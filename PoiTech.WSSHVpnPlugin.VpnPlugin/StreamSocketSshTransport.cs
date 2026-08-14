@@ -1,12 +1,12 @@
 ﻿using System;
 using System.Globalization;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Renci.SshNet.Common;
 using Renci.SshNet.Connection;
 using Windows.Networking;
 using Windows.Networking.Sockets;
-using Windows.Storage.Streams;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 
@@ -22,38 +22,29 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// <see cref="Windows.Networking.Vpn.VpnChannel.StartWithMainTransport"/>.
 /// </para>
 /// <para>
-/// <see cref="StreamSocket"/> is async-only, while the session reads on a dedicated thread and
-/// writes synchronously from others. The blocking members below bridge that by waiting on the
-/// underlying task; that is safe here because no member ever runs on a thread carrying a
-/// synchronization context.
+/// Both adapters are created unbuffered. The session does its own framing and buffering, and a
+/// buffered writer would sit on outgoing SSH packets rather than sending them.
+/// </para>
+/// <para>
+/// The blocking members wait on the underlying task. That is safe here only because no session
+/// thread carries a synchronization context.
 /// </para>
 /// </remarks>
 internal sealed class StreamSocketSshTransport : SshTransport
 {
     private readonly StreamSocket _socket;
-    private readonly DataReader _reader;
-    private readonly DataWriter _writer;
-
-    /// <summary>
-    /// Scratch space for <see cref="DataReader.ReadBytes(byte[])"/>, which fills the whole array and
-    /// so needs one sized exactly to the read. The session reads a small set of recurring sizes, so
-    /// this is reallocated rarely.
-    /// </summary>
-    private byte[] _scratch = Array.Empty<byte>();
+    private readonly Stream _input;
+    private readonly Stream _output;
 
     private int _disposed;
+    private int _shutdown;
     private bool _isConnected;
 
     private StreamSocketSshTransport(StreamSocket socket)
     {
         _socket = socket;
-        _reader = new DataReader(socket.InputStream)
-        {
-            // Return whatever has arrived rather than waiting for the full count, which is the
-            // semantic the session's read loop expects from a socket.
-            InputStreamOptions = InputStreamOptions.Partial,
-        };
-        _writer = new DataWriter(socket.OutputStream);
+        _input = socket.InputStream.AsStreamForRead(bufferSize: 0);
+        _output = socket.OutputStream.AsStreamForWrite(bufferSize: 0);
         _isConnected = true;
     }
 
@@ -97,13 +88,16 @@ internal sealed class StreamSocketSshTransport : SshTransport
     {
         if (timeout == Timeout.InfiniteTimeSpan)
         {
-            return ReadAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
+            return Complete(() => _input.Read(buffer, offset, count));
         }
 
         using var cts = new CancellationTokenSource(timeout);
         try
         {
-            return ReadAsync(buffer, offset, count, cts.Token).GetAwaiter().GetResult();
+            return Complete(() => _input.ReadAsync(buffer.AsMemory(offset, count), cts.Token)
+                                        .AsTask()
+                                        .GetAwaiter()
+                                        .GetResult());
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -117,65 +111,42 @@ internal sealed class StreamSocketSshTransport : SshTransport
     /// <inheritdoc/>
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        if (count == 0)
+        int read;
+        try
         {
+            read = await _input.ReadAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsExpectedDuringTeardown(ex))
+        {
+            _isConnected = false;
             return 0;
         }
 
-        if (_reader.UnconsumedBufferLength == 0)
+        if (read == 0)
         {
-            uint loaded;
-            try
-            {
-                loaded = await _reader.LoadAsync((uint)count).AsTask(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is ObjectDisposedException || IsSocketClosed(ex))
-            {
-                _isConnected = false;
-                return 0;
-            }
-
-            if (loaded == 0)
-            {
-                // The server closed the connection.
-                _isConnected = false;
-                return 0;
-            }
+            _isConnected = false;
         }
 
-        var toRead = (int)Math.Min((uint)count, _reader.UnconsumedBufferLength);
-
-        if (_scratch.Length != toRead)
-        {
-            _scratch = new byte[toRead];
-        }
-
-        _reader.ReadBytes(_scratch);
-        System.Buffer.BlockCopy(_scratch, 0, buffer, offset, toRead);
-        return toRead;
+        return read;
     }
 
     /// <inheritdoc/>
     public override void Write(byte[] buffer, int offset, int count)
     {
-        WriteAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
+        _output.Write(buffer, offset, count);
     }
 
     /// <inheritdoc/>
-    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        // DataWriter has no offset overload, so hand it exactly the span being sent.
-        var slice = new byte[count];
-        System.Buffer.BlockCopy(buffer, offset, slice, 0, count);
-
-        _writer.WriteBytes(slice);
-        _ = await _writer.StoreAsync().AsTask(cancellationToken).ConfigureAwait(false);
+        return _output.WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
     }
 
     /// <inheritdoc/>
     public override void Shutdown()
     {
         _isConnected = false;
+        _ = Interlocked.Exchange(ref _shutdown, 1);
 
         // StreamSocket has no half-close; cancelling pending I/O is what interrupts the blocked
         // read on the message listener thread.
@@ -198,29 +169,50 @@ internal sealed class StreamSocketSshTransport : SshTransport
         }
 
         _isConnected = false;
+        _ = Interlocked.Exchange(ref _shutdown, 1);
 
-        // Detach first: disposing a DataReader/DataWriter otherwise closes the socket's streams
-        // out from under the socket itself.
-        try
-        {
-            _ = _reader.DetachStream();
-            _reader.Dispose();
-            _ = _writer.DetachStream();
-            _writer.Dispose();
-        }
-        catch (Exception ex)
-        {
-            PluginLog.Error("Failed to detach socket streams", ex);
-        }
-
+        _input.Dispose();
+        _output.Dispose();
         _socket.Dispose();
     }
 
-    private static bool IsSocketClosed(Exception exception)
+    /// <summary>
+    /// Runs a blocking read, reporting a close rather than an error when the failure is the result
+    /// of our own teardown.
+    /// </summary>
+    private int Complete(Func<int> read)
     {
-        return SocketError.GetStatus(exception.HResult) is SocketErrorStatus.ConnectionResetByPeer
-            or SocketErrorStatus.ConnectionTimedOut
-            or SocketErrorStatus.OperationAborted
-            or SocketErrorStatus.SoftwareCausedConnectionAbort;
+        int bytesRead;
+        try
+        {
+            bytesRead = read();
+        }
+        catch (Exception ex) when (IsExpectedDuringTeardown(ex))
+        {
+            _isConnected = false;
+            return 0;
+        }
+
+        if (bytesRead == 0)
+        {
+            _isConnected = false;
+        }
+
+        return bytesRead;
+    }
+
+    /// <summary>
+    /// Determines whether an exception is the expected consequence of <see cref="Shutdown"/> or
+    /// <see cref="Dispose(bool)"/>, in which case the session should see a clean close instead of an
+    /// error. Anything else is a genuine failure and is left to propagate.
+    /// </summary>
+    private bool IsExpectedDuringTeardown(Exception exception)
+    {
+        if (Volatile.Read(ref _shutdown) == 0)
+        {
+            return false;
+        }
+
+        return exception is IOException or ObjectDisposedException or OperationCanceledException;
     }
 }

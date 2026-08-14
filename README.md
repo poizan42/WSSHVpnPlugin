@@ -87,8 +87,10 @@ recognise the SSH connection to keep it out of the tunnel it installs. SSH.NET d
 That was deliberate — routing the abstraction through the connector chain would have churned about
 a hundred test files instead of sixteen.
 
-The plug-in side is `StreamSocketSshTransport`, which bridges the async-only `StreamSocket` to the
-session's blocking reads with a `DataReader` in `InputStreamOptions.Partial` mode.
+The plug-in side is `StreamSocketSshTransport`, which adapts the socket with
+`AsStreamForRead(0)` / `AsStreamForWrite(0)`. Unbuffered on both sides: the session does its own
+framing and buffering, and a buffered writer would sit on outgoing SSH packets instead of sending
+them.
 
 ## Diagnostics
 

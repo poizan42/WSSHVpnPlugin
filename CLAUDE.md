@@ -123,9 +123,15 @@ Setting it replaces the built-in connectors entirely, proxy support included.
 `SocketSshTransport`. Pushing the abstraction down into the connector chain would churn ~100 test
 files instead of 16; don't do it without a reason.
 
-The plug-in implements `StreamSocketSshTransport`, bridging the async-only `StreamSocket` to the
-session's blocking reads via a `DataReader` in `InputStreamOptions.Partial` mode. Blocking on those
-tasks is safe only because no session thread carries a synchronization context.
+The plug-in implements `StreamSocketSshTransport` on top of `AsStreamForRead(0)` /
+`AsStreamForWrite(0)` — unbuffered, since the session frames and buffers itself and a buffered
+writer would sit on outgoing packets. Blocking on those tasks is safe only because no session thread
+carries a synchronization context.
+
+Those adapters live in `System.IO.WindowsRuntimeStreamExtensions`, and `AsBuffer`/`ToArray` in
+`System.Runtime.InteropServices.WindowsRuntime` — both **are** available under CsWinRT UWP. They are
+extension methods, so omitting the `using` yields CS1061, which reads exactly like the API having
+been removed in .NET 5+. Import the namespace before concluding it's missing.
 
 ## Conventions
 
