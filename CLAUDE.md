@@ -132,6 +132,13 @@ by experiment; each attempt costs a deploy, and the channel is **single-shot** (
   (`VpnChannelImpl::StartInternal`, `TakeTransportOwnership`). The host is created per activation and
   exits on failure, so `<StartDelaySeconds>` in the profile makes it wait long enough to attach
   `cdbX64 -p`. Tell the host from the UI by command line: the UI carries `-ServerName:App.AppX...`.
+- **`Encapsulate` must rotate its list, not read it.** Take each buffer with `RemoveAtBegin()` and
+  `Append()` it back to the **same** `packets` list — never to `encapsulatedPackets`, which stays
+  empty because the SSH session owns the wire. Both shipping implementations do exactly this.
+  Merely enumerating the list looks harmless and is not: the platform delivered one burst during
+  connect and then nothing ever again, which is what a plug-in that never returns its buffers looks
+  like. Symptom to recognise: the tunnel is up, routes are correct, `Find-NetRoute` picks the tunnel,
+  keep-alive activations keep arriving, and no packet is ever offered.
 - **`GetVpnReceivePacketBuffer()` works on a worker thread**, so the inbound queue can carry platform
   buffers and cost one copy rather than two.
 - The platform starts reading the associated transport at `AssociateTransport`, before `Start`:

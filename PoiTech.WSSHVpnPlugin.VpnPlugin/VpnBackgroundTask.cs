@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 using Windows.ApplicationModel.Background;
 using Windows.ApplicationModel.Core;
 using Windows.Networking.Vpn;
@@ -22,6 +23,14 @@ public sealed class VpnBackgroundTask : IBackgroundTask
 {
     private const string PlugInPropertyKey = "PoiTech.WSSHVpnPlugin.PlugIn";
 
+    /// <summary>
+    /// How many activations to log before going quiet. Encapsulate runs at line rate, so this is a
+    /// diagnostic budget rather than a running commentary.
+    /// </summary>
+    private const int ActivationLogBudget = 25;
+
+    private static int _activations;
+
     /// <inheritdoc/>
     public void Run(IBackgroundTaskInstance taskInstance)
     {
@@ -30,6 +39,7 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         var deferral = taskInstance.GetDeferral();
         try
         {
+            LogActivation(taskInstance);
             VpnChannel.ProcessEventAsync(GetOrCreatePlugIn(), taskInstance.TriggerDetails);
         }
         catch (Exception ex)
@@ -42,6 +52,27 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         {
             deferral.Complete();
         }
+    }
+
+    /// <summary>
+    /// Records that the platform activated us, and what it handed over.
+    /// </summary>
+    /// <remarks>
+    /// Without this there is no way to tell "the platform never raised the event" from "it raised it
+    /// and the plug-in returned early", which is exactly the question when no packet ever arrives.
+    /// </remarks>
+    private static void LogActivation(IBackgroundTaskInstance taskInstance)
+    {
+        var count = Interlocked.Increment(ref _activations);
+        if (count > ActivationLogBudget)
+        {
+            return;
+        }
+
+        var details = taskInstance.TriggerDetails;
+        PluginLog.Info(
+            $"Activation #{count}: trigger={taskInstance.Task?.Name ?? "?"}, "
+            + $"details={details?.GetType().FullName ?? "null"}");
     }
 
     private static IVpnPlugIn GetOrCreatePlugIn()

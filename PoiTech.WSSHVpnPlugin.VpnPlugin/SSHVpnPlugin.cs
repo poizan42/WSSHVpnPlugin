@@ -58,6 +58,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private Timer? _stopWatchdog;
     private int _channelStopped;
     private int _decapsulateCalls;
+    private int _encapsulateCalls;
 
     private long _encapsulateFailureCount;
     private long _lastFailureReportTicks;
@@ -292,11 +293,12 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// returns an empty list.
     /// </para>
     /// <para>
-    /// The buffers are <em>enumerated</em> rather than removed. Every buffer the platform hands us
-    /// has to be given back, and the only documented return paths are this method's out-list and
-    /// <see cref="Decapsulate"/>'s; a buffer pulled off the list and dropped is leaked, and the
-    /// documented consequence is that the plug-in stops being able to request buffers at all.
-    /// Leaving them in <paramref name="packets"/> lets the framework reclaim them.
+    /// Each buffer is taken off the front of <paramref name="packets"/> and appended back to the
+    /// <em>same</em> list once its contents have been copied out — not to
+    /// <paramref name="encapsulatedPackets"/>, which stays empty. That is what both shipping
+    /// implementations do, and it is not interchangeable with enumerating the list: merely reading
+    /// through it left the platform delivering one burst of packets during connect and nothing
+    /// afterwards, which is what a plug-in that never returns its buffers looks like.
     /// </para>
     /// </remarks>
     public void Encapsulate(VpnChannel channel, VpnPacketBufferList packets, VpnPacketBufferList encapsulatedPackets)
@@ -304,6 +306,8 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         ArgumentNullException.ThrowIfNull(packets);
 
         var connection = GetConnection();
+        LogFirstEncapsulateCalls(packets, connection);
+
         if (connection is null)
         {
             return;
@@ -312,8 +316,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         var spike = GetSpike();
         var failures = 0;
 
-        foreach (var buffer in packets)
+        // Size is captured first: the list is rotated, not drained, so re-reading it would loop.
+        var count = packets.Size;
+        for (uint i = 0; i < count; i++)
         {
+            var buffer = packets.RemoveAtBegin();
             try
             {
                 spike?.SampleOutbound(VpnPacketBufferAccess.GetSpan(buffer).Slice(0, checked((int)buffer.Buffer.Length)));
@@ -328,6 +335,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 // and would fill the disk. Count them and log once for the batch instead.
                 failures++;
                 _lastEncapsulateFailure = ex;
+            }
+            finally
+            {
+                // Unconditional: a buffer dropped on a failure is one the platform never gets back.
+                packets.Append(buffer);
             }
         }
 
@@ -390,6 +402,33 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Logs the first few encapsulate calls, before anything can return early.
+    /// </summary>
+    /// <remarks>
+    /// The interesting case is the absence of these lines: with the tunnel up and traffic routed to
+    /// it, no encapsulate call at all means the platform is not offering us the send path, which is a
+    /// different problem from us dropping what it offers.
+    /// </remarks>
+    private void LogFirstEncapsulateCalls(VpnPacketBufferList packets, SshVpnConnection? connection)
+    {
+        const int LogBudget = 5;
+
+        var call = Interlocked.Increment(ref _encapsulateCalls);
+        if (call > LogBudget)
+        {
+            return;
+        }
+
+        PluginLog.Info(
+            string.Format(
+                CultureInfo.InvariantCulture,
+                "Encapsulate called (#{0}), {1} packet(s), connection {2}",
+                call,
+                packets.Size,
+                connection is null ? "MISSING" : "present"));
     }
 
     /// <summary>
