@@ -8,7 +8,40 @@
     mc:Ignorable="d"
     Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
 
-    <Grid>
+    <Grid Padding="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
 
+        <TextBlock Grid.Row="0"
+                   Text="SSH VPN profile"
+                   Style="{ThemeResource SubtitleTextBlockStyle}"
+                   Margin="0,0,0,16"/>
+
+        <StackPanel Grid.Row="1" Spacing="8" MaxWidth="480" HorizontalAlignment="Left">
+            <TextBox x:Name="HostBox" Header="SSH server" PlaceholderText="ssh.example.com"/>
+            <TextBox x:Name="PortBox" Header="Port" Text="22"/>
+            <TextBox x:Name="UserNameBox" Header="User name" PlaceholderText="(leave empty to be prompted)"/>
+            <TextBox x:Name="FingerprintBox" Header="Host key fingerprint" PlaceholderText="SHA256:..."/>
+            <TextBox x:Name="ClientAddressBox" Header="Client IPv4 address" Text="192.168.255.2"/>
+            <TextBox x:Name="DnsBox" Header="DNS servers (comma separated)" PlaceholderText="1.1.1.1"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" Margin="0,16,0,16">
+            <Button x:Name="SaveButton" Content="Save profile" Click="OnSaveProfileClick"/>
+            <Button x:Name="ConnectButton" Content="Connect" Click="OnConnectClick"/>
+            <Button x:Name="DisconnectButton" Content="Disconnect" Click="OnDisconnectClick"/>
+            <Button x:Name="DeleteButton" Content="Delete profile" Click="OnDeleteProfileClick"/>
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
+            <TextBlock x:Name="StatusText"
+                       IsTextSelectionEnabled="True"
+                       TextWrapping="Wrap"
+                       FontFamily="Consolas"/>
+        </ScrollViewer>
     </Grid>
 </Page>

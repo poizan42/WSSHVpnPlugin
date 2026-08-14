@@ -1,0 +1,175 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Xml.Linq;
+using Windows.Networking;
+using Windows.Networking.Vpn;
+
+namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
+
+/// <summary>
+/// The plug-in's view of the VPN profile.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The host to connect to comes from the profile's server URI list, which the platform surfaces
+/// as <see cref="VpnChannelConfiguration.ServerHostNameList"/>. Everything else is carried in
+/// the profile's custom configuration string, which is opaque to the platform. The expected
+/// shape is:
+/// </para>
+/// <code>
+/// &lt;SshVpnConfiguration&gt;
+///   &lt;Port&gt;22&lt;/Port&gt;
+///   &lt;UserName&gt;alice&lt;/UserName&gt;
+///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
+///   &lt;ClientIPv4&gt;192.168.255.2&lt;/ClientIPv4&gt;
+///   &lt;Mtu&gt;1400&lt;/Mtu&gt;
+///   &lt;DnsServer&gt;1.1.1.1&lt;/DnsServer&gt;
+///   &lt;InclusionRoute&gt;10.0.0.0/8&lt;/InclusionRoute&gt;
+/// &lt;/SshVpnConfiguration&gt;
+/// </code>
+/// </remarks>
+internal sealed class SshVpnConfiguration
+{
+    public const string RootElementName = "SshVpnConfiguration";
+
+    /// <summary>The default MTU. Sized to leave room for the SSH record overhead over a 1500 byte path.</summary>
+    public const uint DefaultMtu = 1400;
+
+    private SshVpnConfiguration(string host)
+    {
+        Host = host;
+    }
+
+    /// <summary>Gets the SSH server host name or address.</summary>
+    public string Host { get; }
+
+    /// <summary>Gets the SSH server port.</summary>
+    public uint Port { get; private init; } = 22;
+
+    /// <summary>Gets the SSH user name, or <see langword="null"/> to prompt the user.</summary>
+    public string? UserName { get; private init; }
+
+    /// <summary>
+    /// Gets the expected server host key fingerprint. When set, the host key is pinned to this
+    /// value; when unset, the connection is refused rather than trusted blindly.
+    /// </summary>
+    public string? HostKeyFingerprint { get; private init; }
+
+    /// <summary>Gets the IPv4 address to assign to the virtual interface.</summary>
+    public string ClientIPv4 { get; private init; } = "192.168.255.2";
+
+    /// <summary>Gets the MTU to advertise on the virtual interface.</summary>
+    public uint Mtu { get; private init; } = DefaultMtu;
+
+    /// <summary>Gets the DNS servers to assign, if any.</summary>
+    public IReadOnlyList<string> DnsServers { get; private init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Gets the IPv4 routes to direct into the tunnel, in CIDR form. An empty list means
+    /// "default route": send everything through the tunnel.
+    /// </summary>
+    public IReadOnlyList<string> InclusionRoutes { get; private init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Reads the configuration carried by the VPN profile.
+    /// </summary>
+    /// <exception cref="FormatException">The profile is missing a server, or the custom configuration is malformed.</exception>
+    public static SshVpnConfiguration FromChannelConfiguration(VpnChannelConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var host = GetFirstServerHost(configuration.ServerHostNameList)
+            ?? throw new FormatException("The VPN profile does not specify a server host name.");
+
+        var custom = configuration.CustomField;
+        if (string.IsNullOrWhiteSpace(custom))
+        {
+            return new SshVpnConfiguration(host);
+        }
+
+        XElement root;
+        try
+        {
+            root = XDocument.Parse(custom).Root
+                ?? throw new FormatException("The custom configuration is empty.");
+        }
+        catch (System.Xml.XmlException ex)
+        {
+            throw new FormatException("The custom configuration is not well-formed XML.", ex);
+        }
+
+        if (root.Name.LocalName != RootElementName)
+        {
+            throw new FormatException(
+                $"Expected a <{RootElementName}> root element but found <{root.Name.LocalName}>.");
+        }
+
+        return new SshVpnConfiguration(host)
+        {
+            Port = ReadUInt32(root, "Port", 22),
+            UserName = ReadString(root, "UserName"),
+            HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
+            ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
+            Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
+            DnsServers = ReadStringList(root, "DnsServer"),
+            InclusionRoutes = ReadStringList(root, "InclusionRoute"),
+        };
+    }
+
+    private static string? GetFirstServerHost(IReadOnlyList<HostName>? servers)
+    {
+        if (servers is null)
+        {
+            return null;
+        }
+
+        foreach (var server in servers)
+        {
+            var name = server.CanonicalName;
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                return name;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ReadString(XElement root, string name)
+    {
+        var value = root.Element(name)?.Value.Trim();
+        return string.IsNullOrEmpty(value) ? null : value;
+    }
+
+    private static uint ReadUInt32(XElement root, string name, uint defaultValue)
+    {
+        var raw = ReadString(root, name);
+        if (raw is null)
+        {
+            return defaultValue;
+        }
+
+        if (!uint.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out var value))
+        {
+            throw new FormatException($"<{name}> is not a valid unsigned integer: '{raw}'.");
+        }
+
+        return value;
+    }
+
+    private static IReadOnlyList<string> ReadStringList(XElement root, string name)
+    {
+        List<string>? values = null;
+        foreach (var element in root.Elements(name))
+        {
+            var value = element.Value.Trim();
+            if (value.Length > 0)
+            {
+                (values ??= new List<string>()).Add(value);
+            }
+        }
+
+        return (IReadOnlyList<string>?)values ?? Array.Empty<string>();
+    }
+}

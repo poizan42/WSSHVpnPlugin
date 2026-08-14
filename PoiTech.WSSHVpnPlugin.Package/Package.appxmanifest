@@ -4,7 +4,8 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-  IgnorableNamespaces="uap mp">
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap mp rescap">
 
   <Identity
     Name="3703e6b2-f1f9-447d-b506-da47be3094ff"
@@ -20,7 +21,7 @@
   </Properties>
 
   <Dependencies>
-    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.0.0" MaxVersionTested="10.0.0.0" />
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
   <Resources>
@@ -29,21 +30,73 @@
 
   <Applications>
     <Application Id="App"
-      Executable="$targetnametoken$.exe"
-      EntryPoint="PoiTech.WSSHVpnPlugin.Package.App">
+      Executable="PoiTech.WSSHVpnPlugin.App\PoiTech.WSSHVpnPlugin.App.exe"
+      EntryPoint="PoiTech.WSSHVpnPlugin.App.App">
       <uap:VisualElements
-        DisplayName="PoiTech.WSSHVpnPlugin.Package"
+        DisplayName="SSH VPN"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png"
-        Description="PoiTech.WSSHVpnPlugin.Package"
+        Description="VPN over SSH tunnelling"
         BackgroundColor="transparent">
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"/>
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
     </Application>
+
+    <!--
+      The VPN plug-in is hosted by its own application entry so the platform can activate it
+      without the UI app. AppListEntry="none" keeps it out of the Start menu.
+    -->
+    <Application Id="Plugin">
+      <uap:VisualElements
+        DisplayName="SSH VPN Plug-in"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        Description="VPN over SSH tunnelling"
+        BackgroundColor="transparent"
+        AppListEntry="none">
+        <uap:DefaultTile />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <Extension Category="windows.backgroundTasks"
+                   Executable="PoiTech.WSSHVpnPlugin.App\PoiTech.WSSHVpnPlugin.App.exe"
+                   EntryPoint="PoiTech.WSSHVpnPlugin.VpnPlugin.VpnBackgroundTask">
+          <BackgroundTasks>
+            <uap:Task Type="vpnClient" />
+          </BackgroundTasks>
+        </Extension>
+      </Extensions>
+    </Application>
   </Applications>
 
   <Capabilities>
-    <Capability Name="internetClient" />
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
+    <uap:Capability Name="sharedUserCertificates" />
+    <!--
+      Restricted capability. Sideloading works, but Store submission needs Microsoft approval,
+      and the package must be signed for the machine to accept it.
+    -->
+    <rescap:Capability Name="networkingVpnProvider" />
   </Capabilities>
+
+  <Extensions>
+    <!--
+      Package-level WinRT activation registration for the background task. Without it the
+      packaging step fails with "not allowed to have EntryPoint=... without ActivatableClassId in
+      windows.activatableClass.inProcessServer".
+
+      Path names the binary that exports DllGetActivationFactory. Under .NET Native that was
+      CLRHost.dll; with Native AOT everything is linked into the app's single native executable,
+      so CsWinRT's generated export is re-exported from there — see the UnmanagedEntryPointsAssembly
+      and LinkerArg items in the app project.
+    -->
+    <Extension Category="windows.activatableClass.inProcessServer">
+      <InProcessServer>
+        <Path>PoiTech.WSSHVpnPlugin.App\PoiTech.WSSHVpnPlugin.App.exe</Path>
+        <ActivatableClass ActivatableClassId="PoiTech.WSSHVpnPlugin.VpnPlugin.VpnBackgroundTask" ThreadingModel="both" />
+      </InProcessServer>
+    </Extension>
+  </Extensions>
 </Package>

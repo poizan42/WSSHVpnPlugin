@@ -12,4 +12,31 @@
     <PublishProfile>win-$(Platform).pubxml</PublishProfile>
     <DisableRuntimeMarshalling>true</DisableRuntimeMarshalling>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Needed even though this project authors no WinRT types: CsWinRT's targets are what strip the
+      referenced component's .winmd out of the compile references (otherwise NETSDK1130).
+    -->
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Pulls the WinRT component (and SSH.NET) into the package so the platform can activate
+      VpnBackgroundTask. The UI itself only talks to the plug-in through VpnManagementAgent.
+    -->
+    <ProjectReference Include="..\PoiTech.WSSHVpnPlugin.VpnPlugin\PoiTech.WSSHVpnPlugin.VpnPlugin.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The component's CsWinRT source generator emits a [UnmanagedCallersOnly] DllGetActivationFactory.
+      Since Native AOT links the component into this executable rather than its own DLL, ILC has to be
+      told to keep that entry point and the linker to export it — otherwise the WinRT activation
+      registered in the package manifest has nothing to bind to.
+    -->
+    <UnmanagedEntryPointsAssembly Include="PoiTech.WSSHVpnPlugin.VpnPlugin" />
+    <LinkerArg Include="/EXPORT:DllGetActivationFactory" />
+  </ItemGroup>
 </Project>
