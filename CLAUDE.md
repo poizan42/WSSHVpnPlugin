@@ -101,6 +101,38 @@ state — so the instance lives in `CoreApplication.Properties`, which outlives 
 the host process. Exceptions must not escape `Run`; they tear down the host and leave the platform
 without a response.
 
+### The transport socket belongs to the platform
+
+Established by disassembling `Windows.Networking.Vpn.dll` after a long spike. Do not re-litigate this
+by experiment; each attempt costs a deploy, and the channel is **single-shot** (after one rejected
+`Start*` every later call returns `E_ILLEGAL_METHOD_CALL`, so one activation = one experiment).
+
+- `AssociateTransport` registers the socket as a **ControlChannelTrigger**, which is why it must be
+  unconnected. `Start*` then calls `WaitForPushEnabled`, `TakeTransportOwnership` and
+  `VpnExeChannelCreate`, after which **the VPN service reads and writes that socket**. A plug-in
+  cannot run its own protocol on it — SSH bytes get consumed by the platform's reader.
+- So the SSH session runs on a **separate socket the platform never sees**, bound to the physical
+  interface, and the platform gets a **loopback dummy socket** as its transport.
+- `E_OUTOFMEMORY` from `Start*` is not about memory. It comes over RPC from the CCT broker, usually
+  because the socket was already connected. Varying the arguments will not help.
+- Always `AssociateTransport` before `Start*`. `StartWithMainTransport` compares what you pass
+  against what you associated (a vector at `this+0xA8` that only `AssociateTransport` writes), so
+  calling it on a virgin channel dereferences NULL and kills the background-task host.
+- `SetErrorMessage` is documented "Not supported" — use `TerminateConnection`.
+
+### Debugging the background task
+
+There is no console and no debugger attached. What worked, in order of usefulness:
+
+- **WER LocalDumps** for crashes: set `HKLM\...\Windows Error Reporting\LocalDumps\<exe>` (needs
+  elevation), reproduce, then analyse with `cdbX64.exe` — the Store WinDbg build. The Windows Kits
+  `cdb.exe` fails to start on this machine; `cdbX64.exe` on `PATH` works.
+- **Non-invasive attach for hangs**: `cdbX64 -pv -p <pid> -c "~*k"`. This is what found
+  `WaitForPushEnabled`.
+- **ETW**: `logman create trace ... -p "{E5FC4A0F-7198-492F-9B0F-88FDCBFDED48}"` (Networking VPN
+  Plugin Platform) works without elevation, but only gives coarse states — Connecting, Negotiating
+  Network, Abort. The detailed errors are WPP and need a TMF to decode.
+
 ### The central design constraint
 
 SSH cannot carry raw IP datagrams. Its forwarding primitive (`direct-tcpip`) is a byte stream to a
