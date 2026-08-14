@@ -14,35 +14,32 @@ internal sealed class SshVpnConnection : IDisposable
     private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
 
     private readonly SshClient _client;
+    private readonly StreamSocketSshTransportFactory _transportFactory;
     private readonly string? _expectedFingerprint;
     private int _disposed;
 
-    private SshVpnConnection(SshClient client, string? expectedFingerprint)
+    private SshVpnConnection(
+        SshClient client,
+        StreamSocketSshTransportFactory transportFactory,
+        string? expectedFingerprint)
     {
         _client = client;
+        _transportFactory = transportFactory;
         _expectedFingerprint = expectedFingerprint;
     }
 
     /// <summary>
-    /// Gets the object the platform should treat as the outer tunnel transport, so that the SSH
+    /// Gets the socket the platform should treat as the outer tunnel transport, so that the SSH
     /// connection's own traffic is not routed back into the tunnel it carries.
     /// </summary>
     /// <remarks>
-    /// <para>
-    /// <see cref="VpnChannel.Start"/> expects a <c>Windows.Networking.Sockets.StreamSocket</c> or
-    /// <c>DatagramSocket</c>. SSH.NET connects with a <c>System.Net.Sockets.Socket</c>, which the
-    /// platform will not accept, so there is nothing to hand over yet.
-    /// </para>
-    /// <para>
-    /// The two ways out are (a) teach the SSH.NET fork to run its transport over a WinRT
-    /// <c>StreamSocket</c>, or (b) skip the association and instead keep the server out of the
-    /// tunnel with an explicit exclusion route for its address. (a) is more faithful to what the
-    /// platform expects — it also drives reconnect-on-transport-change — but is the larger change.
-    /// </para>
+    /// This is the same <c>StreamSocket</c> the session is running over. The SSH.NET fork was
+    /// changed to accept a caller-supplied transport precisely so that this socket exists as a
+    /// WinRT object — see <see cref="StreamSocketSshTransport"/>.
     /// </remarks>
-    public object? OuterTunnelTransport =>
-        throw new NotImplementedException(
-            "The SSH transport is not yet exposed as a WinRT socket; see SshVpnConnection.OuterTunnelTransport.");
+    public object OuterTunnelTransport =>
+        _transportFactory.Socket
+        ?? throw new InvalidOperationException("The SSH session has not been established.");
 
     /// <summary>
     /// Connects and authenticates to the SSH server described by <paramref name="configuration"/>.
@@ -51,16 +48,26 @@ internal sealed class SshVpnConnection : IDisposable
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
+        var transportFactory = new StreamSocketSshTransportFactory();
+
         // TODO: support public key authentication (PrivateKeyAuthenticationMethod) in addition to
         // passwords, and keyboard-interactive for servers that require it.
         var connectionInfo = new ConnectionInfo(
             configuration.Host,
             checked((int)configuration.Port),
             userName,
-            new PasswordAuthenticationMethod(userName, password));
+            new PasswordAuthenticationMethod(userName, password))
+        {
+            // Run the session over a WinRT StreamSocket rather than System.Net.Sockets.Socket, so
+            // the platform can be handed the socket and keep this connection out of the tunnel.
+            TransportFactory = transportFactory,
+        };
 
         var client = new SshClient(connectionInfo);
-        var connection = new SshVpnConnection(client, NormalizeFingerprint(configuration.HostKeyFingerprint));
+        var connection = new SshVpnConnection(
+            client,
+            transportFactory,
+            NormalizeFingerprint(configuration.HostKeyFingerprint));
         try
         {
             client.HostKeyReceived += connection.OnHostKeyReceived;

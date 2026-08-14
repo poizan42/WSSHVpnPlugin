@@ -60,11 +60,8 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 _connection = connection;
             }
 
-            // TODO: the platform needs an "outer tunnel transport" so it can exempt the SSH
-            // connection's own traffic from the tunnel it is about to install. It expects a WinRT
-            // Windows.Networking.Sockets.StreamSocket, whereas SSH.NET drives a
-            // System.Net.Sockets.Socket. Resolving this is the next open design decision — see
-            // SshVpnConnection.OuterTunnelTransport.
+            // The StreamSocket the SSH session is running over. Handing it to the platform is what
+            // keeps the SSH connection's own traffic out of the tunnel being installed.
             var transport = connection.OuterTunnelTransport;
 
             // StartWithMainTransport rather than the older Start overload: it takes a

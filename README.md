@@ -61,21 +61,34 @@ for Store submission.
 
 ## Open design questions
 
-**Outer tunnel transport.** `VpnChannel.StartWithMainTransport` wants a WinRT `StreamSocket` so the
-platform can keep the SSH connection's own traffic out of the tunnel it installs. SSH.NET drives a
-`System.Net.Sockets.Socket`. Either the fork learns to run its transport over a `StreamSocket`, or
-the server's address gets an explicit exclusion route instead. See
-`SshVpnConnection.OuterTunnelTransport` — currently the one deliberate hole in the skeleton.
-
 **Packet path.** SSH forwards byte streams, not IP datagrams, so there is no packet-for-packet
 encapsulation. `Encapsulate` has to feed a user-space TCP/IP stack that maps each TCP flow onto a
 `direct-tcpip` channel and synthesises the return packets, injecting them with
 `RequestVpnPacketBuffer` / `AppendVpnReceivePacketBuffer`. UDP and ICMP need a separate answer.
 
-**Fork surface.** Nothing has been changed in the `SSH.NET` submodule yet. `ISession`,
-`IChannelDirectTcpip` and `ChannelDirectTcpip` are all `internal`, and `IChannelDirectTcpip.Open`
-binds the channel to a `Socket` rather than exposing a byte stream — so the fork needs both a
-visibility change and a socket-free way to open and pump a channel.
+**Fork surface — channels.** `ISession`, `IChannelDirectTcpip` and `ChannelDirectTcpip` are still
+`internal`, and `IChannelDirectTcpip.Open` binds the channel to a `Socket` rather than exposing a
+byte stream — so the fork still needs both a visibility change and a socket-free way to open and
+pump a channel. This is the remaining reason the fork exists.
+
+## The transport abstraction in the fork
+
+`VpnChannel.StartWithMainTransport` will only accept a WinRT socket, because the platform has to
+recognise the SSH connection to keep it out of the tunnel it installs. SSH.NET drove a
+`System.Net.Sockets.Socket`, so the fork gained a seam:
+
+- `Renci.SshNet.Connection.SshTransport` — public abstract byte pipe (`Read`/`Write` plus async,
+  `IsConnected`, `Shutdown`, `Dispose`).
+- `ISshTransportFactory`, assigned to `ConnectionInfo.TransportFactory`. When set, it replaces the
+  built-in connectors entirely — and with them proxy support.
+- `SocketSshTransport` wraps the ordinary socket, so the default path is unchanged.
+
+`IConnector` and the five connectors still return `Socket`; `Session` wraps whatever they hand back.
+That was deliberate — routing the abstraction through the connector chain would have churned about
+a hundred test files instead of sixteen.
+
+The plug-in side is `StreamSocketSshTransport`, which bridges the async-only `StreamSocket` to the
+session's blocking reads with a `DataReader` in `InputStreamOptions.Partial` mode.
 
 ## Diagnostics
 

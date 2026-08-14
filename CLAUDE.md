@@ -107,13 +107,25 @@ host and port, so there is no packet-for-packet encapsulation and the usual `Enc
 
 Deliberate, documented, and not to be silently papered over:
 
-- `SshVpnConnection.OuterTunnelTransport` throws. `VpnChannel.StartWithMainTransport` wants a WinRT
-  `StreamSocket` so the platform can keep the SSH connection out of the tunnel it installs; SSH.NET
-  drives a `System.Net.Sockets.Socket`. Either the fork runs its transport over a `StreamSocket`, or
-  the server address gets an explicit exclusion route instead.
 - `SshVpnConnection.SendOutbound` is where the user-space TCP/IP stack goes.
-- Nothing has been changed in the submodule yet. Beyond visibility, `IChannelDirectTcpip.Open` binds
-  a channel to a `Socket` rather than exposing a byte stream, so the fork needs an API change too.
+- `IChannelDirectTcpip` is still `internal`, and its `Open` binds a channel to a `Socket` rather than
+  exposing a byte stream, so the fork needs a visibility *and* an API change before the packet path
+  can use it.
+
+### The fork's transport seam
+
+`VpnChannel.StartWithMainTransport` only accepts a WinRT socket, so the fork gained
+`Renci.SshNet.Connection.SshTransport` (public abstract: `Read`/`Write` plus async, `IsConnected`,
+`Shutdown`, `Dispose`) and `ISshTransportFactory`, assigned via `ConnectionInfo.TransportFactory`.
+Setting it replaces the built-in connectors entirely, proxy support included.
+
+`IConnector` and the five connectors deliberately still return `Socket` — `Session` wraps them in
+`SocketSshTransport`. Pushing the abstraction down into the connector chain would churn ~100 test
+files instead of 16; don't do it without a reason.
+
+The plug-in implements `StreamSocketSshTransport`, bridging the async-only `StreamSocket` to the
+session's blocking reads via a `DataReader` in `InputStreamOptions.Partial` mode. Blocking on those
+tasks is safe only because no session thread carries a synchronization context.
 
 ## Conventions
 
