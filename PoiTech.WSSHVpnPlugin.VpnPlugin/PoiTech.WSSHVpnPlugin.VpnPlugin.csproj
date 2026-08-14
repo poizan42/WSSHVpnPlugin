@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <Nullable>enable</Nullable>
+    <UseUwp>true</UseUwp>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <PublishAot>true</PublishAot>
+    <DisableRuntimeMarshalling>true</DisableRuntimeMarshalling>
+
+    <!--
+      This is a non-XAML library (just a simple WinRT component), so the XAML compiler is not needed.
+      Disabling the XAML compiler allows the target Windows SDK to be lower than 26100, if desired.
+      This property can be removed in case this project does have to include any XAML content.      
+    -->
+    <EnableXamlCompilerTargetsForUwpApps>false</EnableXamlCompilerTargetsForUwpApps>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <CsWinRTComponent>true</CsWinRTComponent>
+    <CsWinRTGenerateProjection>false</CsWinRTGenerateProjection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\SSH.NET\src\Renci.SshNet\Renci.SshNet.csproj" />
+  </ItemGroup>
+</Project>

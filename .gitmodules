@@ -1,0 +1,4 @@
+[submodule "SSH.NET"]
+	path = SSH.NET
+	url = git@github.com:poizan42/WSSHVpnPlugin-SSH.NET.git
+	branch = wssh-vpn-plugin
