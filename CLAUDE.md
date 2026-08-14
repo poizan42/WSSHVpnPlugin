@@ -113,8 +113,30 @@ by experiment; each attempt costs a deploy, and the channel is **single-shot** (
   cannot run its own protocol on it — SSH bytes get consumed by the platform's reader.
 - So the SSH session runs on a **separate socket the platform never sees**, bound to the physical
   interface, and the platform gets a **loopback dummy socket** as its transport.
-- `E_OUTOFMEMORY` from `Start*` is not about memory. It comes over RPC from the CCT broker, usually
-  because the socket was already connected. Varying the arguments will not help.
+- **`E_OUTOFMEMORY` from `Start*` means the assigned IPv6 address list was empty.** Bisected to a
+  single variable: with `mtu 1400` / `maxFrameSize 1500` unchanged, adding one IPv6 address
+  (`fd00::2`) turns a hard failure into `StartWithMainTransport accepted`. Assign at least one address
+  for **both** families or the call fails with a resource error that has nothing to do with resources.
+  This cost most of a day, because it looks like anything but an argument problem.
+  Note the separate, opposite hazard already recorded below: inclusion *routes* for a family with no
+  assigned address hang the platform. Address without routes is fine; routes without address is not.
+  Also disproved along the way, so nobody re-runs them: the delay before `Start` is irrelevant
+  (307 ms works), and so is "it only works on the second attempt" (a cold first connect works).
+  Two theories that were confidently wrong and are recorded so nobody rebuilds them:
+  "the socket was already connected" (Maple connects too, and ships), and "the CCT broker refuses
+  over RPC" — **`WaitForPushEnabled` returns `S_OK`**, observed under `cdbX64`, so the whole control
+  channel trigger path including slot allocation works. `TakeTransportOwnership` also returns 0.
+  The transport shape is irrelevant: a loopback datagram pair and a real remote TCP connection fail
+  and succeed identically.
+- **Debugging `Start` is practical.** `Windows.Networking.Vpn.dll` has public PDB symbols
+  (`VpnChannelImpl::StartInternal`, `TakeTransportOwnership`). The host is created per activation and
+  exits on failure, so `<StartDelaySeconds>` in the profile makes it wait long enough to attach
+  `cdbX64 -p`. Tell the host from the UI by command line: the UI carries `-ServerName:App.AppX...`.
+- **`GetVpnReceivePacketBuffer()` works on a worker thread**, so the inbound queue can carry platform
+  buffers and cost one copy rather than two.
+- The platform starts reading the associated transport at `AssociateTransport`, before `Start`:
+  `Decapsulate` fired with the SSH server's 42-byte identification string while `Start` was still
+  pending.
 - Always `AssociateTransport` before `Start*`. `StartWithMainTransport` compares what you pass
   against what you associated (a vector at `this+0xA8` that only `AssociateTransport` writes), so
   calling it on a virgin channel dereferences NULL and kills the background-task host.
@@ -141,9 +163,45 @@ host and port, so there is no packet-for-packet encapsulation and the usual `Enc
 
 - `Encapsulate` consumes IP packets and returns **nothing** — the SSH session owns the wire, not the
   platform. A user-space TCP/IP stack has to demultiplex flows onto `direct-tcpip` channels.
-- `Decapsulate` stays unused; inbound packets get injected from the SSH receive loop via
-  `RequestVpnPacketBuffer` / `AppendVpnReceivePacketBuffer` instead.
+- `Decapsulate` is the *inbound* path, not a mirror of `Encapsulate`. See below.
 - UDP and ICMP need a separate answer; plain SSH has no primitive for either.
+
+### The outer tunnel transport is a loopback dummy
+
+The platform takes **exclusive ownership** of whatever is passed to `AssociateTransport`: it registers
+the socket as a ControlChannelTrigger, then `Start*` calls `WaitForPushEnabled`,
+`TakeTransportOwnership` and `VpnExeChannelCreate`, after which the VPN service reads and writes it
+itself. An SSH session running over that socket has its bytes stolen — we watched the banner come back
+corrupted. Established by crash dump, live stack and disassembly of `Windows.Networking.Vpn.dll`; do
+not re-derive it.
+
+So `LoopbackTransport` hands the platform a cross-connected pair of `DatagramSocket`s on `127.0.0.1`
+that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
+
+- **Order**: `AssociateTransport` first and on an *unconnected* socket, then bind both, then
+  cross-connect, then `StartWithMainTransport` passing the same socket. Calling `Start*` on a channel
+  that never had `AssociateTransport` dereferences NULL and kills the host; connecting before
+  associating earns `E_OUTOFMEMORY` from the CCT broker, which is not about memory.
+- **Datagrams, never a listener.** TCP cannot cross-connect, so a `StreamSocket` dummy would need a
+  `StreamSocketListener` — the one loopback shape whose app-container behaviour is doubtful. Loopback
+  itself needs no exemption: the check passes when both endpoints share the package SID.
+- **Inbound injection goes through `Decapsulate`, woken by a doorbell.** Writing one byte to the back
+  socket makes the platform raise the event. The producer calls `GetVpnReceivePacketBuffer()` on its
+  *own* thread, writes the packet directly into that buffer and queues it (`InboundPacketQueue`);
+  `Decapsulate` only appends, which is what returns the buffer. One copy, not two. Ring the doorbell
+  **per batch, unconditionally** — transition-only ringing stalls forever if a single ring is lost.
+- **`Disconnect` must not call `channel.Stop()`.** Buffers we have not returned block the background
+  task and the platform kills the host process. Close the queue, ring once more, and let `Decapsulate`
+  stop the channel when it finds the queue drained. Whether that last call actually arrives is
+  unresolved — `SSHVpnPlugin.OnStopWatchdog` reports which way it went.
+- **Never a literal `0.0.0.0/0` inclusion route** — recorded in the reference implementation as looping
+  back through the tunnel even from a bound socket. Use `0.0.0.0/1` + `128.0.0.0/1`. And only add
+  routes for a family that has an assigned address, or the platform hangs.
+- **SSH is source-bound** to a chosen interface (`OutboundInterface`), not kept out with
+  `Ipv4ExclusionRoutes` (which returns `WSAEACCES`). `GetInternetConnectionProfile` is useless here —
+  its "preferred interface" becomes the tunnel. The heuristic cannot tell our tunnel from another
+  VPN's TAP adapter, so `<NetworkAdapter>` in the profile is a real requirement when nesting, not a
+  nicety.
 
 ### Open holes
 
@@ -156,10 +214,16 @@ Deliberate, documented, and not to be silently papered over:
 
 ### The fork's transport seam
 
-`VpnChannel.StartWithMainTransport` only accepts a WinRT socket, so the fork gained
-`Renci.SshNet.Connection.SshTransport` (public abstract: `Read`/`Write` plus async, `IsConnected`,
-`Shutdown`, `Dispose`) and `ISshTransportFactory`, assigned via `ConnectionInfo.TransportFactory`.
-Setting it replaces the built-in connectors entirely, proxy support included.
+The plug-in runs in an app container where the WinRT socket types are what is usable, so the fork
+gained `Renci.SshNet.Connection.SshTransport` (public abstract: `Read`/`Write` plus async,
+`IsConnected`, `Shutdown`, `Dispose`) and `ISshTransportFactory`, assigned via
+`ConnectionInfo.TransportFactory`. Setting it replaces the built-in connectors entirely, proxy support
+included. (The original reason — handing the platform the socket the session runs on — was disproved;
+see the outer-transport section above.)
+
+`StreamSocketSshTransportFactory` takes an optional `HostName` local address, threaded through to a
+`ConnectAsync(EndpointPair)` with `LocalHostName` set. The local *service* name in that pair must be
+the empty string; null is rejected.
 
 `IConnector` and the five connectors deliberately still return `Socket` — `Session` wraps them in
 `SocketSshTransport`. Pushing the abstraction down into the connector chain would churn ~100 test
