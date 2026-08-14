@@ -4,6 +4,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 using Windows.ApplicationModel;
+using Windows.ApplicationModel.Background;
 using Windows.Networking.Vpn;
 using Windows.Storage;
 using Windows.UI.Xaml;
@@ -21,8 +22,6 @@ namespace PoiTech.WSSHVpnPlugin.App;
 /// </remarks>
 public sealed partial class MainPage : Page
 {
-    private const string ProfileName = "SSH VPN";
-
     private readonly VpnManagementAgent _agent = new();
 
     public MainPage()
@@ -51,6 +50,9 @@ public sealed partial class MainPage : Page
         }
 
         SpikeProbeCheck.IsChecked = values.ContainsKey("SpikeProbe") && values["SpikeProbe"] is true;
+        RemoteTransportCheck.IsChecked = values.ContainsKey("RemoteDummyTransport") && values["RemoteDummyTransport"] is true;
+        AssignIPv6Check.IsChecked = values.ContainsKey("AssignIPv6") && values["AssignIPv6"] is true;
+        LargeFrameCheck.IsChecked = values.ContainsKey("LargeFrameSize") && values["LargeFrameSize"] is true;
     }
 
     private void SaveSettings()
@@ -63,19 +65,25 @@ public sealed partial class MainPage : Page
         }
 
         values["SpikeProbe"] = SpikeProbeCheck.IsChecked == true;
+        values["RemoteDummyTransport"] = RemoteTransportCheck.IsChecked == true;
+        values["AssignIPv6"] = AssignIPv6Check.IsChecked == true;
+        values["LargeFrameSize"] = LargeFrameCheck.IsChecked == true;
     }
 
     private (TextBox Box, string Key)[] SettingsBoxes()
     {
         return new[]
         {
+            (ProfileNameBox, "ProfileName"),
             (HostBox, "Host"),
             (PortBox, "Port"),
             (UserNameBox, "UserName"),
             (PrivateKeyPathBox, "PrivateKeyPath"),
             (FingerprintBox, "HostKeyFingerprint"),
             (ClientAddressBox, "ClientIPv4"),
+            (NetworkAdapterBox, "NetworkAdapter"),
             (DnsBox, "DnsServers"),
+            (StartDelayBox, "StartDelaySeconds"),
         };
     }
 
@@ -105,9 +113,41 @@ public sealed partial class MainPage : Page
     {
         await RunAsync("Connect", async () =>
         {
+            await EnsureBackgroundAccessAsync();
+
             var status = await _agent.ConnectProfileAsync(BuildProfile());
             Log($"ConnectProfileAsync: {status}");
         });
+    }
+
+    /// <summary>
+    /// Asks for background execution access before connecting.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Associating a transport with the VPN channel registers it as a <c>ControlChannelTrigger</c>,
+    /// and <c>ControlChannelTrigger</c> is documented as requiring this call first. The plug-in
+    /// itself cannot make it — it runs in a background task, and the access being requested is the
+    /// right to run there — so the foreground app has to, and it applies to the whole package.
+    /// </para>
+    /// <para>
+    /// Worth logging rather than firing and forgetting: <c>StartWithMainTransport</c> currently fails
+    /// with <c>E_OUTOFMEMORY</c>, which is traced to the trigger broker refusing over RPC, and a
+    /// refused background quota is a candidate explanation for a resource error of that shape.
+    /// </para>
+    /// </remarks>
+    private async Task EnsureBackgroundAccessAsync()
+    {
+        try
+        {
+            var before = BackgroundExecutionManager.GetAccessStatus();
+            var after = await BackgroundExecutionManager.RequestAccessAsync();
+            Log($"Background access: {before} -> {after}");
+        }
+        catch (Exception ex)
+        {
+            Log($"Background access request failed: {ex.Message}");
+        }
     }
 
     private async void OnDisconnectClick(object sender, RoutedEventArgs e)
@@ -116,6 +156,79 @@ public sealed partial class MainPage : Page
         {
             var status = await _agent.DisconnectProfileAsync(BuildProfile());
             Log($"DisconnectProfileAsync: {status}");
+        });
+    }
+
+    /// <summary>
+    /// Runs the loopback datagram exchange the plug-in's outer tunnel transport depends on.
+    /// </summary>
+    /// <remarks>
+    /// Here rather than in the plug-in because it needs no VPN channel: the app container check is
+    /// on the package, which is the same one. If this fails, nothing about the tunnel can work, and
+    /// finding that out costs a click instead of an activation.
+    /// </remarks>
+    private async void OnTestLoopbackClick(object sender, RoutedEventArgs e)
+    {
+        await RunAsync("Test loopback", async () => Log(await LoopbackProbe.RunAsync()));
+    }
+
+    /// <summary>
+    /// Drives the control channel trigger directly, without a VPN channel.
+    /// </summary>
+    /// <remarks>
+    /// The trigger is the part that actually fails, and unlike a VPN channel it can be created and
+    /// discarded repeatedly — so this is where the failure can be narrowed down without a deploy and
+    /// an activation per attempt.
+    /// </remarks>
+    private async void OnTestCctClick(object sender, RoutedEventArgs e)
+    {
+        await RunAsync("Test CCT", async () =>
+        {
+            // The socket IOCTL first: that is the call the VPN platform actually fails on, and
+            // unlike the trigger it is a plain socket operation we can issue directly.
+            Log(TransportSettingProbe.Run());
+            Log(await CctProbe.RunAsync());
+        });
+    }
+
+    /// <summary>
+    /// Dumps what the VPN platform actually has registered.
+    /// </summary>
+    /// <remarks>
+    /// Worth having as a button rather than reasoning about it: whether a profile exists, and how one
+    /// created here differs from one created in Settings, has been guessed at repeatedly. This is the
+    /// authoritative view, and it has to run inside the package to see the package's own profiles.
+    /// </remarks>
+    private async void OnListProfilesClick(object sender, RoutedEventArgs e)
+    {
+        await RunAsync("List profiles", async () =>
+        {
+            var profiles = await _agent.GetProfilesAsync();
+            Log($"GetProfilesAsync: {profiles.Count} profile(s)");
+
+            foreach (var profile in profiles)
+            {
+                if (profile is VpnPlugInProfile plugIn)
+                {
+                    var servers = string.Join(", ", plugIn.ServerUris);
+                    Log($"  plug-in '{plugIn.ProfileName}' pkg={plugIn.VpnPluginPackageFamilyName} "
+                        + $"servers=[{servers}] alwaysOn={plugIn.AlwaysOn} "
+                        + $"customConfig={plugIn.CustomConfiguration?.Length ?? 0} chars");
+
+                    if (plugIn.CustomConfiguration is { Length: > 0 } config)
+                    {
+                        Log($"    config starts: {config[..Math.Min(60, config.Length)]}");
+                    }
+                }
+                else if (profile is VpnNativeProfile native)
+                {
+                    Log($"  native  '{native.ProfileName}' type={native.NativeProtocolType}");
+                }
+                else
+                {
+                    Log($"  other   '{profile.ProfileName}' ({profile.GetType().Name})");
+                }
+            }
         });
     }
 
@@ -143,9 +256,15 @@ public sealed partial class MainPage : Page
             throw new InvalidOperationException("The port must be a number.");
         }
 
+        var profileName = ProfileNameBox.Text.Trim();
+        if (profileName.Length == 0)
+        {
+            throw new InvalidOperationException("Enter a profile name.");
+        }
+
         var profile = new VpnPlugInProfile
         {
-            ProfileName = ProfileName,
+            ProfileName = profileName,
             AlwaysOn = false,
             RememberCredentials = true,
 
@@ -181,6 +300,12 @@ public sealed partial class MainPage : Page
             root.Add(new XElement("UserName", userName));
         }
 
+        var networkAdapter = NetworkAdapterBox.Text.Trim();
+        if (networkAdapter.Length > 0)
+        {
+            root.Add(new XElement("NetworkAdapter", networkAdapter));
+        }
+
         var privateKeyPath = PrivateKeyPathBox.Text.Trim();
         if (privateKeyPath.Length > 0)
         {
@@ -196,6 +321,27 @@ public sealed partial class MainPage : Page
         if (SpikeProbeCheck.IsChecked == true)
         {
             root.Add(new XElement("SpikeProbe", "true"));
+        }
+
+        if (RemoteTransportCheck.IsChecked == true)
+        {
+            root.Add(new XElement("RemoteDummyTransport", "true"));
+        }
+
+        if (AssignIPv6Check.IsChecked == true)
+        {
+            root.Add(new XElement("AssignIPv6", "true"));
+        }
+
+        if (LargeFrameCheck.IsChecked == true)
+        {
+            root.Add(new XElement("LargeFrameSize", "true"));
+        }
+
+        var startDelay = StartDelayBox.Text.Trim();
+        if (startDelay.Length > 0 && startDelay != "0")
+        {
+            root.Add(new XElement("StartDelaySeconds", startDelay));
         }
 
         foreach (var dns in DnsBox.Text.Split(','))
@@ -233,6 +379,9 @@ public sealed partial class MainPage : Page
         ConnectButton.IsEnabled = !busy;
         DisconnectButton.IsEnabled = !busy;
         DeleteButton.IsEnabled = !busy;
+        LoopbackButton.IsEnabled = !busy;
+        CctButton.IsEnabled = !busy;
+        ListButton.IsEnabled = !busy;
     }
 
     private void Log(string message)
