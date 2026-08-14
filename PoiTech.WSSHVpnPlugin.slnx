@@ -18,4 +18,5 @@
     <Deploy />
   </Project>
   <Project Path="PoiTech.WSSHVpnPlugin.VpnPlugin/PoiTech.WSSHVpnPlugin.VpnPlugin.csproj" />
+  <Project Path="SSH.NET/src/Renci.SshNet/Renci.SshNet.csproj" />
 </Solution>
