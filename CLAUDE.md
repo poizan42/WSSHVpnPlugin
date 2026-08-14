@@ -41,7 +41,12 @@ dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj --filter F
 Two tests fail on some networks and are not your doing:
 `ConnectAsync_HostNameInvalid_*` and `ConnectAsync_ProxyHostNameInvalid_*` expect `HostNotFound`,
 which never comes back if the local resolver answers for invalid names. Baseline is
-**2338 passed / 2 failed / 13 skipped**.
+**2347 passed / 2 failed / 13 skipped**.
+
+`StreamSocketSshTransportTest` is the only coverage of the transport the plug-in actually uses —
+everything else drives `Session` over `SocketSshTransport`, which production never instantiates. It
+runs in under a second on loopback, so its `[Timeout(1000)]` is deliberate: the tests exist to catch
+a read that never returns, and waiting long defeats them.
 
 `Renci.SshNet.IntegrationTests` needs Docker (testcontainers). The submodule treats warnings as
 errors in Release and under CI, and applies StyleCop/Meziantou/Sonar analyzers, so changes there
@@ -142,6 +147,15 @@ upstream small. `RuntimeIdentifiers` is set because the plug-in publishes Native
 Do **not** set `UseUwp` on the fork. It authors no WinRT types, and turning it on enables CsWinRT's
 authoring analyzers, which flag every class implementing `IDisposable` or holding a `WaitHandle`
 (CsWinRT1028/CsWinRT1030) — dozens of warnings, and warnings are errors in Release.
+
+Two teardown behaviours were established by test and are easy to get wrong again:
+
+- `StreamSocket` has no half-close. `Shutdown()` uses `CancelIOAsync()`, which cancels only I/O
+  **already in flight** — so `Read` must short-circuit to `0` once shutdown has run, or a read issued
+  afterwards blocks forever.
+- The WinRT stream adapter reports socket failures as `COMException`, not `IOException`. Teardown
+  classification has to include it, and non-teardown failures are normalised to `IOException` so both
+  transports present the same shape of error.
 
 Those adapters live in `System.IO.WindowsRuntimeStreamExtensions`, and `AsBuffer`/`ToArray` in
 `System.Runtime.InteropServices.WindowsRuntime` — both **are** available under CsWinRT UWP. They are
