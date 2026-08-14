@@ -23,6 +23,7 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 ///   &lt;UserName&gt;alice&lt;/UserName&gt;
 ///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
 ///   &lt;ClientIPv4&gt;192.168.255.2&lt;/ClientIPv4&gt;
+///   &lt;NetworkAdapter&gt;192.168.1.20&lt;/NetworkAdapter&gt;
 ///   &lt;Mtu&gt;1400&lt;/Mtu&gt;
 ///   &lt;DnsServer&gt;1.1.1.1&lt;/DnsServer&gt;
 ///   &lt;InclusionRoute&gt;10.0.0.0/8&lt;/InclusionRoute&gt;
@@ -63,6 +64,57 @@ internal sealed class SshVpnConfiguration
     public bool SpikeProbe { get; private init; }
 
     /// <summary>
+    /// Gets a value indicating whether to hand the platform a real connection to the SSH server as
+    /// the outer tunnel transport, rather than a loopback pair.
+    /// </summary>
+    /// <remarks>
+    /// A spike switch, not a setting. The loopback shape is what the reference implementations ship,
+    /// but it has never got past <c>StartWithMainTransport</c> here, and another plug-in on this
+    /// machine starts successfully with a real remote socket. See <see cref="RemoteDummyTransport"/>.
+    /// </remarks>
+    public bool RemoteDummyTransport { get; private init; }
+
+    /// <summary>
+    /// Gets a value indicating whether to assign an IPv6 address.
+    /// </summary>
+    /// <remarks>
+    /// Effectively mandatory: <c>Start*</c> fails with <c>E_OUTOFMEMORY</c> when the assigned IPv6
+    /// address list is empty, which is what blocked this plug-in for a long time. Kept as a switch
+    /// only so that finding stays reproducible.
+    /// </remarks>
+    public bool AssignIPv6 { get; private init; }
+
+    /// <summary>
+    /// Gets a value indicating whether to route IPv6 into the tunnel as well as assigning an address.
+    /// </summary>
+    /// <remarks>
+    /// Off by default and expected to stay off until the stack can carry IPv6: routing it in with
+    /// nothing behind it black-holes IPv6 instead of leaving it on the physical interface.
+    /// </remarks>
+    public bool RouteIPv6 { get; private init; }
+
+    /// <summary>
+    /// Gets a value indicating whether to pass the reference implementation's frame sizes
+    /// (<c>mtu 1500</c>, <c>maxFrameSize 1512</c>) rather than our own.
+    /// </summary>
+    /// <remarks>
+    /// Note theirs has the frame size <em>above</em> the MTU, where ours had it below the documented
+    /// ceiling but only 100 bytes above a smaller MTU.
+    /// </remarks>
+    public bool LargeFrameSize { get; private init; }
+
+    /// <summary>
+    /// Gets how long to wait before starting the channel, so a debugger can be attached to the
+    /// background task host first.
+    /// </summary>
+    /// <remarks>
+    /// The host is created per activation and exits when the connect fails, and the whole sequence
+    /// takes about a second — far too little to attach by hand. Waiting here is the difference
+    /// between racing the process and simply catching it.
+    /// </remarks>
+    public uint StartDelaySeconds { get; private init; }
+
+    /// <summary>
     /// Gets the expected server host key fingerprint. When set, the host key is pinned to this
     /// value; when unset, the connection is refused rather than trusted blindly.
     /// </summary>
@@ -70,6 +122,18 @@ internal sealed class SshVpnConfiguration
 
     /// <summary>Gets the IPv4 address to assign to the virtual interface.</summary>
     public string ClientIPv4 { get; private init; } = "192.168.255.2";
+
+    /// <summary>
+    /// Gets the interface the SSH session should connect from — either an IPv4 literal or the name
+    /// of a network connection — or <see langword="null"/> to choose one automatically.
+    /// </summary>
+    /// <remarks>
+    /// Needed whenever the automatic choice cannot be trusted, and it cannot be trusted when this
+    /// tunnel runs nested inside another VPN: an adapter belonging to another VPN is
+    /// indistinguishable from a physical one, so SSH would be bound underneath it and leave that
+    /// VPN. See <see cref="OutboundInterface"/>.
+    /// </remarks>
+    public string? NetworkAdapter { get; private init; }
 
     /// <summary>Gets the MTU to advertise on the virtual interface.</summary>
     public uint Mtu { get; private init; } = DefaultMtu;
@@ -124,8 +188,14 @@ internal sealed class SshVpnConfiguration
             UserName = ReadString(root, "UserName"),
             PrivateKeyPath = ReadString(root, "PrivateKeyPath"),
             SpikeProbe = string.Equals(ReadString(root, "SpikeProbe"), "true", StringComparison.OrdinalIgnoreCase),
+            RemoteDummyTransport = string.Equals(ReadString(root, "RemoteDummyTransport"), "true", StringComparison.OrdinalIgnoreCase),
+            AssignIPv6 = string.Equals(ReadString(root, "AssignIPv6"), "true", StringComparison.OrdinalIgnoreCase),
+            RouteIPv6 = string.Equals(ReadString(root, "RouteIPv6"), "true", StringComparison.OrdinalIgnoreCase),
+            LargeFrameSize = string.Equals(ReadString(root, "LargeFrameSize"), "true", StringComparison.OrdinalIgnoreCase),
+            StartDelaySeconds = ReadUInt32(root, "StartDelaySeconds", 0),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
+            NetworkAdapter = ReadString(root, "NetworkAdapter"),
             Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),

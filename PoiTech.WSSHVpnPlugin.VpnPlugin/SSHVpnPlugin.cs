@@ -2,10 +2,8 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.Threading;
-using System.Threading.Tasks;
 using Windows.Networking;
 using Windows.Networking.Vpn;
-using Windows.System;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 
@@ -22,6 +20,11 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// packets for the return direction.
 /// </para>
 /// <para>
+/// The platform is given a loopback dummy socket as its outer tunnel transport, because it takes
+/// exclusive ownership of whatever it is given; see <see cref="LoopbackTransport"/>. Inbound packets
+/// come back through <see cref="Decapsulate"/>, which the doorbell on that socket is what summons.
+/// </para>
+/// <para>
 /// The instance is long-lived: the background task host creates it once and reuses it for every
 /// event on the channel. See <see cref="VpnBackgroundTask"/>.
 /// </para>
@@ -34,10 +37,27 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// </summary>
     private const long FailureReportIntervalMs = 10_000;
 
-    private readonly object _stateGate = new();
-    private SshVpnConnection? _connection;
+    /// <summary>
+    /// How many times <see cref="Decapsulate"/> re-checks an empty queue before giving up on the
+    /// batch, absorbing the race between a packet being queued and the doorbell being rung.
+    /// </summary>
+    private const int EmptyQueueSpins = 8;
 
+    /// <summary>
+    /// How long <see cref="Disconnect"/> gives the platform to call <see cref="Decapsulate"/> one
+    /// last time before reporting that it did not.
+    /// </summary>
+    private static readonly TimeSpan StopWatchdogDelay = TimeSpan.FromSeconds(2);
+
+    private readonly object _stateGate = new();
+
+    private SshVpnConnection? _connection;
+    private IOuterTransport? _transport;
+    private InboundPacketQueue? _inbound;
     private M0Spike? _spike;
+    private Timer? _stopWatchdog;
+    private int _channelStopped;
+    private int _decapsulateCalls;
 
     private long _encapsulateFailureCount;
     private long _lastFailureReportTicks;
@@ -50,6 +70,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         try
         {
+            // This instance outlives an activation, so a second connect inherits whatever the last
+            // one left behind. Clear it before anything else, or the old session and its sockets
+            // stay alive behind the new ones.
+            ResetState();
+
             var configuration = SshVpnConfiguration.FromChannelConfiguration(channel.Configuration);
             PluginLog.Info($"Connecting to {configuration.Host}:{configuration.Port}");
 
@@ -71,36 +96,53 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 throw new InvalidOperationException("No SSH user name was configured or supplied.");
             }
 
-            // SSH runs on a socket of its own, which is never handed to the platform. See the
-            // transport section of CLAUDE.md: the platform takes exclusive ownership of whatever is
-            // passed to AssociateTransport and reads it itself, so a session running over it has
-            // its bytes consumed — we watched the SSH banner come back corrupted.
+            // SSH runs on a socket of its own, bound to a physical interface so that it does not
+            // route into the tunnel it is about to carry.
             var connection = SshVpnConnection.Establish(
                 configuration,
                 userName,
-                credential?.PasskeyCredential?.Password ?? string.Empty);
+                credential?.PasskeyCredential?.Password ?? string.Empty,
+                OutboundInterface.Select(configuration.NetworkAdapter));
+
+            IOuterTransport transport = configuration.RemoteDummyTransport
+                ? RemoteDummyTransport.Create(channel, configuration.Host, configuration.Port)
+                : LoopbackTransport.Create(channel);
+
+            var inbound = new InboundPacketQueue(channel);
 
             lock (_stateGate)
             {
-                _connection?.Dispose();
                 _connection = connection;
+                _transport = transport;
+                _inbound = inbound;
+                _channelStopped = 0;
             }
 
-            // Starting the tunnel needs the outer transport reworked first: the platform must be
-            // given a loopback dummy socket to own, while this SSH socket stays bound to the
-            // physical interface and out of the tunnel. Until that exists there is nothing sound to
-            // pass to Start, and every ordering of AssociateTransport and Start* has been shown to
-            // fail. Deliberately explicit rather than half-working.
-            //
-            // Once it starts, this is where the channel starts and, when configured, the M0 spike
-            // runs: M0Spike.Start(channel, connection, configuration.ClientIPv4).
-            throw new NotSupportedException(
-                "The outer tunnel transport has not been reworked yet; see the transport section of CLAUDE.md.");
+            if (configuration.StartDelaySeconds > 0)
+            {
+                PluginLog.Info(
+                    $"Waiting {configuration.StartDelaySeconds}s before Start so a debugger can attach "
+                    + $"to this process (pid {Environment.ProcessId}).");
+                Thread.Sleep(TimeSpan.FromSeconds(configuration.StartDelaySeconds));
+            }
+
+            // Everything the platform might immediately call into has to exist before this: it may
+            // ask for packets as soon as the channel starts.
+            StartChannel(channel, configuration, transport);
+
+            if (configuration.SpikeProbe)
+            {
+                var spike = M0Spike.Start(channel, connection, inbound, transport, configuration.ClientIPv4);
+                lock (_stateGate)
+                {
+                    _spike = spike;
+                }
+            }
         }
         catch (Exception ex)
         {
             PluginLog.Error("Connect failed", ex);
-            CloseConnection();
+            ResetState();
 
             // TerminateConnection, not SetErrorMessage: the latter is documented as not supported.
             channel.TerminateConnection(ex.Message);
@@ -108,35 +150,44 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     }
 
     /// <summary>
-    /// Starts the channel, trying each candidate argument shape until one is accepted.
+    /// Starts the channel over the loopback dummy transport.
     /// </summary>
     /// <remarks>
     /// Exactly one attempt: the channel is single-shot, and a second call after a rejected one
     /// returns <c>E_ILLEGAL_METHOD_CALL</c> rather than being retried on its merits.
     /// </remarks>
-    private static void StartChannel(VpnChannel channel, SshVpnConfiguration configuration)
+    private static void StartChannel(VpnChannel channel, SshVpnConfiguration configuration, IOuterTransport transport)
     {
-        // A stable identifier for the virtual interface; a fixed locally-administered
-        // MAC-shaped value serves.
-        var interfaceId = new VpnInterfaceId(new byte[] { 0x02, 0x57, 0x53, 0x53, 0x48, 0x01 });
+        // Every other difference from a known-good implementation has now been eliminated by
+        // experiment, so the arguments are the last candidate. These are Maple's exact values,
+        // including an assigned IPv6 address and IPv6 routes we have no stack for: the point is to
+        // replicate something that ships, not to be correct. If this is what starts the channel, the
+        // differences get bisected from here.
+        var ipv4 = new List<HostName> { new HostName(configuration.ClientIPv4) };
+        var ipv6 = configuration.AssignIPv6
+            ? new List<HostName> { new HostName("fd00::2") }
+            : new List<HostName>();
+        var mtu = configuration.LargeFrameSize ? 1500u : configuration.Mtu;
+        var frameSize = configuration.LargeFrameSize ? 1512u : GetMaxFrameSize(configuration.Mtu);
 
         try
         {
-            channel.StartExistingTransports(
-                new List<HostName> { new HostName(configuration.ClientIPv4) }, // assigned IPv4
-                new List<HostName>(),                                          // assigned IPv6
-                interfaceId,
+            channel.StartWithMainTransport(
+                ipv4,
+                ipv6,
+                null,                                                          // interface id
                 BuildRouteAssignment(configuration),
                 BuildDomainNameAssignment(configuration),
-                configuration.Mtu,
-                GetMaxFrameSize(configuration.Mtu),
-                false);                                                        // reserved
+                mtu,
+                frameSize,
+                false,                                                         // reserved
+                transport.Transport);
 
-            PluginLog.Info("StartExistingTransports accepted");
+            PluginLog.Info($"StartWithMainTransport accepted (mtu {mtu}, frame {frameSize}, ipv6 {ipv6.Count})");
         }
         catch (Exception ex)
         {
-            PluginLog.Error($"StartExistingTransports rejected: 0x{ex.HResult:X8}", ex);
+            PluginLog.Error($"StartWithMainTransport rejected: 0x{ex.HResult:X8}", ex);
             throw;
         }
     }
@@ -185,6 +236,19 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// <para>
+    /// Deliberately does not call <see cref="VpnChannel.Stop"/>. Buffers the platform has lent us
+    /// and not had back block the VPN background task, and the platform kills the whole host process
+    /// when it stops responding. Instead the inbound queue is closed and the doorbell rung once
+    /// more, so that <see cref="Decapsulate"/> returns what is outstanding and stops the channel
+    /// itself once there is nothing left.
+    /// </para>
+    /// <para>
+    /// Whether the platform actually delivers that last call is exactly what M0′ is meant to find
+    /// out, so the watchdog reports which way it went rather than papering over it.
+    /// </para>
+    /// </remarks>
     public void Disconnect(VpnChannel channel)
     {
         ArgumentNullException.ThrowIfNull(channel);
@@ -192,8 +256,24 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         PluginLog.Info("Disconnecting");
         try
         {
-            CloseConnection();
-            channel.Stop();
+            IOuterTransport? transport;
+            InboundPacketQueue? inbound;
+
+            lock (_stateGate)
+            {
+                transport = _transport;
+                inbound = _inbound;
+            }
+
+            // Stop producing before stopping the session, so nothing tries to queue a packet into a
+            // connection that is going away.
+            inbound?.Close();
+            CloseSession();
+
+            // One last ring, after closing: this is what gets us the call in which the queue is
+            // observed drained and the channel is stopped.
+            transport?.RingDoorbell();
+            ArmStopWatchdog(channel);
         }
         catch (Exception ex)
         {
@@ -258,13 +338,18 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     }
 
     /// <summary>
-    /// Turns bytes received on a platform-owned transport back into IP packets.
+    /// Hands the platform the inbound packets waiting to be injected.
     /// </summary>
     /// <remarks>
-    /// Unused for now. The platform only raises this event for transports it reads on the
-    /// plug-in's behalf; inbound traffic here is produced by the user-space stack and injected
-    /// with <see cref="VpnChannel.RequestVpnPacketBuffer"/> /
-    /// <see cref="VpnChannel.AppendVpnReceivePacketBuffer"/> from the SSH receive loop instead.
+    /// <para>
+    /// <paramref name="encapBuffer"/> is ignored: nothing is ever sent over the dummy transport, so
+    /// the only thing that arrives on it is our own doorbell byte. The call itself is the point —
+    /// it is the one place we are allowed to give the platform buffers back on the inbound path.
+    /// </para>
+    /// <para>
+    /// The packets are already written into the platform's own buffers by whoever produced them, so
+    /// there is nothing to copy here; appending a buffer is what returns it.
+    /// </para>
     /// </remarks>
     public void Decapsulate(
         VpnChannel channel,
@@ -272,15 +357,71 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         VpnPacketBufferList decapsulatedPackets,
         VpnPacketBufferList controlPacketsToSend)
     {
-        // Intentionally empty; see the remarks above.
+        var inbound = GetInbound();
+        if (inbound is null || decapsulatedPackets is null)
+        {
+            return;
+        }
+
+        LogFirstDecapsulateCalls(encapBuffer);
+
+        var spins = 0;
+        var appended = 0;
+
+        while (true)
+        {
+            if (inbound.TryDequeue(out var buffer))
+            {
+                decapsulatedPackets.Append(buffer);
+                appended++;
+                spins = 0;
+                continue;
+            }
+
+            // Nothing left, and nothing more coming: this is the call Disconnect asked for.
+            if (inbound.IsFinished)
+            {
+                StopChannel(channel, $"the inbound queue drained after disconnect, {appended} returned");
+                return;
+            }
+
+            if (++spins >= EmptyQueueSpins)
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Logs the first few decapsulate calls, which is how we find out whether the doorbell works at
+    /// all and what the platform hands us when it rings.
+    /// </summary>
+    private void LogFirstDecapsulateCalls(VpnPacketBuffer? encapBuffer)
+    {
+        const int LogBudget = 5;
+
+        var call = Interlocked.Increment(ref _decapsulateCalls);
+        if (call > LogBudget)
+        {
+            return;
+        }
+
+        var length = encapBuffer?.Buffer?.Length;
+        PluginLog.Info(
+            string.Format(
+                CultureInfo.InvariantCulture,
+                "Decapsulate called (#{0}), encapBuffer {1}",
+                call,
+                length is null ? "absent" : $"{length} bytes"));
     }
 
     /// <summary>
     /// Supplies a keep-alive payload for the platform to send on an idle tunnel.
     /// </summary>
     /// <remarks>
-    /// SSH runs its own keep-alive (<see cref="Renci.SshNet.BaseClient.KeepAliveInterval"/>), so
-    /// no platform-level keep-alive packet is produced.
+    /// SSH runs its own keep-alive (<see cref="Renci.SshNet.BaseClient.KeepAliveInterval"/>), and
+    /// the transport the platform would send this on is a dummy that carries nothing, so no
+    /// platform-level keep-alive packet is produced.
     /// </remarks>
     public void GetKeepAlivePayload(VpnChannel channel, out VpnPacketBuffer keepAlivePacket)
     {
@@ -295,6 +436,14 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         }
     }
 
+    private InboundPacketQueue? GetInbound()
+    {
+        lock (_stateGate)
+        {
+            return _inbound;
+        }
+    }
+
     private M0Spike? GetSpike()
     {
         lock (_stateGate)
@@ -303,7 +452,10 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         }
     }
 
-    private void CloseConnection()
+    /// <summary>
+    /// Stops the spike and the SSH session, leaving the channel and its transport alone.
+    /// </summary>
+    private void CloseSession()
     {
         SshVpnConnection? connection;
         M0Spike? spike;
@@ -321,14 +473,144 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         connection?.Dispose();
     }
 
+    /// <summary>
+    /// Drops everything from a previous activation.
+    /// </summary>
+    private void ResetState()
+    {
+        CloseSession();
+
+        IOuterTransport? transport;
+        Timer? watchdog;
+
+        lock (_stateGate)
+        {
+            transport = _transport;
+            _transport = null;
+            _inbound = null;
+            watchdog = _stopWatchdog;
+            _stopWatchdog = null;
+        }
+
+        watchdog?.Dispose();
+        transport?.Dispose();
+
+        Volatile.Write(ref _decapsulateCalls, 0);
+    }
+
+    /// <summary>
+    /// Stops the channel, once.
+    /// </summary>
+    private void StopChannel(VpnChannel? channel, string reason)
+    {
+        if (channel is null || Interlocked.Exchange(ref _channelStopped, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            channel.Stop();
+            PluginLog.Info($"Channel stopped: {reason}");
+        }
+        catch (Exception ex)
+        {
+            PluginLog.Error($"Stopping the channel failed ({reason})", ex);
+        }
+
+        ResetState();
+    }
+
+    /// <summary>
+    /// Watches for the last decapsulate call that <see cref="Disconnect"/> asked for.
+    /// </summary>
+    /// <remarks>
+    /// If it never comes, the channel is left running rather than stopped behind the platform's
+    /// back: buffers we have not returned are precisely what makes <see cref="VpnChannel.Stop"/>
+    /// dangerous, so stopping anyway would trade a stall for a killed host process. The queue state
+    /// is logged either way, because which branch happens is a fact about the platform worth having.
+    /// </remarks>
+    private void ArmStopWatchdog(VpnChannel channel)
+    {
+        var watchdog = new Timer(
+            static state =>
+            {
+                var (plugin, watched) = ((SSHVpnPlugin, VpnChannel))state!;
+                plugin.OnStopWatchdog(watched);
+            },
+            (this, channel),
+            StopWatchdogDelay,
+            Timeout.InfiniteTimeSpan);
+
+        Timer? previous;
+        lock (_stateGate)
+        {
+            previous = _stopWatchdog;
+            _stopWatchdog = watchdog;
+        }
+
+        previous?.Dispose();
+    }
+
+    private void OnStopWatchdog(VpnChannel channel)
+    {
+        if (Volatile.Read(ref _channelStopped) != 0)
+        {
+            return;
+        }
+
+        var inbound = GetInbound();
+        if (inbound is null || inbound.IsFinished)
+        {
+            // Nothing of the platform's is still in our hands, so stopping is safe even though the
+            // platform never came back to us.
+            PluginLog.Error(
+                "The platform did not call Decapsulate again after Disconnect; stopping the channel " +
+                "directly, which is safe only because the inbound queue is empty.");
+            StopChannel(channel, "watchdog, queue empty");
+            return;
+        }
+
+        PluginLog.Error(
+            "The platform did not call Decapsulate again after Disconnect and the inbound queue " +
+            "still holds platform buffers. Not stopping the channel: returning those buffers is the " +
+            "precondition for stopping, and stopping without them risks the host process.");
+    }
+
+    /// <summary>
+    /// Builds the route assignment.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A literal <c>0.0.0.0/0</c> is never used, even though it is what "send everything" means. It
+    /// is recorded in the reference implementation that a default route written that way pulls
+    /// traffic back into the tunnel even from a socket bound to another interface, which would take
+    /// the SSH session down with it. The split default covers exactly the same addresses and behaves.
+    /// </para>
+    /// <para>
+    /// Only IPv4 routes are added, because only an IPv4 address is assigned: the platform hangs when
+    /// given routes for a family it has no address for. The consequence is that IPv6 traffic keeps
+    /// using the physical interface — it leaves the tunnel rather than being blocked.
+    /// </para>
+    /// </remarks>
     private static VpnRouteAssignment BuildRouteAssignment(SshVpnConfiguration configuration)
     {
         var assignment = new VpnRouteAssignment { ExcludeLocalSubnets = true };
 
         if (configuration.InclusionRoutes.Count == 0)
         {
-            // Default route: everything except the local subnets goes through the tunnel.
-            assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName("0.0.0.0"), 0));
+            assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName("0.0.0.0"), 1));
+            assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName("128.0.0.0"), 1));
+
+            // Deliberately no IPv6 routes, even though an IPv6 address has to be assigned for Start
+            // to succeed at all. There is no IPv6 stack behind this tunnel, so routing IPv6 into it
+            // would black-hole it; leaving it unrouted keeps it on the physical interface. That is a
+            // leak, and an accepted one until the stack grows an IPv6 path.
+            if (configuration.RouteIPv6)
+            {
+                assignment.Ipv6InclusionRoutes.Add(new VpnRoute(new HostName("::"), 1));
+                assignment.Ipv6InclusionRoutes.Add(new VpnRoute(new HostName("8000::"), 1));
+            }
         }
         else
         {
@@ -355,7 +637,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             dnsServers.Add(new HostName(server));
         }
 
-        // "." is the catch-all suffix: resolve every name through these servers.
+        // "." is the catch-all suffix: resolve every name through these servers. Note that this
+        // takes effect the moment the channel starts, so until DNS is actually carried, a connected
+        // tunnel means the machine cannot resolve names at all.
         assignment.DomainNameList.Add(
             new VpnDomainNameInfo(".", VpnDomainNameType.Suffix, dnsServers, new List<HostName>()));
 

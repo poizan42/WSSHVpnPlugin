@@ -4,6 +4,7 @@ using System.Threading;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Connection;
+using Windows.Networking;
 using Windows.Networking.Vpn;
 using Windows.Storage;
 using Windows.Storage.Streams;
@@ -18,41 +19,36 @@ internal sealed class SshVpnConnection : IDisposable
     private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
 
     private readonly SshClient _client;
-    private readonly StreamSocketSshTransportFactory _transportFactory;
     private readonly string? _expectedFingerprint;
     private int _disposed;
 
-    private SshVpnConnection(
-        SshClient client,
-        StreamSocketSshTransportFactory transportFactory,
-        string? expectedFingerprint)
+    private SshVpnConnection(SshClient client, string? expectedFingerprint)
     {
         _client = client;
-        _transportFactory = transportFactory;
         _expectedFingerprint = expectedFingerprint;
     }
 
     /// <summary>
-    /// Gets the socket the platform should treat as the outer tunnel transport, so that the SSH
-    /// connection's own traffic is not routed back into the tunnel it carries.
-    /// </summary>
-    /// <remarks>
-    /// This is the same <c>StreamSocket</c> the session is running over. The SSH.NET fork was
-    /// changed to accept a caller-supplied transport precisely so that this socket exists as a
-    /// WinRT object — see <see cref="StreamSocketSshTransport"/>.
-    /// </remarks>
-    public object OuterTunnelTransport =>
-        _transportFactory.Socket
-        ?? throw new InvalidOperationException("The SSH session has not been established.");
-
-    /// <summary>
     /// Connects and authenticates to the SSH server described by <paramref name="configuration"/>.
     /// </summary>
-    public static SshVpnConnection Establish(SshVpnConfiguration configuration, string userName, string password)
+    /// <param name="configuration">The profile to connect with.</param>
+    /// <param name="userName">The user to authenticate as.</param>
+    /// <param name="password">The password, when the profile does not name a private key.</param>
+    /// <param name="localAddress">
+    /// The local address to connect from, or <see langword="null"/> to let the system choose.
+    /// </param>
+    /// <remarks>
+    /// The session is bound to a chosen local address so that its own packets keep using the
+    /// physical interface once the tunnel takes over the default route. Without that, the tunnel
+    /// carries the connection that carries the tunnel.
+    /// </remarks>
+    public static SshVpnConnection Establish(
+        SshVpnConfiguration configuration,
+        string userName,
+        string password,
+        HostName? localAddress)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-
-        var transportFactory = new StreamSocketSshTransportFactory();
 
         // TODO: keyboard-interactive, for servers that require it.
         var connectionInfo = new ConnectionInfo(
@@ -61,15 +57,14 @@ internal sealed class SshVpnConnection : IDisposable
             userName,
             CreateAuthenticationMethod(configuration, userName, password))
         {
-            // Run the session over a WinRT StreamSocket rather than System.Net.Sockets.Socket, so
-            // the platform can be handed the socket and keep this connection out of the tunnel.
-            TransportFactory = transportFactory,
+            // A WinRT StreamSocket rather than System.Net.Sockets.Socket: the plug-in runs in an app
+            // container, where the WinRT socket types are what is available.
+            TransportFactory = new StreamSocketSshTransportFactory(localAddress),
         };
 
         var client = new SshClient(connectionInfo);
         var connection = new SshVpnConnection(
             client,
-            transportFactory,
             NormalizeFingerprint(configuration.HostKeyFingerprint));
         try
         {
