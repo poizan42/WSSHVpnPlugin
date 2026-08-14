@@ -38,10 +38,10 @@ dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj
 dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj --filter FullyQualifiedName~ChannelDirectTcpip
 ```
 
-Two tests fail on some networks and are not your doing:
-`ConnectAsync_HostNameInvalid_*` and `ConnectAsync_ProxyHostNameInvalid_*` expect `HostNotFound`,
-which never comes back if the local resolver answers for invalid names. Baseline is
-**2347 passed / 2 failed / 13 skipped**.
+The suite is **2363 tests, 13 skipped**. Two of them — `ConnectAsync_HostNameInvalid_*` and
+`ConnectAsync_ProxyHostNameInvalid_*` — depend on the local resolver rejecting invalid host names,
+so they pass or fail with the network rather than with your changes. Don't chase them, and don't
+treat a fixed pass count as the baseline.
 
 `StreamSocketSshTransportTest` is the only coverage of the transport the plug-in actually uses —
 everything else drives `Session` over `SocketSshTransport`, which production never instantiates. It
