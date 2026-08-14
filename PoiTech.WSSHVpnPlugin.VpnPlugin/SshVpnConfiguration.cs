@@ -51,6 +51,18 @@ internal sealed class SshVpnConfiguration
     public string? UserName { get; private init; }
 
     /// <summary>
+    /// Gets the path of an unencrypted private key to authenticate with, or <see langword="null"/>
+    /// to authenticate with a password.
+    /// </summary>
+    public string? PrivateKeyPath { get; private init; }
+
+    /// <summary>
+    /// Gets a value indicating whether to run the M0 diagnostic probes. Scaffolding; see
+    /// <see cref="M0Spike"/>.
+    /// </summary>
+    public bool SpikeProbe { get; private init; }
+
+    /// <summary>
     /// Gets the expected server host key fingerprint. When set, the host key is pinned to this
     /// value; when unset, the connection is refused rather than trusted blindly.
     /// </summary>
@@ -79,13 +91,10 @@ internal sealed class SshVpnConfiguration
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var host = GetFirstServerHost(configuration.ServerHostNameList)
-            ?? throw new FormatException("The VPN profile does not specify a server host name.");
-
         var custom = configuration.CustomField;
         if (string.IsNullOrWhiteSpace(custom))
         {
-            return new SshVpnConfiguration(host);
+            throw new FormatException("The VPN profile carries no custom configuration.");
         }
 
         XElement root;
@@ -105,16 +114,46 @@ internal sealed class SshVpnConfiguration
                 $"Expected a <{RootElementName}> root element but found <{root.Name.LocalName}>.");
         }
 
+        var host = ReadString(root, "Host")
+            ?? TryGetFirstServerHost(configuration)
+            ?? throw new FormatException("The VPN profile does not specify a server host name.");
+
         return new SshVpnConfiguration(host)
         {
             Port = ReadUInt32(root, "Port", 22),
             UserName = ReadString(root, "UserName"),
+            PrivateKeyPath = ReadString(root, "PrivateKeyPath"),
+            SpikeProbe = string.Equals(ReadString(root, "SpikeProbe"), "true", StringComparison.OrdinalIgnoreCase),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
             Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),
         };
+    }
+
+    /// <summary>
+    /// Reads the host from the platform's server list, if it will give us one.
+    /// </summary>
+    /// <remarks>
+    /// Observed: for a plug-in profile whose <c>ServerUris</c> were set, merely reading
+    /// <see cref="VpnChannelConfiguration.ServerHostNameList"/> throws
+    /// <c>ArgumentException("hostName")</c> from the projection — with both an <c>ssh://</c> and an
+    /// <c>https://</c> URI, so it is not about the scheme. The host is therefore carried in the
+    /// custom configuration, which we control end to end, and this is only a fallback so that a
+    /// profile provisioned by other means (MDM, say) still works.
+    /// </remarks>
+    private static string? TryGetFirstServerHost(VpnChannelConfiguration configuration)
+    {
+        try
+        {
+            return GetFirstServerHost(configuration.ServerHostNameList);
+        }
+        catch (Exception ex)
+        {
+            PluginLog.Error("The platform would not surface ServerHostNameList; using <Host> instead", ex);
+            return null;
+        }
     }
 
     private static string? GetFirstServerHost(IReadOnlyList<HostName>? servers)

@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using System.Xml.Linq;
 using Windows.ApplicationModel;
 using Windows.Networking.Vpn;
+using Windows.Storage;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 
@@ -27,6 +28,55 @@ public sealed partial class MainPage : Page
     public MainPage()
     {
         InitializeComponent();
+        LoadSettings();
+    }
+
+    /// <summary>
+    /// Restores the form from local settings.
+    /// </summary>
+    /// <remarks>
+    /// The values are per-machine and deliberately not committed anywhere: this repository is
+    /// public, and the host, user name and key path are not ours to publish.
+    /// </remarks>
+    private void LoadSettings()
+    {
+        var values = ApplicationData.Current.LocalSettings.Values;
+
+        foreach (var (box, key) in SettingsBoxes())
+        {
+            if (values.ContainsKey(key) && values[key] is string text)
+            {
+                box.Text = text;
+            }
+        }
+
+        SpikeProbeCheck.IsChecked = values.ContainsKey("SpikeProbe") && values["SpikeProbe"] is true;
+    }
+
+    private void SaveSettings()
+    {
+        var values = ApplicationData.Current.LocalSettings.Values;
+
+        foreach (var (box, key) in SettingsBoxes())
+        {
+            values[key] = box.Text;
+        }
+
+        values["SpikeProbe"] = SpikeProbeCheck.IsChecked == true;
+    }
+
+    private (TextBox Box, string Key)[] SettingsBoxes()
+    {
+        return new[]
+        {
+            (HostBox, "Host"),
+            (PortBox, "Port"),
+            (UserNameBox, "UserName"),
+            (PrivateKeyPathBox, "PrivateKeyPath"),
+            (FingerprintBox, "HostKeyFingerprint"),
+            (ClientAddressBox, "ClientIPv4"),
+            (DnsBox, "DnsServers"),
+        };
     }
 
     private async void OnSaveProfileClick(object sender, RoutedEventArgs e)
@@ -34,7 +84,19 @@ public sealed partial class MainPage : Page
         await RunAsync("Save profile", async () =>
         {
             var profile = BuildProfile();
+
+            // Add refuses when a profile of this name already exists, so fall back to update.
+            // Getting this wrong is quiet and expensive: the save reports a failure, the old
+            // profile stays in place, and the next Connect exercises the previous settings.
             var status = await _agent.AddProfileFromObjectAsync(profile);
+            if (status != VpnManagementErrorStatus.Ok)
+            {
+                Log($"AddProfileFromObjectAsync: {status}; updating the existing profile instead");
+                status = await _agent.UpdateProfileFromObjectAsync(profile);
+                Log($"UpdateProfileFromObjectAsync: {status}");
+                return;
+            }
+
             Log($"AddProfileFromObjectAsync: {status}");
         });
     }
@@ -68,6 +130,8 @@ public sealed partial class MainPage : Page
 
     private VpnPlugInProfile BuildProfile()
     {
+        SaveSettings();
+
         var host = HostBox.Text.Trim();
         if (host.Length == 0)
         {
@@ -91,8 +155,12 @@ public sealed partial class MainPage : Page
             CustomConfiguration = BuildCustomConfiguration(port),
         };
 
-        // The platform hands these to the plug-in as VpnChannelConfiguration.ServerHostNameList.
-        profile.ServerUris.Add(new Uri($"ssh://{host}:{port}"));
+        // The platform hands these to the plug-in as VpnChannelConfiguration.ServerHostNameList,
+        // which it builds by pulling the host out of each URI. The scheme has to be one WinRT's own
+        // URI parser recognises — with "ssh://" it fails to find a host at all and reading
+        // ServerHostNameList throws ArgumentException("hostName"). The scheme is otherwise
+        // meaningless here; the port the plug-in dials comes from <Port> in the custom config.
+        profile.ServerUris.Add(new Uri($"https://{host}"));
 
         return profile;
     }
@@ -101,6 +169,9 @@ public sealed partial class MainPage : Page
     {
         var root = new XElement(
             "SshVpnConfiguration",
+            // Carried here rather than relied upon from ServerUris: reading the platform's
+            // ServerHostNameList throws for this profile. See SshVpnConfiguration.TryGetFirstServerHost.
+            new XElement("Host", HostBox.Text.Trim()),
             new XElement("Port", port.ToString(CultureInfo.InvariantCulture)),
             new XElement("ClientIPv4", ClientAddressBox.Text.Trim()));
 
@@ -110,10 +181,21 @@ public sealed partial class MainPage : Page
             root.Add(new XElement("UserName", userName));
         }
 
+        var privateKeyPath = PrivateKeyPathBox.Text.Trim();
+        if (privateKeyPath.Length > 0)
+        {
+            root.Add(new XElement("PrivateKeyPath", privateKeyPath));
+        }
+
         var fingerprint = FingerprintBox.Text.Trim();
         if (fingerprint.Length > 0)
         {
             root.Add(new XElement("HostKeyFingerprint", fingerprint));
+        }
+
+        if (SpikeProbeCheck.IsChecked == true)
+        {
+            root.Add(new XElement("SpikeProbe", "true"));
         }
 
         foreach (var dns in DnsBox.Text.Split(','))
