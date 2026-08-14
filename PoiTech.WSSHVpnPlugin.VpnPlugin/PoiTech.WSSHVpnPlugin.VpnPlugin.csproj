@@ -1,12 +1,24 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
-    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <!--
+      AppendVpnReceivePacketBuffer / FlushVpnReceivePacketBuffers arrived in 10.0.20348.0 and the
+      packet path depends on them unconditionally. Note the platform-compatibility analyzer does NOT
+      flag this, so a lower minimum here fails at runtime rather than at build.
+    -->
+    <TargetPlatformMinVersion>10.0.20348.0</TargetPlatformMinVersion>
     <Nullable>enable</Nullable>
     <UseUwp>true</UseUwp>
     <DefaultLanguage>en-US</DefaultLanguage>
     <PublishAot>true</PublishAot>
     <DisableRuntimeMarshalling>true</DisableRuntimeMarshalling>
+
+    <!--
+      The packet path writes IP headers straight into the platform's VpnPacketBuffer, reached through
+      IMemoryBufferByteAccess, which hands back a byte*. DataReader/DataWriter cannot fill an existing
+      IBuffer in place and would allocate per packet.
+    -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <!--
       This is a non-XAML library (just a simple WinRT component), so the XAML compiler is not needed.

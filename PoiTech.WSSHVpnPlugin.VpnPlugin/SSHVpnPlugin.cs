@@ -1,8 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading;
+using System.Threading.Tasks;
 using Windows.Networking;
 using Windows.Networking.Vpn;
+using Windows.System;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 
@@ -25,8 +28,20 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// </remarks>
 public sealed class SSHVpnPlugin : IVpnPlugIn
 {
+    /// <summary>
+    /// How long to wait between reporting outbound packet failures. <see cref="Encapsulate"/> runs
+    /// at line rate, so an unconditional log there fills the disk on any systematic failure.
+    /// </summary>
+    private const long FailureReportIntervalMs = 10_000;
+
     private readonly object _stateGate = new();
     private SshVpnConnection? _connection;
+
+    private M0Spike? _spike;
+
+    private long _encapsulateFailureCount;
+    private long _lastFailureReportTicks;
+    private Exception? _lastEncapsulateFailure;
 
     /// <inheritdoc/>
     public void Connect(VpnChannel channel)
@@ -38,21 +53,32 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             var configuration = SshVpnConfiguration.FromChannelConfiguration(channel.Configuration);
             PluginLog.Info($"Connecting to {configuration.Host}:{configuration.Port}");
 
-            var credential = channel.RequestCredentials(
-                VpnCredentialType.UsernamePassword,
-                isRetry: false,
-                isSingleSignOnCredential: false,
-                certificate: null);
-            var userName = configuration.UserName ?? credential.PasskeyCredential?.UserName;
+            // A key-based profile that already names its user needs nothing from the user, and
+            // asking anyway would put a prompt in front of a background task for no reason.
+            var needsCredentials = configuration.PrivateKeyPath is null || configuration.UserName is null;
+
+            var credential = needsCredentials
+                ? channel.RequestCredentials(
+                    VpnCredentialType.UsernamePassword,
+                    isRetry: false,
+                    isSingleSignOnCredential: false,
+                    certificate: null)
+                : null;
+
+            var userName = configuration.UserName ?? credential?.PasskeyCredential?.UserName;
             if (string.IsNullOrEmpty(userName))
             {
                 throw new InvalidOperationException("No SSH user name was configured or supplied.");
             }
 
+            // SSH runs on a socket of its own, which is never handed to the platform. See the
+            // transport section of CLAUDE.md: the platform takes exclusive ownership of whatever is
+            // passed to AssociateTransport and reads it itself, so a session running over it has
+            // its bytes consumed — we watched the SSH banner come back corrupted.
             var connection = SshVpnConnection.Establish(
                 configuration,
                 userName,
-                credential.PasskeyCredential?.Password ?? string.Empty);
+                credential?.PasskeyCredential?.Password ?? string.Empty);
 
             lock (_stateGate)
             {
@@ -60,33 +86,102 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 _connection = connection;
             }
 
-            // The StreamSocket the SSH session is running over. Handing it to the platform is what
-            // keeps the SSH connection's own traffic out of the tunnel being installed.
-            var transport = connection.OuterTunnelTransport;
-
-            // StartWithMainTransport rather than the older Start overload: it takes a
-            // VpnDomainNameAssignment (per-namespace DNS) instead of the legacy
-            // VpnNamespaceAssignment. StartWithTrafficFilter is the next step up, if per-app or
-            // per-port filtering is wanted later.
-            channel.StartWithMainTransport(
-                new List<HostName> { new HostName(configuration.ClientIPv4) }, // assigned IPv4 addresses
-                null,                                                          // assigned IPv6 addresses
-                null,                                                          // VpnInterfaceId
-                BuildRouteAssignment(configuration),
-                BuildDomainNameAssignment(configuration),
-                configuration.Mtu,                                             // MTU
-                configuration.Mtu + 128,                                       // max frame size
-                false,                                                         // reserved
-                transport);                                                    // main outer tunnel transport
-
-            PluginLog.Info("Channel started");
+            // Starting the tunnel needs the outer transport reworked first: the platform must be
+            // given a loopback dummy socket to own, while this SSH socket stays bound to the
+            // physical interface and out of the tunnel. Until that exists there is nothing sound to
+            // pass to Start, and every ordering of AssociateTransport and Start* has been shown to
+            // fail. Deliberately explicit rather than half-working.
+            //
+            // Once it starts, this is where the channel starts and, when configured, the M0 spike
+            // runs: M0Spike.Start(channel, connection, configuration.ClientIPv4).
+            throw new NotSupportedException(
+                "The outer tunnel transport has not been reworked yet; see the transport section of CLAUDE.md.");
         }
         catch (Exception ex)
         {
             PluginLog.Error("Connect failed", ex);
             CloseConnection();
-            channel.SetErrorMessage(ex.Message);
+
+            // TerminateConnection, not SetErrorMessage: the latter is documented as not supported.
+            channel.TerminateConnection(ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Starts the channel, trying each candidate argument shape until one is accepted.
+    /// </summary>
+    /// <remarks>
+    /// Exactly one attempt: the channel is single-shot, and a second call after a rejected one
+    /// returns <c>E_ILLEGAL_METHOD_CALL</c> rather than being retried on its merits.
+    /// </remarks>
+    private static void StartChannel(VpnChannel channel, SshVpnConfiguration configuration)
+    {
+        // A stable identifier for the virtual interface; a fixed locally-administered
+        // MAC-shaped value serves.
+        var interfaceId = new VpnInterfaceId(new byte[] { 0x02, 0x57, 0x53, 0x53, 0x48, 0x01 });
+
+        try
+        {
+            channel.StartExistingTransports(
+                new List<HostName> { new HostName(configuration.ClientIPv4) }, // assigned IPv4
+                new List<HostName>(),                                          // assigned IPv6
+                interfaceId,
+                BuildRouteAssignment(configuration),
+                BuildDomainNameAssignment(configuration),
+                configuration.Mtu,
+                GetMaxFrameSize(configuration.Mtu),
+                false);                                                        // reserved
+
+            PluginLog.Info("StartExistingTransports accepted");
+        }
+        catch (Exception ex)
+        {
+            PluginLog.Error($"StartExistingTransports rejected: 0x{ex.HResult:X8}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Gets the frame size to advertise for the given MTU.
+    /// </summary>
+    /// <remarks>
+    /// The platform sizes the send buffer pool from this and documents a hard ceiling of 1500,
+    /// reducing either the MTU or the encapsulation overhead if the sum would exceed it. We add no
+    /// encapsulation of our own — the SSH session owns the wire — so the MTU alone would do; the
+    /// clamp exists so that a profile configuring a larger MTU degrades rather than being rejected.
+    /// </remarks>
+    private static uint GetMaxFrameSize(uint mtu)
+    {
+        const uint PlatformMaxFrameSize = 1500;
+        const uint HeaderRoom = 128;
+
+        return Math.Min(mtu + HeaderRoom, PlatformMaxFrameSize);
+    }
+
+    /// <summary>
+    /// Reports outbound packet failures, at most once per <see cref="FailureReportIntervalMs"/>.
+    /// </summary>
+    /// <param name="failures">The number of failures in the batch just processed.</param>
+    private void ReportEncapsulateFailures(int failures)
+    {
+        var total = Interlocked.Add(ref _encapsulateFailureCount, failures);
+
+        var now = Environment.TickCount64;
+        var previous = Interlocked.Read(ref _lastFailureReportTicks);
+        if (now - previous < FailureReportIntervalMs)
+        {
+            return;
+        }
+
+        // Losing the race just means another thread reports instead.
+        if (Interlocked.CompareExchange(ref _lastFailureReportTicks, now, previous) != previous)
+        {
+            return;
+        }
+
+        PluginLog.Error(
+            string.Format(CultureInfo.InvariantCulture, "{0} outbound packet(s) failed so far", total),
+            _lastEncapsulateFailure);
     }
 
     /// <inheritdoc/>
@@ -110,10 +205,19 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// Consumes IP packets destined for the tunnel.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Nothing is added to <paramref name="encapsulatedPackets"/>: the platform's send path is
     /// only used when the plug-in wraps packets for a transport the platform owns. Here the SSH
     /// session owns the wire, so the packets are handed to the user-space stack and this method
     /// returns an empty list.
+    /// </para>
+    /// <para>
+    /// The buffers are <em>enumerated</em> rather than removed. Every buffer the platform hands us
+    /// has to be given back, and the only documented return paths are this method's out-list and
+    /// <see cref="Decapsulate"/>'s; a buffer pulled off the list and dropped is leaked, and the
+    /// documented consequence is that the plug-in stops being able to request buffers at all.
+    /// Leaving them in <paramref name="packets"/> lets the framework reclaim them.
+    /// </para>
     /// </remarks>
     public void Encapsulate(VpnChannel channel, VpnPacketBufferList packets, VpnPacketBufferList encapsulatedPackets)
     {
@@ -122,24 +226,34 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         var connection = GetConnection();
         if (connection is null)
         {
-            // Not connected: drop the packets rather than leaking the buffers.
-            packets.Clear();
             return;
         }
 
-        while (packets.Size > 0)
+        var spike = GetSpike();
+        var failures = 0;
+
+        foreach (var buffer in packets)
         {
-            var buffer = packets.RemoveAtBegin();
             try
             {
+                spike?.SampleOutbound(VpnPacketBufferAccess.GetSpan(buffer).Slice(0, checked((int)buffer.Buffer.Length)));
+
                 // TODO: hand the IP packet to the user-space TCP/IP stack, which maps each TCP
                 // flow onto an SSH direct-tcpip channel.
                 connection.SendOutbound(buffer);
             }
             catch (Exception ex)
             {
-                PluginLog.Error("Failed to process an outbound packet", ex);
+                // Deliberately not logged per packet: a systematic failure here runs at line rate
+                // and would fill the disk. Count them and log once for the batch instead.
+                failures++;
+                _lastEncapsulateFailure = ex;
             }
+        }
+
+        if (failures > 0)
+        {
+            ReportEncapsulateFailures(failures);
         }
     }
 
@@ -181,15 +295,29 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         }
     }
 
+    private M0Spike? GetSpike()
+    {
+        lock (_stateGate)
+        {
+            return _spike;
+        }
+    }
+
     private void CloseConnection()
     {
         SshVpnConnection? connection;
+        M0Spike? spike;
+
         lock (_stateGate)
         {
             connection = _connection;
             _connection = null;
+            spike = _spike;
+            _spike = null;
         }
 
+        // The spike probes the connection, so stop it before disposing what it probes.
+        spike?.Dispose();
         connection?.Dispose();
     }
 

@@ -427,3 +427,8 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+# Crash dumps: full process memory, includes live SSH session state.
+dumps/
+
+# ETW captures from platform debugging.
+trace/

@@ -21,7 +21,8 @@
   </Properties>
 
   <Dependencies>
-    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+    <!-- 20348 is where AppendVpnReceivePacketBuffer / FlushVpnReceivePacketBuffers appear. -->
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.20348.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
   <Resources>
@@ -79,6 +80,12 @@
       and the package must be signed for the machine to accept it.
     -->
     <rescap:Capability Name="networkingVpnProvider" />
+    <!--
+      Needed only to read a private key from a path outside the package, since the plug-in runs in
+      an app container. If key handling later moves into the package's own local folder, or to a
+      certificate via RequestCredentials, this can go.
+    -->
+    <rescap:Capability Name="broadFileSystemAccess" />
   </Capabilities>
 
   <Extensions>
