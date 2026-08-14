@@ -34,9 +34,14 @@ Get-AppxPackage *3703e6b2-f1f9-447d-b506-da47be3094ff* | Remove-AppxPackage
 This repo has none. The `SSH.NET` submodule has its own suite; fork changes should be validated there:
 
 ```
-dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj -f net10.0
-dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj -f net10.0 --filter FullyQualifiedName~ChannelDirectTcpip
+dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj
+dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj --filter FullyQualifiedName~ChannelDirectTcpip
 ```
+
+Two tests fail on some networks and are not your doing:
+`ConnectAsync_HostNameInvalid_*` and `ConnectAsync_ProxyHostNameInvalid_*` expect `HostNotFound`,
+which never comes back if the local resolver answers for invalid names. Baseline is
+**2338 passed / 2 failed / 13 skipped**.
 
 `Renci.SshNet.IntegrationTests` needs Docker (testcontainers). The submodule treats warnings as
 errors in Release and under CI, and applies StyleCop/Meziantou/Sonar analyzers, so changes there
@@ -123,10 +128,20 @@ Setting it replaces the built-in connectors entirely, proxy support included.
 `SocketSshTransport`. Pushing the abstraction down into the connector chain would churn ~100 test
 files instead of 16; don't do it without a reason.
 
-The plug-in implements `StreamSocketSshTransport` on top of `AsStreamForRead(0)` /
+`StreamSocketSshTransport` lives in the fork too, built on `AsStreamForRead(0)` /
 `AsStreamForWrite(0)` — unbuffered, since the session frames and buffers itself and a buffered
 writer would sit on outgoing packets. Blocking on those tasks is safe only because no session thread
 carries a synchronization context.
+
+**The fork targets `net10.0-windows10.0.26100.0` only.** Upstream's five TFMs were collapsed to one
+because `Windows.Networking.Sockets` is invisible from `net462`, `netstandard2.0` and plain
+`net10.0` — that is what lets the WinRT transport live in the library instead of the plug-in. The
+`#if NET` / `#if !NET` branches are now dead but were left in place to keep the diff against
+upstream small. `RuntimeIdentifiers` is set because the plug-in publishes Native AOT per RID.
+
+Do **not** set `UseUwp` on the fork. It authors no WinRT types, and turning it on enables CsWinRT's
+authoring analyzers, which flag every class implementing `IDisposable` or holding a `WaitHandle`
+(CsWinRT1028/CsWinRT1030) — dozens of warnings, and warnings are errors in Release.
 
 Those adapters live in `System.IO.WindowsRuntimeStreamExtensions`, and `AsBuffer`/`ToArray` in
 `System.Runtime.InteropServices.WindowsRuntime` — both **are** available under CsWinRT UWP. They are

@@ -82,15 +82,18 @@ recognise the SSH connection to keep it out of the tunnel it installs. SSH.NET d
 - `ISshTransportFactory`, assigned to `ConnectionInfo.TransportFactory`. When set, it replaces the
   built-in connectors entirely — and with them proxy support.
 - `SocketSshTransport` wraps the ordinary socket, so the default path is unchanged.
+- `StreamSocketSshTransport` runs the session over the WinRT socket, adapting it with
+  `AsStreamForRead(0)` / `AsStreamForWrite(0)`. Unbuffered on both sides: the session does its own
+  framing and buffering, and a buffered writer would sit on outgoing SSH packets instead of sending
+  them.
 
 `IConnector` and the five connectors still return `Socket`; `Session` wraps whatever they hand back.
 That was deliberate — routing the abstraction through the connector chain would have churned about
 a hundred test files instead of sixteen.
 
-The plug-in side is `StreamSocketSshTransport`, which adapts the socket with
-`AsStreamForRead(0)` / `AsStreamForWrite(0)`. Unbuffered on both sides: the session does its own
-framing and buffering, and a buffered writer would sit on outgoing SSH packets instead of sending
-them.
+Because the fork exists only to serve this plug-in, its five target frameworks were collapsed to
+`net10.0-windows10.0.26100.0`. That is what allows the WinRT transport to live in the library:
+`Windows.Networking.Sockets` is not visible from `net462`, `netstandard2.0` or a plain `net10.0`.
 
 ## Diagnostics
 

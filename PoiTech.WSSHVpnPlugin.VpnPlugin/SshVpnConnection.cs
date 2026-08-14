@@ -2,6 +2,7 @@
 using System.Threading;
 using Renci.SshNet;
 using Renci.SshNet.Common;
+using Renci.SshNet.Connection;
 using Windows.Networking.Vpn;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
