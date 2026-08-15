@@ -25,6 +25,11 @@ internal enum TcpState
     /// <summary>We have finished sending; the peer may still be sending.</summary>
     FinWait,
 
+    /// <summary>
+    /// Both sides have finished sending and we are waiting for our own FIN to be acknowledged.
+    /// </summary>
+    LastAck,
+
     /// <summary>Finished. The flow can be forgotten.</summary>
     Closed,
 }

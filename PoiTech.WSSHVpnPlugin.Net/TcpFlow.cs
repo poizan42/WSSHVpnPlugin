@@ -145,6 +145,21 @@ internal sealed class TcpFlow
         {
             _receiveNext++;
 
+            if (_state == TcpState.FinWait)
+            {
+                // We closed first and the peer has now followed. Both directions are done, so the
+                // flow is finished rather than half-closed - it just has to acknowledge this last
+                // FIN before it goes. There is no TIME-WAIT: see the note on TcpState.
+                SendAck();
+
+                // Still worth saying explicitly, even though the channel is about to be disposed:
+                // this is the client reporting it will send no more, and it is the last chance to
+                // pass that on as itself rather than as a close.
+                SendChannelEof();
+                Finish();
+                return false;
+            }
+
             if (_state == TcpState.Established)
             {
                 _state = TcpState.CloseWait;
@@ -153,6 +168,13 @@ internal sealed class TcpFlow
             // A FIN is acknowledged at once: nothing more is coming to piggyback on.
             SendAck();
             SendChannelEof();
+            return false;
+        }
+
+        if (_state == TcpState.LastAck && tcp.AcknowledgementNumber == _sendNext)
+        {
+            // Our FIN is acknowledged and the peer's arrived long ago. Nothing is left to carry.
+            Finish();
             return false;
         }
 
@@ -246,9 +268,14 @@ internal sealed class TcpFlow
             progressed = true;
         }
 
-        if (channel.IsPeerEof && _state == TcpState.Established)
+        if (channel.IsPeerEof && _state is TcpState.Established or TcpState.CloseWait)
         {
-            _state = TcpState.FinWait;
+            // Whichever side finished first, this is us finishing. From Established the peer may
+            // still be sending, so we half-close and wait for its FIN; from CloseWait it already
+            // sent one, so the only thing left is the acknowledgement of ours. Handling just the
+            // Established case - which is what this did - left every gracefully closed connection
+            // parked in CloseWait for the life of the tunnel, holding its channel.
+            _state = _state == TcpState.Established ? TcpState.FinWait : TcpState.LastAck;
             SendSegment(TcpFlags.Fin | TcpFlags.Ack, ReadOnlySpan<byte>.Empty);
             _sendNext++;
             progressed = true;
@@ -259,6 +286,19 @@ internal sealed class TcpFlow
 
     /// <summary>Discards the flow without ceremony.</summary>
     public void Abort()
+    {
+        Finish();
+    }
+
+    /// <summary>
+    /// Marks the flow finished and releases its channel.
+    /// </summary>
+    /// <remarks>
+    /// The channel has to go here rather than when the loop drops the flow: the loop only forgets
+    /// the entry, so a flow that closed without releasing it would leave the channel open on the
+    /// server and subscribed to the session for as long as the tunnel lasts.
+    /// </remarks>
+    private void Finish()
     {
         _state = TcpState.Closed;
         _channel?.Dispose();

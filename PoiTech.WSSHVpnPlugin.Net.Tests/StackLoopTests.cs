@@ -223,6 +223,55 @@ public class StackLoopTests
         Assert.IsTrue(_sink.Last().Flags.HasFlag(TcpFlags.Fin));
     }
 
+    /// <summary>
+    /// The client closes first, then the far end. Both directions are then done, so the flow must be
+    /// forgotten and its channel released - not parked in CLOSE-WAIT for the life of the tunnel.
+    /// </summary>
+    [TestMethod]
+    public void CloseStartedByTheClient_EndsTheFlow()
+    {
+        Syn();
+        var channel = _channels.Last!;
+
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, 0, TcpFlags.Fin | TcpFlags.Ack));
+        Assert.IsTrue(channel.EofSent, "the far end should be told the client finished");
+        Assert.AreEqual(1, _stack.FlowCount, "half closed, so still tracked");
+
+        // The far end answers by closing too.
+        channel.IsPeerEof = true;
+        _ = _stack.RunOnce();
+
+        var fin = _sink.Last();
+        Assert.IsTrue(fin.Flags.HasFlag(TcpFlags.Fin), $"expected our FIN, got {fin.Flags}");
+
+        // The client acknowledges it.
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1002, fin.Seq + 1, TcpFlags.Ack));
+
+        Assert.AreEqual(0, _stack.FlowCount, "the flow should be forgotten");
+        Assert.IsTrue(channel.Disposed, "the channel must not leak");
+    }
+
+    /// <summary>The other order: the far end closes first, then the client.</summary>
+    [TestMethod]
+    public void CloseStartedByTheFarEnd_EndsTheFlow()
+    {
+        Syn();
+        var channel = _channels.Last!;
+
+        channel.IsPeerEof = true;
+        _ = _stack.RunOnce();
+
+        var fin = _sink.Last();
+        Assert.IsTrue(fin.Flags.HasFlag(TcpFlags.Fin));
+        Assert.AreEqual(1, _stack.FlowCount, "half closed, so still tracked");
+
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, fin.Seq + 1, TcpFlags.Fin | TcpFlags.Ack));
+
+        Assert.AreEqual(1002u, _sink.Last().Ack, "the client's FIN occupies a sequence number");
+        Assert.AreEqual(0, _stack.FlowCount, "the flow should be forgotten");
+        Assert.IsTrue(channel.Disposed, "the channel must not leak");
+    }
+
     [TestMethod]
     public void Reset_DiscardsTheFlow()
     {
