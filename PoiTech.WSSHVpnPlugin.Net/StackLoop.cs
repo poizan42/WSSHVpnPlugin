@@ -54,8 +54,24 @@ internal sealed class StackLoop
     public long Dropped { get; private set; }
 
     /// <summary>Gets how the DNS relay has been faring, for the host to report.</summary>
-    public (long Answered, long Truncated, long Dropped) DnsCounters =>
-        (_dns.Answered, _dns.Truncated, _dns.Dropped);
+    public (long Answered, long Truncated, long Dropped, int Channels) DnsCounters =>
+        (_dns.Answered, _dns.Truncated, _dns.Dropped, _dns.Channels);
+
+    /// <summary>
+    /// Releases what the stack holds. Call only once whatever drives <see cref="RunOnce"/> has
+    /// stopped.
+    /// </summary>
+    public void Dispose()
+    {
+        _dns.Dispose();
+
+        foreach (var flow in _flows.Values)
+        {
+            flow.Abort();
+        }
+
+        _flows.Clear();
+    }
 
     /// <summary>
     /// Called when a flow is first seen, with its four-tuple.

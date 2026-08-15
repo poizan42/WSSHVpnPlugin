@@ -11,8 +11,14 @@ namespace PoiTech.WSSHVpnPlugin.Net;
 /// <para>
 /// SSH forwards byte streams, so a UDP query has nowhere to go. RFC 7766 makes this tractable: every
 /// DNS server that speaks UDP also speaks TCP, with the same message preceded by a two-byte length.
-/// So each query becomes a channel, and the reply becomes a datagram again on the way back. The
-/// client never learns that anything happened.
+/// </para>
+/// <para>
+/// One channel per <em>server</em>, not per query, with queries pipelined onto it. The first version
+/// opened a channel per query, and measured against a real tunnel that was the dominant cost: 60 of
+/// 77 refused channel opens in one run were DNS, all of them inside the first minute, because a
+/// browser resolving a page's worth of names outruns any sane limit on concurrent opens. Pipelining
+/// turns a burst of opens into a burst of writes, and removes the open's round trip from every
+/// lookup's latency.
 /// </para>
 /// <para>
 /// Not optional. Assigning DNS servers pins the whole machine's name resolution to this tunnel the
@@ -29,16 +35,6 @@ internal sealed class DnsRelay
     public const ushort Port = 53;
 
     /// <summary>
-    /// How many queries may be in flight at once.
-    /// </summary>
-    /// <remarks>
-    /// A burst of name lookups is a burst of channel opens, each costing a round trip to the SSH
-    /// server. Beyond this they are dropped, which a resolver treats as packet loss and retries -
-    /// the outcome UDP already has, and better than queueing work that will time out anyway.
-    /// </remarks>
-    private const int MaximumOutstanding = 16;
-
-    /// <summary>
     /// The largest reply that can be handed back as a single datagram.
     /// </summary>
     /// <remarks>
@@ -47,17 +43,23 @@ internal sealed class DnsRelay
     /// </remarks>
     private const int MaximumReplySize = 1372;
 
-    /// <summary>How long a query may stay outstanding before it is abandoned.</summary>
+    /// <summary>
+    /// How long an abandoned query's identifier stays reserved.
+    /// </summary>
     /// <remarks>
-    /// Above a resolver's own first-attempt timeout, so a query is normally retried by the client
-    /// before this fires. This is the reaper that stops a hung channel leaking, not a retry policy.
+    /// A late reply must not be delivered as the answer to whichever query inherited its identifier.
+    /// Holding the identifier past the deadline makes that impossible rather than unlikely.
     /// </remarks>
-    private static readonly TimeSpan QueryTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan Quarantine = TimeSpan.FromSeconds(10);
+
+    /// <summary>How long a channel with nothing to do is kept before it is closed.</summary>
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(60);
 
     private readonly IPacketSink _sink;
     private readonly IStackClock _clock;
     private readonly OpenChannel _open;
-    private readonly List<PendingQuery> _queries = new();
+    private readonly Dictionary<uint, ServerLink> _links = new();
+    private readonly List<uint> _finished = new();
     private readonly byte[] _scratch = new byte[1500];
 
     public DnsRelay(IPacketSink sink, IStackClock clock, OpenChannel open)
@@ -79,8 +81,24 @@ internal sealed class DnsRelay
     /// <summary>Gets the number of queries dropped or abandoned.</summary>
     public long Dropped { get; private set; }
 
-    /// <summary>Gets the number of queries currently in flight.</summary>
-    public int Outstanding => _queries.Count;
+    /// <summary>Gets the number of queries currently awaiting an answer.</summary>
+    public int Outstanding
+    {
+        get
+        {
+            var total = 0;
+
+            foreach (var link in _links.Values)
+            {
+                total += link.LiveCount;
+            }
+
+            return total;
+        }
+    }
+
+    /// <summary>Gets the number of server channels currently held.</summary>
+    public int Channels => _links.Count;
 
     /// <summary>
     /// Takes a query addressed to a DNS server.
@@ -93,82 +111,155 @@ internal sealed class DnsRelay
     {
         var payload = datagram.Payload;
 
-        if (payload.Length < DnsMessage.HeaderLength || _queries.Count >= MaximumOutstanding)
+        if (payload.Length < DnsMessage.HeaderLength)
         {
             Dropped++;
             return false;
         }
 
-        var query = new PendingQuery
+        if (!_links.TryGetValue(destination, out var link))
         {
-            ClientAddress = source,
-            ClientPort = datagram.SourcePort,
-            ServerAddress = destination,
-            Message = payload.ToArray(),
-            Deadline = _clock.Now + QueryTimeout,
-        };
+            link = new ServerLink(destination);
+            _links[destination] = link;
+            BeginOpen(link);
+        }
+
+        if (!link.TryAccept(source, datagram.SourcePort, payload, _clock.Now, out var query))
+        {
+            Dropped++;
+            return false;
+        }
 
         query.MaximumReply = Math.Min(DnsMessage.GetMaximumReplySize(query.Message), MaximumReplySize);
-
-        // The whole query, framed as RFC 7766 wants it, built once so a partial send can simply
-        // resume from an offset.
-        query.Request = new byte[sizeof(ushort) + query.Message.Length];
-        BinaryPrimitives.WriteUInt16BigEndian(query.Request, (ushort)query.Message.Length);
-        query.Message.CopyTo(query.Request, sizeof(ushort));
-
-        _queries.Add(query);
-
-        _open(
-            destination,
-            Port,
-            channel =>
-            {
-                // The query may already have been given up on. An open outlives its query whenever
-                // the destination is slow, and a channel handed to a forgotten query is a channel
-                // nothing will ever close - left subscribed to the session and, because the session
-                // dispatches by walking its subscribers, slowing every message that follows.
-                if (query.Finished)
-                {
-                    channel.Dispose();
-                    return;
-                }
-
-                query.Channel = channel;
-            },
-            () => query.Failed = true);
-
         return true;
     }
 
     /// <summary>
-    /// Moves every outstanding query along, and forgets the finished ones.
+    /// Moves every server channel along, and forgets the ones with nothing left to do.
     /// </summary>
     /// <returns><see langword="true"/> if anything progressed.</returns>
     public bool RunOnce()
     {
         var progressed = false;
+        var now = _clock.Now;
 
-        for (var i = _queries.Count - 1; i >= 0; i--)
+        foreach (var pair in _links)
         {
-            var query = _queries[i];
-            var finished = Pump(query);
-
-            if (!finished && _clock.Now >= query.Deadline)
+            if (Pump(pair.Value, now))
             {
-                Dropped++;
-                finished = true;
+                progressed = true;
             }
 
-            if (!finished)
+            if (pair.Value.IsDone(now, IdleTimeout))
             {
-                continue;
+                _finished.Add(pair.Key);
+            }
+        }
+
+        foreach (var address in _finished)
+        {
+            _links[address].Dispose();
+            _ = _links.Remove(address);
+            progressed = true;
+        }
+
+        _finished.Clear();
+        return progressed;
+    }
+
+    /// <summary>Releases every channel, for teardown.</summary>
+    public void Dispose()
+    {
+        foreach (var link in _links.Values)
+        {
+            link.Dispose();
+        }
+
+        _links.Clear();
+    }
+
+    private void BeginOpen(ServerLink link)
+    {
+        link.Opening = true;
+
+        _open(
+            link.ServerAddress,
+            Port,
+            channel =>
+            {
+                // The link may have been given up on while the open was in flight; a channel handed
+                // to a forgotten link is one nothing will ever close.
+                if (link.Abandoned)
+                {
+                    channel.Dispose();
+                    return;
+                }
+
+                link.Opening = false;
+                link.Channel = channel;
+            },
+            () =>
+            {
+                link.Opening = false;
+                link.Failed = true;
+            });
+    }
+
+    /// <summary>
+    /// Moves one server's channel along: send what is queued, read what has arrived, reap what has
+    /// timed out.
+    /// </summary>
+    private bool Pump(ServerLink link, TimeSpan now)
+    {
+        var expired = link.Expire(now, Quarantine);
+        Dropped += expired;
+        var progressed = expired > 0;
+
+        if (link.Failed)
+        {
+            // No channel and no prospect of one. Everything waiting on it is loss as far as the
+            // client is concerned, which is what it would have seen from a dropped datagram.
+            Dropped += link.AbandonAll();
+            link.Failed = false;
+            link.Channel = null;
+
+            if (link.LiveCount > 0 || link.HasQueuedRequests)
+            {
+                BeginOpen(link);
             }
 
-            // Marked before the channel is dropped, so an open still in flight knows to close
-            // whatever it produces rather than hand it to a query that no longer exists.
-            query.Finished = true;
-            query.Channel?.Dispose();
-            _queries.RemoveAt(i);
+            return true;
+        }
+
+        var channel = link.Channel;
+        if (channel is null)
+        {
+            if (!link.Opening && (link.LiveCount > 0 || link.HasQueuedRequests))
+            {
+                BeginOpen(link);
+                progressed = true;
+            }
+
+            return progressed;
+        }
+
+        if (link.SendQueued(out var sent) && sent)
+        {
+            progressed = true;
+        }
+
+        if (ReceiveInto(link, channel))
+        {
+            progressed = true;
+        }
+
+        if (!channel.IsOpen || channel.IsPeerEof)
+        {
+            // The server hung up. Whatever was in flight is gone; a fresh channel opens on the next
+            // query rather than now, so a server that closes on every request cannot spin.
+            Dropped += link.AbandonAll();
+            channel.Dispose();
+            link.Channel = null;
             progressed = true;
         }
 
@@ -176,234 +267,130 @@ internal sealed class DnsRelay
     }
 
     /// <summary>
-    /// Moves one query along.
+    /// Reads whatever the channel has, completing every whole message in it.
     /// </summary>
-    /// <returns><see langword="true"/> if it is finished, one way or the other.</returns>
-    private bool Pump(PendingQuery query)
+    private bool ReceiveInto(ServerLink link, IByteChannel channel)
     {
-        if (query.Failed)
+        var progressed = false;
+
+        while (true)
         {
-            // No channel, so nothing to say to the client. A resolver reads silence as loss and asks
-            // again, which is the same thing that happens when a UDP query is dropped.
-            Dropped++;
-            return true;
-        }
-
-        // A reply that was built but could not be delivered because the platform's queue was full.
-        if (query.ReplyLength > 0)
-        {
-            return SendReply(query);
-        }
-
-        var channel = query.Channel;
-        if (channel is null)
-        {
-            return false;
-        }
-
-        while (query.Sent < query.Request!.Length)
-        {
-            var result = channel.TrySend(
-                query.Request,
-                query.Sent,
-                query.Request.Length - query.Sent,
-                out var written);
-
-            query.Sent += written;
-
-            if (result == ByteChannelSendResult.Closed)
+            // A reply that could not be handed to the platform blocks the stream deliberately:
+            // reading on would consume the bytes behind it with nowhere to put the result.
+            if (link.HasReplyPending && !DeliverPending(link))
             {
-                Dropped++;
-                return true;
+                return progressed;
             }
 
-            if (result == ByteChannelSendResult.Full || written == 0)
+            if (!channel.TryRead(out var data) || data.Count == 0)
             {
-                break;
+                return progressed;
             }
-        }
 
-        if (query.Sent < query.Request.Length)
-        {
-            return false;
-        }
+            var consumed = link.Consume(data.AsSpan(), this);
+            progressed = true;
 
-        while (channel.TryRead(out var data))
-        {
-            Append(query, data);
-
-            if (channel.Advance(data.Count))
+            if (channel.Advance(consumed))
             {
                 channel.FlushWindowCredit();
             }
 
-            if (TryBuildReply(query))
+            if (consumed < data.Count)
             {
-                return SendReply(query);
-            }
-
-            if (query.Failed)
-            {
-                Dropped++;
-                return true;
+                // Stopped early, which only happens when a reply is waiting on the sink.
+                return progressed;
             }
         }
-
-        if (channel.IsPeerEof || !channel.IsOpen)
-        {
-            // The server hung up mid-reply. Nothing partial is worth returning: a DNS message is
-            // only meaningful whole.
-            Dropped++;
-            return true;
-        }
-
-        return false;
     }
 
     /// <summary>
-    /// Copies what the channel gave us into the reply buffer, discarding any excess.
+    /// Completes one reassembled message: matches it to its query and answers the client.
     /// </summary>
     /// <remarks>
-    /// Excess can only appear once the reply is already known to be too large to return, and in that
-    /// case the rest of it is never read - so dropping it here costs nothing and keeps the buffer a
-    /// fixed size.
+    /// Called by <see cref="ServerLink"/> as it reassembles, because only the relay owns the sink and
+    /// the counters.
     /// </remarks>
-    private static void Append(PendingQuery query, ArraySegment<byte> data)
+    internal void OnMessage(ServerLink link, ReadOnlySpan<byte> message, bool oversize)
     {
-        var space = query.Reply.Length - query.Received;
-        var take = Math.Min(space, data.Count);
-
-        if (take > 0)
+        if (message.Length < DnsMessage.HeaderLength)
         {
-            data.AsSpan()[..take].CopyTo(query.Reply.AsSpan(query.Received));
+            Dropped++;
+            return;
         }
 
-        query.Received += data.Count;
-    }
+        var id = BinaryPrimitives.ReadUInt16BigEndian(message);
 
-    /// <summary>
-    /// Decides whether the reply is complete, and prepares it for delivery.
-    /// </summary>
-    /// <returns><see langword="true"/> if there is now a reply to send.</returns>
-    private bool TryBuildReply(PendingQuery query)
-    {
-        if (query.Received < sizeof(ushort))
+        if (!link.TryTake(id, _clock.Now, Quarantine, out var query))
         {
-            return false;
+            // A reply to a query that timed out, or one nobody asked for. Its bytes are consumed
+            // either way - the stream has to stay in step.
+            Dropped++;
+            return;
         }
 
-        var declared = BinaryPrimitives.ReadUInt16BigEndian(query.Reply);
-
-        if (declared > query.MaximumReply)
+        if (oversize || message.Length > query.MaximumReply)
         {
-            // Too large for one datagram. Say so properly rather than dropping it: a truncated reply
-            // makes the client ask again over TCP, which this stack carries natively.
             Truncated++;
 
-            if (!DnsMessage.TryBuildTruncatedReply(query.Message, query.Reply, out var length))
+            if (!DnsMessage.TryBuildTruncatedReply(query.Message, link.ReplyBuffer, out var length))
             {
-                query.Failed = true;
-                return false;
+                Dropped++;
+                return;
             }
 
-            query.ReplyOffset = 0;
-            query.ReplyLength = length;
-            return true;
+            link.SetReplyPending(query, length);
         }
-
-        if (query.Received < sizeof(ushort) + declared)
+        else
         {
-            return false;
+            Answered++;
+            message.CopyTo(link.ReplyBuffer);
+
+            // The client's own identifier goes back, not ours.
+            BinaryPrimitives.WriteUInt16BigEndian(link.ReplyBuffer, query.ClientId);
+            link.SetReplyPending(query, message.Length);
         }
 
-        Answered++;
-        query.ReplyOffset = sizeof(ushort);
-        query.ReplyLength = declared;
-        return true;
+        _ = DeliverPending(link);
     }
 
     /// <summary>
     /// Hands a finished reply back as a datagram from the server the client asked.
     /// </summary>
-    /// <returns>
-    /// <see langword="true"/> if the query is finished with - either delivered, or given up on.
-    /// </returns>
-    private bool SendReply(PendingQuery query)
+    /// <returns><see langword="true"/> if it went; otherwise the sink was full and it still waits.</returns>
+    private bool DeliverPending(ServerLink link)
     {
+        if (!link.HasReplyPending)
+        {
+            return true;
+        }
+
         if (!_sink.CanAccept)
         {
-            // Retried next pass. The reply is already built and the deadline still applies, so this
-            // cannot spin forever.
             return false;
         }
 
         const int UdpOffset = Ipv4Packet.MinimumHeaderLength;
-        var payload = query.Reply.AsSpan(query.ReplyOffset, query.ReplyLength);
+        var payload = link.ReplyBuffer.AsSpan(0, link.ReplyLength);
 
         payload.CopyTo(_scratch.AsSpan(UdpOffset + UdpDatagram.HeaderLength));
 
         var udpLength = UdpDatagram.Write(
             _scratch.AsSpan(UdpOffset),
-            query.ServerAddress,
-            query.ClientAddress,
+            link.ServerAddress,
+            link.ReplyClientAddress,
             Port,
-            query.ClientPort,
+            link.ReplyClientPort,
             payload.Length);
 
         var total = Ipv4Packet.Write(
             _scratch,
             IpProtocol.Udp,
-            query.ServerAddress,
-            query.ClientAddress,
+            link.ServerAddress,
+            link.ReplyClientAddress,
             udpLength);
 
         _ = _sink.TryWrite(_scratch.AsSpan(0, total));
+        link.ClearReplyPending();
         return true;
-    }
-
-    /// <summary>
-    /// One query, from the datagram that started it to the datagram that answers it.
-    /// </summary>
-    private sealed class PendingQuery
-    {
-        /// <summary>The reply buffer, sized for the largest reply that could be delivered.</summary>
-        public byte[] Reply { get; } = new byte[sizeof(ushort) + MaximumReplySize];
-
-        public uint ClientAddress { get; init; }
-
-        public ushort ClientPort { get; init; }
-
-        public uint ServerAddress { get; init; }
-
-        /// <summary>The query as the client sent it, kept for building a truncated reply.</summary>
-        public byte[] Message { get; init; } = Array.Empty<byte>();
-
-        /// <summary>The query with its length prefix, as it goes onto the channel.</summary>
-        public byte[]? Request { get; set; }
-
-        public TimeSpan Deadline { get; init; }
-
-        public int MaximumReply { get; set; }
-
-        public IByteChannel? Channel { get; set; }
-
-        /// <summary>
-        /// Gets or sets a value indicating whether the relay has given up on this query.
-        /// </summary>
-        /// <remarks>
-        /// Set before the query leaves the list, so a channel that opens afterwards is closed rather
-        /// than attached to something nobody will pump or dispose.
-        /// </remarks>
-        public bool Finished { get; set; }
-
-        public bool Failed { get; set; }
-
-        public int Sent { get; set; }
-
-        public int Received { get; set; }
-
-        public int ReplyOffset { get; set; }
-
-        public int ReplyLength { get; set; }
     }
 }

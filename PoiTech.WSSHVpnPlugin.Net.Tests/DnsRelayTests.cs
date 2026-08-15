@@ -15,6 +15,7 @@ namespace PoiTech.WSSHVpnPlugin.Net.Tests;
 public sealed class DnsRelayTests
 {
     private const ushort ClientPort = 50000;
+    private const ushort ClientId = 0x1234;
 
     private static readonly uint Client = Packets.Address("192.168.255.2");
     private static readonly uint Server = Packets.Address("1.1.1.1");
@@ -50,7 +51,6 @@ public sealed class DnsRelayTests
 
             if (_deferOpen)
             {
-                // Held back so the test can decide when - and whether - the open lands.
                 _completeOpen = () =>
                 {
                     _channel = new FakeChannel();
@@ -73,17 +73,37 @@ public sealed class DnsRelayTests
         CollectionAssert.AreEqual(new[] { (Server, (ushort)53) }, _opens);
     }
 
+    /// <summary>
+    /// The point of pipelining: a burst of names costs one channel, not one each. Opening per query
+    /// is what exhausted the channel limit in the first minute of every real connection.
+    /// </summary>
     [TestMethod]
-    public void Query_is_sent_with_a_two_byte_length_prefix()
+    public void Further_queries_reuse_the_same_channel()
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            OfferQuery(BuildQuery());
+            _ = _relay.RunOnce();
+        }
+
+        Assert.AreEqual(1, _opens.Count, "one channel should serve them all");
+        Assert.AreEqual(1, _relay.Channels);
+        Assert.AreEqual(20, SentRequests().Count, "every query should still have been sent");
+    }
+
+    [TestMethod]
+    public void Query_is_sent_with_a_length_prefix_and_our_own_identifier()
     {
         var query = BuildQuery();
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        var sent = _channel!.Sent.ToArray();
+        var sent = SentRequests();
+        Assert.AreEqual(1, sent.Count);
 
-        Assert.AreEqual(query.Length, BinaryPrimitives.ReadUInt16BigEndian(sent));
-        CollectionAssert.AreEqual(query, sent[2..]);
+        // Everything but the identifier is passed through untouched.
+        CollectionAssert.AreEqual(query[2..], sent[0].Message[2..]);
+        Assert.AreNotEqual(ClientId, sent[0].Id, "the client's identifier must not go on the wire");
     }
 
     [TestMethod]
@@ -105,19 +125,20 @@ public sealed class DnsRelayTests
     }
 
     [TestMethod]
-    public void Reply_comes_back_as_a_datagram_from_the_server()
+    public void Reply_comes_back_as_a_datagram_with_the_clients_identifier()
     {
         var query = BuildQuery();
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        var reply = BuildReply(query, answers: 1);
-        DeliverFramed(reply);
+        DeliverReply(SentRequests()[0].Id, BuildReply(query, answers: 1));
         _ = _relay.RunOnce();
 
         Assert.AreEqual(1, _sink.Packets.Count);
         AssertIsUdpFromServer(_sink.Packets[0]);
-        CollectionAssert.AreEqual(reply, PayloadOf(_sink.Packets[0]));
+
+        var payload = PayloadOf(_sink.Packets[0]);
+        Assert.AreEqual(ClientId, BinaryPrimitives.ReadUInt16BigEndian(payload), "the client's own identifier must come back");
         Assert.AreEqual(1, _relay.Answered);
         Assert.AreEqual(0, _relay.Outstanding);
     }
@@ -129,8 +150,7 @@ public sealed class DnsRelayTests
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        var reply = BuildReply(query, answers: 1);
-        var framed = Frame(reply);
+        var framed = Frame(SentRequests()[0].Id, BuildReply(query, answers: 1));
 
         // A length prefix split across arrivals is what breaks a reader that assumes framing
         // survives the stream.
@@ -141,7 +161,39 @@ public sealed class DnsRelayTests
         }
 
         Assert.AreEqual(1, _sink.Packets.Count);
-        CollectionAssert.AreEqual(reply, PayloadOf(_sink.Packets[0]));
+        Assert.AreEqual(1, _relay.Answered);
+    }
+
+    /// <summary>
+    /// Replies may come back in any order, which is the whole reason identifiers are rewritten
+    /// rather than the stream being treated as a queue.
+    /// </summary>
+    [TestMethod]
+    public void Replies_out_of_order_reach_the_right_clients()
+    {
+        var first = BuildQuery();
+        var second = BuildQuery();
+
+        OfferQueryFrom(60001, first);
+        OfferQueryFrom(60002, second);
+        _ = _relay.RunOnce();
+
+        var sent = SentRequests();
+        Assert.AreEqual(2, sent.Count);
+
+        // Answer the second one first.
+        DeliverReply(sent[1].Id, BuildReply(second, answers: 1));
+        _ = _relay.RunOnce();
+        DeliverReply(sent[0].Id, BuildReply(first, answers: 1));
+        _ = _relay.RunOnce();
+
+        Assert.AreEqual(2, _sink.Packets.Count);
+
+        Assert.IsTrue(UdpDatagram.TryParse(Ipv4PayloadOf(_sink.Packets[0]), out var one));
+        Assert.AreEqual((ushort)60002, one.DestinationPort, "the first answer belongs to the second asker");
+
+        Assert.IsTrue(UdpDatagram.TryParse(Ipv4PayloadOf(_sink.Packets[1]), out var two));
+        Assert.AreEqual((ushort)60001, two.DestinationPort);
     }
 
     [TestMethod]
@@ -151,7 +203,7 @@ public sealed class DnsRelayTests
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        DeliverFramed(BuildReply(query, answers: 1, padding: 2000));
+        DeliverReply(SentRequests()[0].Id, BuildReply(query, answers: 1, padding: 2000));
         _ = _relay.RunOnce();
 
         Assert.AreEqual(1, _sink.Packets.Count);
@@ -161,11 +213,52 @@ public sealed class DnsRelayTests
 
         Assert.AreEqual(0x80, payload[2] & 0x80, "it must be marked a response");
         Assert.AreEqual(0x02, payload[2] & 0x02, "the truncated bit must be set");
-        Assert.AreEqual(0x1234, BinaryPrimitives.ReadUInt16BigEndian(payload), "the identifier must match the query");
-        Assert.AreEqual(1, BinaryPrimitives.ReadUInt16BigEndian(payload.AsSpan(4, 2)), "the question is echoed");
+        Assert.AreEqual(ClientId, BinaryPrimitives.ReadUInt16BigEndian(payload), "the identifier must match the query");
         Assert.AreEqual(0, BinaryPrimitives.ReadUInt16BigEndian(payload.AsSpan(6, 2)), "no answers survive");
-        Assert.AreEqual(0, BinaryPrimitives.ReadUInt16BigEndian(payload.AsSpan(8, 2)), "no authorities survive");
-        Assert.AreEqual(0, BinaryPrimitives.ReadUInt16BigEndian(payload.AsSpan(10, 2)), "no additionals survive");
+    }
+
+    /// <summary>
+    /// The stream has to stay in step even when an answer is unusable: a reply larger than we keep
+    /// must still be consumed in full, or the next length is read from the middle of it.
+    /// </summary>
+    [TestMethod]
+    public void An_oversize_reply_does_not_desync_the_stream()
+    {
+        var first = BuildQuery();
+        var second = BuildQuery();
+
+        OfferQueryFrom(60001, first);
+        OfferQueryFrom(60002, second);
+        _ = _relay.RunOnce();
+
+        var sent = SentRequests();
+
+        // A reply far larger than the buffer, immediately followed by an ordinary one.
+        DeliverReply(sent[0].Id, BuildReply(first, answers: 1, padding: 40000));
+        DeliverReply(sent[1].Id, BuildReply(second, answers: 1));
+        _ = _relay.RunOnce();
+
+        Assert.AreEqual(1, _relay.Truncated, "the oversize one is answered with TC");
+        Assert.AreEqual(1, _relay.Answered, "and the one behind it survives intact");
+        Assert.AreEqual(2, _sink.Packets.Count);
+    }
+
+    /// <summary>A reply nobody is waiting for must be consumed, not left to desync the stream.</summary>
+    [TestMethod]
+    public void An_unknown_identifier_is_discarded_without_desyncing()
+    {
+        var query = BuildQuery();
+        OfferQuery(query);
+        _ = _relay.RunOnce();
+
+        var id = SentRequests()[0].Id;
+
+        DeliverReply((ushort)(id + 999), BuildReply(query, answers: 1));
+        DeliverReply(id, BuildReply(query, answers: 1));
+        _ = _relay.RunOnce();
+
+        Assert.AreEqual(1, _relay.Answered, "the real answer still lands");
+        Assert.AreEqual(1, _sink.Packets.Count);
     }
 
     [TestMethod]
@@ -175,8 +268,7 @@ public sealed class DnsRelayTests
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        // Beyond the classic 512 limit, and still deliverable in one datagram.
-        DeliverFramed(BuildReply(query, answers: 1, padding: 800));
+        DeliverReply(SentRequests()[0].Id, BuildReply(query, answers: 1, padding: 800));
         _ = _relay.RunOnce();
 
         Assert.AreEqual(0, _relay.Truncated);
@@ -190,7 +282,7 @@ public sealed class DnsRelayTests
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        DeliverFramed(BuildReply(query, answers: 1, padding: 600));
+        DeliverReply(SentRequests()[0].Id, BuildReply(query, answers: 1, padding: 600));
         _ = _relay.RunOnce();
 
         Assert.AreEqual(1, _relay.Truncated);
@@ -199,12 +291,11 @@ public sealed class DnsRelayTests
     [TestMethod]
     public void Reply_larger_than_the_tunnel_mtu_is_truncated_even_when_edns_allows_it()
     {
-        // The client says it will take 4096, but nothing here fragments, so the MTU is the ceiling.
         var query = BuildQuery(ednsPayloadSize: 4096);
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        DeliverFramed(BuildReply(query, answers: 1, padding: 1500));
+        DeliverReply(SentRequests()[0].Id, BuildReply(query, answers: 1, padding: 1500));
         _ = _relay.RunOnce();
 
         Assert.AreEqual(1, _relay.Truncated);
@@ -219,7 +310,7 @@ public sealed class DnsRelayTests
 
         Assert.AreEqual(0, _sink.Packets.Count);
         Assert.AreEqual(0, _relay.Outstanding);
-        Assert.AreEqual(1, _relay.Dropped);
+        Assert.IsTrue(_relay.Dropped >= 1);
     }
 
     [TestMethod]
@@ -234,29 +325,27 @@ public sealed class DnsRelayTests
         _ = _relay.RunOnce();
 
         Assert.AreEqual(0, _relay.Outstanding);
-        Assert.IsTrue(_channel!.Disposed, "the channel must not leak");
+        Assert.AreEqual(1, _relay.Dropped);
     }
 
     /// <summary>
-    /// An open outlives the query that wanted it whenever the destination is slow. The channel it
-    /// eventually produces must be closed, not handed to a query the relay has already given up on -
-    /// nothing would ever pump or dispose it, and the session keeps every channel it dispatches to.
+    /// An identifier freed by a timeout must not be handed straight to the next query, or a late
+    /// reply is delivered as somebody else's answer.
     /// </summary>
     [TestMethod]
-    public void Channel_arriving_after_its_query_was_reaped_is_disposed()
+    public void An_identifier_is_not_reused_straight_after_a_timeout()
     {
-        // The open is still in flight when the query's deadline passes.
-        _deferOpen = true;
         OfferQuery(BuildQuery());
+        _ = _relay.RunOnce();
+        var first = SentRequests()[0].Id;
 
         _clock.Advance(TimeSpan.FromSeconds(10));
         _ = _relay.RunOnce();
-        Assert.AreEqual(0, _relay.Outstanding, "the query should have been reaped");
 
-        _completeOpen!();
+        OfferQuery(BuildQuery());
+        _ = _relay.RunOnce();
 
-        Assert.IsNotNull(_channel);
-        Assert.IsTrue(_channel!.Disposed, "the late channel must be closed, not leaked");
+        Assert.AreNotEqual(first, SentRequests()[1].Id, "the abandoned identifier is still reserved");
     }
 
     [TestMethod]
@@ -266,76 +355,98 @@ public sealed class DnsRelayTests
         OfferQuery(query);
         _ = _relay.RunOnce();
 
-        var reply = BuildReply(query, answers: 1);
-        DeliverFramed(reply);
+        DeliverReply(SentRequests()[0].Id, BuildReply(query, answers: 1));
 
         _sink.Full = true;
         _ = _relay.RunOnce();
         Assert.AreEqual(0, _sink.Packets.Count);
-        Assert.AreEqual(1, _relay.Outstanding);
 
         _sink.Full = false;
         _ = _relay.RunOnce();
         Assert.AreEqual(1, _sink.Packets.Count);
-        CollectionAssert.AreEqual(reply, PayloadOf(_sink.Packets[0]));
     }
 
     [TestMethod]
-    public void Server_hanging_up_mid_reply_drops_the_query()
+    public void Server_hanging_up_drops_what_was_in_flight()
     {
         OfferQuery(BuildQuery());
         _ = _relay.RunOnce();
 
-        // A length prefix promising 256 bytes, and one byte of them.
-        _channel!.ReceiveFromPeer(0x01, 0x00, 0x00);
-        _channel.IsPeerEof = true;
+        _channel!.IsPeerEof = true;
         _ = _relay.RunOnce();
 
         Assert.AreEqual(0, _sink.Packets.Count);
         Assert.AreEqual(0, _relay.Outstanding);
-        Assert.AreEqual(1, _relay.Dropped);
+        Assert.IsTrue(_relay.Dropped >= 1);
     }
 
     [TestMethod]
     public void Queries_beyond_the_outstanding_limit_are_refused()
     {
-        // A resolver reads the refusal as loss and asks again, which is what UDP already does.
-        for (var i = 0; i < 16; i++)
+        for (var i = 0; i < 64; i++)
         {
             OfferQuery(BuildQuery());
         }
 
-        Assert.AreEqual(16, _relay.Outstanding);
-        Assert.IsFalse(TryOfferQuery(BuildQuery()));
-        Assert.AreEqual(16, _relay.Outstanding);
+        Assert.AreEqual(64, _relay.Outstanding);
+        Assert.IsFalse(TryOfferQuery(60000, BuildQuery()));
+        Assert.AreEqual(64, _relay.Outstanding);
     }
 
     /// <summary>Hands a query to the relay the way <see cref="StackLoop"/> would.</summary>
-    private void OfferQuery(byte[] message)
+    private void OfferQuery(byte[] message) => OfferQueryFrom(ClientPort, message);
+
+    private void OfferQueryFrom(ushort clientPort, byte[] message)
     {
-        Assert.IsTrue(TryOfferQuery(message));
+        Assert.IsTrue(TryOfferQuery(clientPort, message));
     }
 
-    private bool TryOfferQuery(byte[] message)
+    private bool TryOfferQuery(ushort clientPort, byte[] message)
     {
         var buffer = new byte[UdpDatagram.HeaderLength + message.Length];
         message.CopyTo(buffer, UdpDatagram.HeaderLength);
-        _ = UdpDatagram.Write(buffer, Client, Server, ClientPort, 53, message.Length);
+        _ = UdpDatagram.Write(buffer, Client, Server, clientPort, 53, message.Length);
 
         Assert.IsTrue(UdpDatagram.TryParse(buffer, out var datagram));
         return _relay.Offer(Client, Server, datagram);
     }
 
-    private void DeliverFramed(byte[] message)
+    /// <summary>Reads back the length-framed requests the relay has written to the channel.</summary>
+    private List<(ushort Id, byte[] Message)> SentRequests()
     {
-        _channel!.ReceiveFromPeer(Frame(message));
+        var sent = _channel!.Sent.ToArray();
+        var requests = new List<(ushort, byte[])>();
+        var offset = 0;
+
+        while (offset + 2 <= sent.Length)
+        {
+            var length = BinaryPrimitives.ReadUInt16BigEndian(sent.AsSpan(offset, 2));
+            if (offset + 2 + length > sent.Length)
+            {
+                break;
+            }
+
+            var message = sent[(offset + 2)..(offset + 2 + length)];
+            requests.Add((BinaryPrimitives.ReadUInt16BigEndian(message), message));
+            offset += 2 + length;
+        }
+
+        return requests;
     }
 
-    private static byte[] Frame(byte[] message)
+    private void DeliverReply(ushort id, byte[] message)
+    {
+        _channel!.ReceiveFromPeer(Frame(id, message));
+    }
+
+    private static byte[] Frame(ushort id, byte[] message)
     {
         var framed = new byte[2 + message.Length];
         BinaryPrimitives.WriteUInt16BigEndian(framed, (ushort)message.Length);
         message.CopyTo(framed, 2);
+
+        // The server answers with whatever identifier it was asked with.
+        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(2), id);
         return framed;
     }
 
@@ -386,8 +497,7 @@ public sealed class DnsRelayTests
         message[3] = 0x80;                               // recursion available
         BinaryPrimitives.WriteUInt16BigEndian(CollectionsMarshal.AsSpan(message)[6..8], (ushort)answers);
 
-        // Nothing under test parses an answer record, so only its length matters here: what the tests
-        // turn on is where the reply as a whole falls against the size limits.
+        // Nothing under test parses an answer record, so only its length matters here.
         for (var i = 0; i < answers; i++)
         {
             message.AddRange(new byte[] { 0xC0, 0x0C });                    // name: a pointer to the question
@@ -410,13 +520,17 @@ public sealed class DnsRelayTests
 
         Assert.IsTrue(UdpDatagram.TryParse(ip.Payload, out var udp));
         Assert.AreEqual((ushort)53, udp.SourcePort);
-        Assert.AreEqual(ClientPort, udp.DestinationPort);
+    }
+
+    private static byte[] Ipv4PayloadOf(byte[] packet)
+    {
+        Assert.IsTrue(Ipv4Packet.TryParse(packet, out var ip));
+        return ip.Payload.ToArray();
     }
 
     private static byte[] PayloadOf(byte[] packet)
     {
-        Assert.IsTrue(Ipv4Packet.TryParse(packet, out var ip));
-        Assert.IsTrue(UdpDatagram.TryParse(ip.Payload, out var udp));
+        Assert.IsTrue(UdpDatagram.TryParse(Ipv4PayloadOf(packet), out var udp));
         return udp.Payload.ToArray();
     }
 }

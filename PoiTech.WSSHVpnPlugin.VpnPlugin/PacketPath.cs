@@ -208,7 +208,7 @@ internal sealed class PacketPath : IDisposable
 
         return $"{_stack.FlowCount} flow(s) open, {Dropped} outbound packet(s) dropped, " +
                $"{_stack.Dropped} uninteresting; DNS {dns.Answered} answered, " +
-               $"{dns.Truncated} truncated, {dns.Dropped} dropped";
+               $"{dns.Truncated} truncated, {dns.Dropped} dropped over {dns.Channels} channel(s)";
     }
 
     private bool DrainOutbound()
@@ -247,7 +247,15 @@ internal sealed class PacketPath : IDisposable
 
         // Bounded: a stack thread that will not stop must not hold up the teardown the platform is
         // waiting on.
-        _ = _thread.Join(TimeSpan.FromSeconds(2));
+        var stopped = _thread.Join(TimeSpan.FromSeconds(2));
+
+        if (stopped)
+        {
+            // Only once the thread is gone: the stack is single-threaded by contract, and releasing
+            // its channels from under a running loop would break that at the worst moment.
+            _stack.Dispose();
+        }
+
         _wake.Dispose();
     }
 }
