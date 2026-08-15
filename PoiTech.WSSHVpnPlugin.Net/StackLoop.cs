@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace PoiTech.WSSHVpnPlugin.Net;
@@ -24,12 +25,26 @@ internal sealed class StackLoop
     private readonly IStackClock _clock;
     private readonly Dictionary<TcpFlowKey, TcpFlow> _flows = new();
     private readonly List<TcpFlowKey> _finished = new();
+    private readonly DnsRelay _dns;
+
+    /// <summary>
+    /// Work handed back by whoever opened a channel, waiting to run on the stack's own thread.
+    /// </summary>
+    /// <remarks>
+    /// Opening a channel is a round trip, so the factory does it on a worker and calls back from
+    /// there. Running that callback where it lands would touch a flow's state from a second thread,
+    /// against everything <see cref="TcpFlow"/> assumes - two threads writing one flow's scratch
+    /// buffer produce a corrupt packet, not an exception, which is the kind of fault that gets blamed
+    /// on the peer for a week. So the callback only queues, and the queue drains here.
+    /// </remarks>
+    private readonly ConcurrentQueue<Action> _arrivals = new();
 
     public StackLoop(IByteChannelFactory channels, IPacketSink sink, IStackClock clock)
     {
         _channels = channels;
         _sink = sink;
         _clock = clock;
+        _dns = new DnsRelay(sink, clock, OpenChannel);
     }
 
     /// <summary>Gets the number of flows currently tracked.</summary>
@@ -37,6 +52,10 @@ internal sealed class StackLoop
 
     /// <summary>Gets the number of packets dropped as uninteresting.</summary>
     public long Dropped { get; private set; }
+
+    /// <summary>Gets how the DNS relay has been faring, for the host to report.</summary>
+    public (long Answered, long Truncated, long Dropped) DnsCounters =>
+        (_dns.Answered, _dns.Truncated, _dns.Dropped);
 
     /// <summary>
     /// Called when a flow is first seen, with its four-tuple.
@@ -67,7 +86,27 @@ internal sealed class StackLoop
         // Dropped before the flow table is touched. A default route through the tunnel drags in
         // SSDP, LLMNR, mDNS, NetBIOS and NCSI probes, and hashing a four-tuple for each of them
         // would be work done purely to throw the result away.
-        if (ip.IsFragment || !IsUnicast(ip.Destination) || ip.Protocol != IpProtocol.Tcp)
+        if (ip.IsFragment || !IsUnicast(ip.Destination))
+        {
+            Dropped++;
+            return false;
+        }
+
+        // The one exception to "TCP only". Name resolution for the whole machine is pinned to the
+        // tunnel the moment it starts, so UDP/53 going nowhere does not degrade gracefully - it
+        // breaks every name on the system.
+        if (ip.Protocol == IpProtocol.Udp)
+        {
+            if (UdpDatagram.TryParse(ip.Payload, out var udp) && udp.DestinationPort == DnsRelay.Port)
+            {
+                return _dns.Offer(ip.Source, ip.Destination, udp);
+            }
+
+            Dropped++;
+            return false;
+        }
+
+        if (ip.Protocol != IpProtocol.Tcp)
         {
             Dropped++;
             return false;
@@ -93,11 +132,7 @@ internal sealed class StackLoop
         if (wantsChannel)
         {
             var pending = flow;
-            _channels.BeginOpen(
-                key.RemoteAddress,
-                key.RemotePort,
-                channel => pending.OnChannelOpened(channel),
-                pending.OnChannelFailed);
+            OpenChannel(key.RemoteAddress, key.RemotePort, pending.OnChannelOpened, pending.OnChannelFailed);
         }
 
         if (flow.IsFinished)
@@ -115,6 +150,19 @@ internal sealed class StackLoop
     public bool RunOnce()
     {
         var progressed = false;
+
+        // Channels that finished opening while we were elsewhere. First, so a flow that has just
+        // been given its channel gets pumped in this same pass rather than the next one.
+        while (_arrivals.TryDequeue(out var arrival))
+        {
+            arrival();
+            progressed = true;
+        }
+
+        if (_dns.RunOnce())
+        {
+            progressed = true;
+        }
 
         foreach (var pair in _flows)
         {
@@ -136,6 +184,18 @@ internal sealed class StackLoop
 
         _finished.Clear();
         return progressed;
+    }
+
+    /// <summary>
+    /// Opens a channel, marshalling the answer back onto the stack's thread.
+    /// </summary>
+    private void OpenChannel(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed)
+    {
+        _channels.BeginOpen(
+            address,
+            port,
+            channel => _arrivals.Enqueue(() => onOpened(channel)),
+            () => _arrivals.Enqueue(onFailed));
     }
 
     /// <summary>

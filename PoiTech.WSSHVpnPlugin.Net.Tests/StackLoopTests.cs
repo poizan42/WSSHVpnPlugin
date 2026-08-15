@@ -36,6 +36,18 @@ public class StackLoopTests
     private void Syn(ushort? mss = 1460, ushort port = ClientPort)
     {
         _ = _stack.Offer(Packets.Tcp(Client, Server, port, ServerPort, 1000, 0, TcpFlags.Syn, default, mss));
+
+        // A channel that opened is only attached to its flow on the stack's own thread, so the
+        // handshake is answered by the loop rather than by whoever completed the open.
+        _ = _stack.RunOnce();
+    }
+
+    /// <summary>Opens the channel a SYN asked for, and lets the loop pick it up.</summary>
+    private FakeChannel CompleteOpen()
+    {
+        var channel = _channels.CompleteOpen();
+        _ = _stack.RunOnce();
+        return channel;
     }
 
     private void Send(uint sequenceNumber, string text, TcpFlags flags = TcpFlags.Ack | TcpFlags.Psh)
@@ -66,7 +78,7 @@ public class StackLoopTests
 
         Assert.AreEqual(0, _sink.Packets.Count);
 
-        _ = _channels.CompleteOpen();
+        _ = CompleteOpen();
 
         var reply = _sink.Last();
         Assert.AreEqual(TcpFlags.Syn | TcpFlags.Ack, reply.Flags);
@@ -105,7 +117,7 @@ public class StackLoopTests
     {
         _channels.OpenImmediately = false;
         Syn(mss: 1200);
-        _ = _channels.CompleteOpen();
+        _ = CompleteOpen();
 
         // The flow is not exposed directly; the observable effect is that it parsed without error
         // and answered, which the SYN-ACK confirms.

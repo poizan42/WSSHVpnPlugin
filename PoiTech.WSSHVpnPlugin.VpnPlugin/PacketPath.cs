@@ -143,7 +143,10 @@ internal sealed class PacketPath : IDisposable
             PluginLog.Error("The stack thread failed; the tunnel will carry nothing", ex);
         }
 
-        PluginLog.Info($"Stack thread stopped (dropped {Dropped} outbound packet(s), {_stack.Dropped} uninteresting)");
+        var dns = _stack.DnsCounters;
+        PluginLog.Info(
+            $"Stack thread stopped (dropped {Dropped} outbound packet(s), {_stack.Dropped} uninteresting; " +
+            $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped)");
     }
 
     private bool DrainOutbound()
