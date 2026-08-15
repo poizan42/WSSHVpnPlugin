@@ -181,7 +181,7 @@ internal sealed class M0Spike : IDisposable
                 return;
             }
 
-            var span = VpnPacketBufferAccess.GetSpan(buffer);
+            var span = VpnPacketBufferAccess.GetSpan(buffer.Buffer);
             var length = WriteIcmpEchoRequest(span, ProbeSource, _clientAddress);
             buffer.Buffer.Length = (uint)length;
 
@@ -214,7 +214,7 @@ internal sealed class M0Spike : IDisposable
         {
             _channel.RequestVpnPacketBuffer(VpnDataPathType.Receive, out var buffer);
 
-            var span = VpnPacketBufferAccess.GetSpan(buffer);
+            var span = VpnPacketBufferAccess.GetSpan(buffer.Buffer);
             var length = WriteIcmpEchoRequest(span, ProbeSource, _clientAddress);
             buffer.Buffer.Length = (uint)length;
 

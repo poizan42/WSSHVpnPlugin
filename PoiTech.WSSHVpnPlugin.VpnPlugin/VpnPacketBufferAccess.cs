@@ -30,25 +30,27 @@ internal static class VpnPacketBufferAccess
     /// A span covering <c>Buffer.Capacity</c> bytes. Set <c>Buffer.Length</c> to the number of bytes
     /// actually written before handing the packet back to the platform.
     /// </returns>
-    public static unsafe Span<byte> GetSpan(VpnPacketBuffer packet)
+    public static unsafe Span<byte> GetSpan(Windows.Storage.Streams.IBuffer buffer)
     {
-        ArgumentNullException.ThrowIfNull(packet);
+        ArgumentNullException.ThrowIfNull(buffer);
 
-        var buffer = packet.Buffer;
+        // The pointer comes from the buffer itself, not from wrapping it. The first version
+        // created a MemoryBuffer over the IBuffer and a reference over that - two new WinRT
+        // objects per packet - and each creation resolved the object's runtime class name, which
+        // failed inside WinTypes and fired RoOriginateError, whose reporting captures diagnostics
+        // through the registry. About a millisecond per packet, all of it overhead: one core
+        // saturated at ~900 packets/s, which is the 1.2 MB/s ceiling every download hit while
+        // every window and queue above measured healthy. Caught red-handed by sampling the hot
+        // thread. IBufferByteAccess is the same pointer with a single QueryInterface on the object
+        // already in hand.
+        ((IBufferByteAccess)(object)buffer).GetBuffer(out var data);
 
-        // The MemoryBuffer and its reference only wrap the existing IBuffer; disposing them does not
-        // touch the underlying memory, which the platform owns.
-        using var memoryBuffer = Windows.Storage.Streams.Buffer.CreateMemoryBufferOverIBuffer(buffer);
-        using var reference = memoryBuffer.CreateReference();
-
-        ((IMemoryBufferByteAccess)(object)reference).GetBuffer(out var data, out var capacity);
-
-        return new Span<byte>(data, checked((int)capacity));
+        return new Span<byte>(data, checked((int)buffer.Capacity));
     }
 }
 
 /// <summary>
-/// Hands back the raw pointer behind an <c>IMemoryBufferReference</c>.
+/// Hands back the raw pointer behind an <c>IBuffer</c>.
 /// </summary>
 /// <remarks>
 /// Declared here because the SDK's own <c>IBufferByteAccess</c> is not public in the projection.
@@ -57,13 +59,12 @@ internal static class VpnPacketBufferAccess
 /// is not something to rely on.
 /// </remarks>
 [GeneratedComInterface]
-[Guid("5b0d3235-4dba-4d44-865e-8f1d0e4fd04d")]
-internal unsafe partial interface IMemoryBufferByteAccess
+[Guid("905a0fef-bc53-11df-8c49-001e4fc686da")]
+internal unsafe partial interface IBufferByteAccess
 {
     /// <summary>
-    /// Gets the address and capacity of the underlying memory.
+    /// Gets the address of the underlying memory, valid for the buffer's capacity.
     /// </summary>
     /// <param name="buffer">Receives the address of the first byte.</param>
-    /// <param name="capacity">Receives the number of bytes available.</param>
-    void GetBuffer(out byte* buffer, out uint capacity);
+    void GetBuffer(out byte* buffer);
 }

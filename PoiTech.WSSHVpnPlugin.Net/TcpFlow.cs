@@ -55,10 +55,21 @@ internal sealed class TcpFlow
     private readonly IStackClock _clock;
     private readonly byte[] _scratch = new byte[1500];
 
+    /// <summary>How long to wait for an acknowledgement before resending, initially.</summary>
+    /// <remarks>Doubled on each expiry, so a dead peer costs retries, not a flood.</remarks>
+    private static readonly TimeSpan InitialRetransmitTimeout = TimeSpan.FromMilliseconds(200);
+
+    private static readonly TimeSpan MaximumRetransmitTimeout = TimeSpan.FromSeconds(2);
+
     private IByteChannel? _channel;
     private TcpState _state;
     private uint _sendNext;
+    private uint _sendUnacknowledged;
+    private uint _peerWindow;
     private uint _receiveNext;
+    private bool _finSent;
+    private TimeSpan _retransmitAt;
+    private TimeSpan _retransmitInterval = InitialRetransmitTimeout;
     private ushort _peerMaximumSegmentSize = 536;
     private bool _channelEofSent;
     private bool _ackDue;
@@ -112,6 +123,8 @@ internal sealed class TcpFlow
 
             _receiveNext = tcp.SequenceNumber + 1;   // the SYN occupies a sequence number
             _sendNext = InitialSendSequence(_key);
+            _sendUnacknowledged = _sendNext;
+            _peerWindow = tcp.WindowSize;
 
             if (tcp.TryGetMaximumSegmentSize(out var mss) && mss > 0)
             {
@@ -130,6 +143,46 @@ internal sealed class TcpFlow
             // A retransmitted SYN while the channel is still opening. Nothing to do; answering
             // early is exactly what we are avoiding.
             return false;
+        }
+
+        if ((flags & TcpFlags.Ack) != 0)
+        {
+            // The peer's view of what it has received and what more it can take. Both matter to
+            // the send side: ignoring the advertised window worked at low rates and then cost a
+            // whole download at higher ones - a burst past what the peer would buffer was dropped,
+            // and with no retransmission on this path a dropped segment wedges the flow for good.
+            // Not sending it in the first place is the fix that does not need a retransmit timer.
+            var acknowledged = tcp.AcknowledgementNumber;
+
+            if ((int)(acknowledged - _sendUnacknowledged) > 0 && (int)(acknowledged - _sendNext) <= 0)
+            {
+                var delta = acknowledged - _sendUnacknowledged;
+                _sendUnacknowledged = acknowledged;
+
+                // Only now are the channel's bytes released: the buffer between the last
+                // acknowledgement and _sendNext is the retransmit buffer, and releasing it on send
+                // is how a lost segment became a permanently wedged flow. A FIN occupies a sequence
+                // number but no buffer, so its acknowledgement releases nothing.
+                var dataDelta = delta;
+                if (_finSent && acknowledged == _sendNext)
+                {
+                    dataDelta--;
+                }
+
+                if (dataDelta > 0 && _channel is { } channel)
+                {
+                    if (channel.Advance((int)dataDelta))
+                    {
+                        channel.FlushWindowCredit();
+                    }
+                }
+
+                // Progress resets the clock and the backoff.
+                _retransmitInterval = InitialRetransmitTimeout;
+                _retransmitAt = _clock.Now + _retransmitInterval;
+            }
+
+            _peerWindow = tcp.WindowSize;
         }
 
         if (tcp.SequenceNumber != _receiveNext && tcp.Payload.Length > 0)
@@ -220,6 +273,11 @@ internal sealed class TcpFlow
         // throughput while appearing to work perfectly.
         SendSegment(TcpFlags.Syn | TcpFlags.Ack, ReadOnlySpan<byte>.Empty, OurMaximumSegmentSize);
         _sendNext++;
+
+        // Counted as acknowledged at once: a SYN occupies a sequence number but no channel bytes,
+        // so the acknowledgement-driven release must never see it, and a lost SYN-ACK is recovered
+        // by the peer retransmitting its SYN rather than by us.
+        _sendUnacknowledged = _sendNext;
     }
 
     /// <summary>
@@ -256,6 +314,29 @@ internal sealed class TcpFlow
             progressed = true;
         }
 
+        // A retransmission timeout rewinds the send pointer to the last acknowledged byte, and the
+        // loop below resends from there - the channel's buffer still holds everything unreleased,
+        // which is the whole reason releasing waits for the acknowledgement. Loss is real on this
+        // path: at 30 Mbit/s a download died mid-transfer with every queue healthy, because one
+        // dropped segment was never sent again.
+        if (_sendNext != _sendUnacknowledged && _clock.Now >= _retransmitAt)
+        {
+            _sendNext = _sendUnacknowledged;
+            _retransmitInterval = _retransmitInterval >= MaximumRetransmitTimeout
+                ? MaximumRetransmitTimeout
+                : _retransmitInterval + _retransmitInterval;
+            _retransmitAt = _clock.Now + _retransmitInterval;
+
+            if (_finSent)
+            {
+                // The FIN was in flight too. It carries no buffer bytes, so it is simply sent
+                // again once the data ahead of it has gone.
+                _finSent = false;
+            }
+
+            progressed = true;
+        }
+
         var sent = 0;
 
         while (sent < InboundQuantum && channel.TryRead(out var data))
@@ -267,19 +348,39 @@ internal sealed class TcpFlow
                 break;
             }
 
-            var take = Math.Min(data.Count, OurMaximumSegmentSize);
+            // Bytes between the acknowledgement and _sendNext are in flight and still sit at the
+            // front of the channel's buffer; what follows them has not been sent yet.
+            var inFlight = (int)(_sendNext - _sendUnacknowledged);
+            var unsent = data.Count - inFlight;
 
-            if (!SendSegment(TcpFlags.Ack | TcpFlags.Psh, data.AsSpan()[..take]))
+            if (unsent <= 0)
             {
                 break;
             }
 
-            _sendNext += (uint)take;
+            // Never more in flight than the peer said it would buffer. Data beyond the advertised
+            // window is not merely impolite - the peer drops it.
+            var window = _peerWindow > (uint)inFlight ? _peerWindow - (uint)inFlight : 0;
 
-            if (channel.Advance(take))
+            if (window == 0)
             {
-                channel.FlushWindowCredit();
+                break;
             }
+
+            var take = Math.Min(Math.Min(unsent, OurMaximumSegmentSize), (int)window);
+
+            if (!SendSegment(TcpFlags.Ack | TcpFlags.Psh, data.AsSpan().Slice(inFlight, take)))
+            {
+                break;
+            }
+
+            if (_sendNext == _sendUnacknowledged)
+            {
+                // The clock starts when the wire goes quiet-to-busy, not per segment.
+                _retransmitAt = _clock.Now + _retransmitInterval;
+            }
+
+            _sendNext += (uint)take;
 
             sent++;
             progressed = true;
@@ -291,11 +392,31 @@ internal sealed class TcpFlow
             // still be sending, so we half-close and wait for its FIN; from CloseWait it already
             // sent one, so the only thing left is the acknowledgement of ours. Handling just the
             // Established case - which is what this did - left every gracefully closed connection
-            // parked in CloseWait for the life of the tunnel, holding its channel.
+            // parked in CloseWait for the life of the tunnel, holding its channel. The FIN itself
+            // goes below, once nothing is left ahead of it.
             _state = _state == TcpState.Established ? TcpState.FinWait : TcpState.LastAck;
-            SendSegment(TcpFlags.Fin | TcpFlags.Ack, ReadOnlySpan<byte>.Empty);
-            _sendNext++;
             progressed = true;
+        }
+
+        if (!_finSent && _state is TcpState.FinWait or TcpState.LastAck)
+        {
+            // A FIN takes its place in the sequence space after the data, so it waits until every
+            // buffered byte has at least been sent. Separate from the transition above because a
+            // retransmission rewind un-sends it, and this is also where it goes again.
+            var buffered = channel.TryRead(out var remaining) ? remaining.Count : 0;
+
+            if (buffered <= (int)(_sendNext - _sendUnacknowledged))
+            {
+                if (_sendNext == _sendUnacknowledged)
+                {
+                    _retransmitAt = _clock.Now + _retransmitInterval;
+                }
+
+                SendSegment(TcpFlags.Fin | TcpFlags.Ack, ReadOnlySpan<byte>.Empty);
+                _sendNext++;
+                _finSent = true;
+                progressed = true;
+            }
         }
 
         return progressed;

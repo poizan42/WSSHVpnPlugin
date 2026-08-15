@@ -300,6 +300,89 @@ public class StackLoopTests
         Assert.AreEqual(40, _sink.Packets.Count - before, "the remainder should still be delivered");
     }
 
+    /// <summary>
+    /// The peer's advertised window is a hard bound on what may be in flight to it. Data past it is
+    /// dropped by the peer, and nothing on this path resends - at speed that wedged whole downloads.
+    /// </summary>
+    [TestMethod]
+    public void PeerWindow_BoundsWhatIsInFlight()
+    {
+        Syn();
+        var synAckSeq = _sink.Last().Seq;
+
+        // The client announces a two-segment window.
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, synAckSeq + 1, TcpFlags.Ack, windowSize: 2720));
+
+        _channels.Last!.ReceiveFromPeer(new byte[10000]);
+
+        for (var i = 0; i < 5; i++)
+        {
+            _ = _stack.RunOnce();
+        }
+
+        var delivered = 0;
+        for (var i = 1; i < _sink.Packets.Count; i++)
+        {
+            delivered += _sink.At(i).Payload.Length;
+        }
+
+        Assert.AreEqual(2720, delivered, "no more than the advertised window may be outstanding");
+
+        // Acknowledging what arrived reopens the window, and the rest follows.
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, synAckSeq + 1 + 2720, TcpFlags.Ack, windowSize: 65535));
+
+        for (var i = 0; i < 5; i++)
+        {
+            _ = _stack.RunOnce();
+        }
+
+        delivered = 0;
+        for (var i = 1; i < _sink.Packets.Count; i++)
+        {
+            delivered += _sink.At(i).Payload.Length;
+        }
+
+        Assert.AreEqual(10000, delivered, "the remainder goes once the window reopens");
+    }
+
+    /// <summary>
+    /// A segment the platform loses must be sent again. The channel's buffer holds everything not
+    /// yet acknowledged, so a retransmission timeout rewinds and resends from the last
+    /// acknowledgement - without this, one lost segment wedged a flow forever, which is how
+    /// downloads started failing the moment the tunnel got fast enough to provoke loss.
+    /// </summary>
+    [TestMethod]
+    public void UnacknowledgedData_IsResentAfterTheTimeout()
+    {
+        Syn();
+        _channels.Last!.ReceiveFromPeer(Encoding.ASCII.GetBytes("hello"));
+        _ = _stack.RunOnce();
+
+        var first = _sink.Last();
+        CollectionAssert.AreEqual(Encoding.ASCII.GetBytes("hello"), first.Payload);
+        var count = _sink.Packets.Count;
+
+        // No acknowledgement arrives. Before the timeout, nothing is resent.
+        _clock.Advance(TimeSpan.FromMilliseconds(100));
+        _ = _stack.RunOnce();
+        Assert.AreEqual(count, _sink.Packets.Count, "too early to resend");
+
+        _clock.Advance(TimeSpan.FromMilliseconds(150));
+        _ = _stack.RunOnce();
+
+        var resent = _sink.Last();
+        CollectionAssert.AreEqual(Encoding.ASCII.GetBytes("hello"), resent.Payload, "the same bytes go again");
+        Assert.AreEqual(first.Seq, resent.Seq, "at the same sequence number");
+
+        // The acknowledgement finally lands, and releases the channel's bytes.
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, first.Seq + 5, TcpFlags.Ack));
+        count = _sink.Packets.Count;
+
+        _clock.Advance(TimeSpan.FromSeconds(3));
+        _ = _stack.RunOnce();
+        Assert.AreEqual(count, _sink.Packets.Count, "acknowledged data is never resent");
+    }
+
     [TestMethod]
     public void Reset_DiscardsTheFlow()
     {

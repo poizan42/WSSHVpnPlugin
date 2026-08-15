@@ -429,8 +429,11 @@ internal sealed class InboundPacketSink : IPacketSink
 
         try
         {
-            packet.CopyTo(VpnPacketBufferAccess.GetSpan(buffer));
-            buffer.Buffer.Length = (uint)packet.Length;
+            // One .Buffer access per packet, reused for the span and the length: the property get
+            // marshals a WinRT object each time it is called.
+            var inner = buffer.Buffer;
+            packet.CopyTo(VpnPacketBufferAccess.GetSpan(inner));
+            inner.Length = (uint)packet.Length;
             _queue.Enqueue(buffer);
             _pending = true;
             _ = Interlocked.Add(ref _bytesWritten, packet.Length);

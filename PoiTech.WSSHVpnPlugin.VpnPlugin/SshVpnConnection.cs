@@ -263,7 +263,7 @@ internal sealed class SshVpnConnection : IDisposable
             return;
         }
 
-        var span = VpnPacketBufferAccess.GetSpan(packet);
+        var span = VpnPacketBufferAccess.GetSpan(packet.Buffer);
         path.Offer(span[..checked((int)packet.Buffer.Length)]);
     }
 

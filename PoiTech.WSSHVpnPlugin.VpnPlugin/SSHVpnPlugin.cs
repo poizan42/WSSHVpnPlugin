@@ -327,7 +327,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             var buffer = packets.RemoveAtBegin();
             try
             {
-                spike?.SampleOutbound(VpnPacketBufferAccess.GetSpan(buffer).Slice(0, checked((int)buffer.Buffer.Length)));
+                spike?.SampleOutbound(VpnPacketBufferAccess.GetSpan(buffer.Buffer).Slice(0, checked((int)buffer.Buffer.Length)));
 
                 // Copies and queues for the stack's own thread. It must not do more than that:
                 // this is the platform's thread, and anything that blocks here blocks the tunnel.

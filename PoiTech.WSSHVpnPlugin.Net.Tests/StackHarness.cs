@@ -230,7 +230,8 @@ internal static class Packets
         uint acknowledgementNumber,
         TcpFlags flags,
         ReadOnlySpan<byte> payload = default,
-        ushort? mss = null)
+        ushort? mss = null,
+        ushort windowSize = 65535)
     {
         var buffer = new byte[1500];
         var tcpStart = Ipv4Packet.MinimumHeaderLength;
@@ -247,7 +248,7 @@ internal static class Packets
             sequenceNumber,
             acknowledgementNumber,
             flags,
-            windowSize: 65535,
+            windowSize,
             payload.Length,
             mss);
 

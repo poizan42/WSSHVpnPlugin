@@ -76,6 +76,8 @@ internal sealed class PacketPath : IDisposable
     private long _lastReads;
     private long _lastReadBytes;
     private long _lastReadTicks;
+    private long _lastAdjusts;
+    private long _lastCredited;
 
     public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport)
     {
@@ -242,8 +244,16 @@ internal sealed class PacketPath : IDisposable
         _lastReadBytes = readBytes;
         _lastReadTicks = readTicks;
 
+        var adjusts = Interlocked.Read(ref Renci.SshNet.DirectTcpipStream.WindowAdjustsSent);
+        var credited = Interlocked.Read(ref Renci.SshNet.DirectTcpipStream.WindowBytesCredited);
+        var deltaAdjusts = adjusts - _lastAdjusts;
+        var creditRate = (credited - _lastCredited) * 8.0 / seconds / 1_000_000.0;
+        _lastAdjusts = adjusts;
+        _lastCredited = credited;
+
         return $"{_stack.FlowCount} flow(s) open, down {down:F1} Mbit/s, up {up:F1} Mbit/s " +
                $"({_sink.Stalls} platform stall(s), {Interlocked.Read(ref Counters.WindowFull)} window-full); " +
+               $"credit {deltaAdjusts / seconds:F1} adjust/s worth {creditRate:F1} Mbit/s; " +
                $"transport {deltaReads / seconds:F0} read/s avg {averageRead:F0} B in {microsPerRead:F0} us; " +
                $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
                $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +

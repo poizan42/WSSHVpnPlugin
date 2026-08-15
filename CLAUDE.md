@@ -309,12 +309,41 @@ Backpressure rather than blocking, in both directions: a full outbound queue dro
 retransmits), and a full `IPacketSink` leaves received bytes unreleased, which closes the SSH
 channel's window and slows the far end down.
 
+### Throughput: what was measured, so nobody re-guesses it
+
+The tunnel ran at 630 kbit/s and ended one long hunt at ~40-50 Mbit/s sustained. Every step was
+measured, and most plausible theories were wrong; the order below is the order of *elimination*:
+
+- **The SSH channel window** (8 KiB default) was the first, real ceiling: 8→128 KiB scaled
+  throughput ~linearly to ~8 Mbit/s. Beyond that it was innocent — 2 MiB (OpenSSH's
+  `CHAN_TCP_WINDOW_DEFAULT`) changed nothing and `window-full` stayed 0 at every rate. Windows now
+  match OpenSSH anyway, made affordable by `DirectTcpipStream` growing its buffer on demand.
+- **Not the platform sink** (stalls fell 7× with no gain; deepening the queue without the fairness
+  quantum below *dropped 4566 outbound packets* and killed connections), **not the transport**
+  (classic socket == WinRT socket, both ~8 Mbit), **not the environment** (a source-bound `ssh -D`
+  on the same machine *with the VPN connected* did 282 Mbit/s — the decisive experiment),
+  **not window credits** (measured flowing at consumption rate).
+- **The real 8 Mbit ceiling: an RCW per packet.** Sampled live with `cdbX64 -pv` on the pegged
+  stack thread: `CreateMemoryBufferOverIBuffer`+`CreateReference` per packet → each RCW creation ran
+  `GetRuntimeClassName`, which **fails inside WinTypes and fires `RoOriginateError`**, whose report
+  capture does registry I/O — ~1 ms/packet, one core caps at ~900 packets/s. Fix:
+  `IBufferByteAccess` QI on the `IBuffer` already in hand (`VpnPacketBufferAccess.GetSpan`), zero
+  new WinRT objects per packet. **Never create a WinRT object on the packet path.** 4-6× immediately.
+- **At 30+ Mbit/s, injected-segment loss is real** and the two TCP-sender liberties stopped being
+  survivable: the peer's advertised window is now honored, and channel bytes are released on the
+  client's ACK rather than on send — the channel buffer *is* the retransmit buffer, with a 200 ms
+  doubling RTO doing go-back-N (SYN and FIN occupy sequence numbers but no buffer, and are excluded
+  from the release accounting).
+- **The fairness quantum in `TcpFlow` (8 segments per flow per visit) is load-bearing**: without it
+  the inbound queue capacity silently doubles as the inbound/outbound fairness bound.
+- **What kills fast downloads now: the 8-slot blocking channel-open pool** — the not-yet-built
+  async-open work (P1-P3 of the packet-path plan). Under sustained load, slow opens hold slots for
+  the 30 s SSH timeout, refusals cascade, and a browser retry storm follows.
+
 ### Open holes
 
 Deliberate, documented, and not to be silently papered over:
 
-- **Retransmission of our own injected segments.** There is no RTO on the inbound path: a segment the
-  platform loses is never resent. It survives because both ends are on one machine.
 - **Out-of-order segments are dropped**, and no SACK is offered — consistent, but it makes any real
   loss expensive.
 - **Channel opens have no short timeout.** `MaximumConcurrentOpens = 8` bounds the damage from
