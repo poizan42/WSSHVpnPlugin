@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <!--
+      The stack is built from synthetic packets, so its internals are what the tests drive. Exposing
+      them beats making the parsing types public purely to be testable.
+    -->
+    <NoWarn>$(NoWarn);CA1707</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MSTest" Version="3.6.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PoiTech.WSSHVpnPlugin.Net\PoiTech.WSSHVpnPlugin.Net.csproj" />
+  </ItemGroup>
+</Project>

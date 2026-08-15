@@ -1,4 +1,4 @@
-<Solution>
+﻿<Solution>
   <Configurations>
     <Platform Name="Any CPU" />
     <Platform Name="ARM64" />
@@ -18,5 +18,7 @@
     <Deploy />
   </Project>
   <Project Path="PoiTech.WSSHVpnPlugin.VpnPlugin/PoiTech.WSSHVpnPlugin.VpnPlugin.csproj" />
+  <Project Path="PoiTech.WSSHVpnPlugin.Net/PoiTech.WSSHVpnPlugin.Net.csproj" />
+  <Project Path="PoiTech.WSSHVpnPlugin.Net.Tests/PoiTech.WSSHVpnPlugin.Net.Tests.csproj" />
   <Project Path="SSH.NET/src/Renci.SshNet/Renci.SshNet.csproj" />
 </Solution>
