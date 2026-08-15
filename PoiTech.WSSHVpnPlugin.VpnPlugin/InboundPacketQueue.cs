@@ -31,10 +31,28 @@ internal sealed class InboundPacketQueue
     /// The most buffers that may be borrowed from the platform at once.
     /// </summary>
     /// <remarks>
-    /// Deliberately modest. The pool's real size is undocumented, and holding more of it than we
-    /// need buys nothing: the queue exists to smooth a batch, not to store a backlog.
+    /// <para>
+    /// This is the tunnel's inbound speed limit: throughput cannot exceed the buffers in flight
+    /// divided by the doorbell round trip, and at 48 buffers of 1360 bytes over the measured ~55 ms
+    /// that is 9.5 Mbit/s - precisely the ceiling every download hit while a bound `ssh -D` on the
+    /// same machine, same server and same connected VPN ran at 282. Every layer above was cleared by
+    /// measurement first: the SSH window never filled, the transport made no difference, and the
+    /// backpressure chain simply propagated this bound up to the server's pacing.
+    /// </para>
+    /// <para>
+    /// Raising it is only safe with the fairness quantum in TcpFlow. The first attempt at 512
+    /// predated that quantum, and the stack spent so long filling the sink that the outbound queue
+    /// overflowed and dropped 4566 packets - lost acknowledgements kill connections rather than
+    /// slowing them. With the quantum bounding inbound work per pass, the outbound queue drains
+    /// every pass whatever this is set to.
+    /// </para>
+    /// <para>
+    /// The pool's real size is undocumented, so this may be more than the platform will lend. An
+    /// acquisition that fails is counted and refused, which is the same backpressure as a full
+    /// queue.
+    /// </para>
     /// </remarks>
-    public const int Capacity = 48;
+    public const int Capacity = 512;
 
     private readonly VpnChannel _channel;
     private readonly Queue<VpnPacketBuffer> _queue = new(Capacity);

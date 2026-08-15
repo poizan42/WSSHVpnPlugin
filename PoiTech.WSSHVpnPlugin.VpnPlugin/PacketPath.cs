@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using PoiTech.WSSHVpnPlugin.Net;
 using Renci.SshNet;
@@ -69,6 +70,12 @@ internal sealed class PacketPath : IDisposable
     private int _disposed;
     private long _dropped;
     private long _lastReport = Environment.TickCount64;
+    private long _lastRateAt = Environment.TickCount64;
+    private long _lastIn;
+    private long _lastOut;
+    private long _lastReads;
+    private long _lastReadBytes;
+    private long _lastReadTicks;
 
     public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport)
     {
@@ -206,9 +213,41 @@ internal sealed class PacketPath : IDisposable
     {
         var dns = _stack.DnsCounters;
 
-        return $"{_stack.FlowCount} flow(s) open, {Dropped} outbound packet(s) dropped, " +
-               $"{_stack.Dropped} uninteresting; DNS {dns.Answered} answered, " +
-               $"{dns.Truncated} truncated, {dns.Dropped} dropped over {dns.Channels} channel(s)";
+        // Rates since the last report, which is what a ceiling shows up in - totals hide it.
+        var now = Environment.TickCount64;
+        var seconds = Math.Max(1.0, (now - _lastRateAt) / 1000.0);
+
+        var inBytes = _sink.BytesWritten;
+        var outBytes = Interlocked.Read(ref Counters.BytesSent);
+        var down = (inBytes - _lastIn) * 8.0 / seconds / 1_000_000.0;
+        var up = (outBytes - _lastOut) * 8.0 / seconds / 1_000_000.0;
+
+        _lastIn = inBytes;
+        _lastOut = outBytes;
+        _lastRateAt = now;
+
+        // The transport's own read profile: how many socket reads that traffic cost, how big they
+        // were, and how long each one blocked the message listener for.
+        var reads = Interlocked.Read(ref Renci.SshNet.Connection.StreamSocketSshTransport.ReadCount);
+        var readBytes = Interlocked.Read(ref Renci.SshNet.Connection.StreamSocketSshTransport.BytesRead);
+        var readTicks = Interlocked.Read(ref Renci.SshNet.Connection.StreamSocketSshTransport.ReadTicks);
+
+        var deltaReads = reads - _lastReads;
+        var averageRead = deltaReads > 0 ? (readBytes - _lastReadBytes) / (double)deltaReads : 0;
+        var microsPerRead = deltaReads > 0
+            ? (readTicks - _lastReadTicks) * 1_000_000.0 / Stopwatch.Frequency / deltaReads
+            : 0;
+
+        _lastReads = reads;
+        _lastReadBytes = readBytes;
+        _lastReadTicks = readTicks;
+
+        return $"{_stack.FlowCount} flow(s) open, down {down:F1} Mbit/s, up {up:F1} Mbit/s " +
+               $"({_sink.Stalls} platform stall(s), {Interlocked.Read(ref Counters.WindowFull)} window-full); " +
+               $"transport {deltaReads / seconds:F0} read/s avg {averageRead:F0} B in {microsPerRead:F0} us; " +
+               $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
+               $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +
+               $"over {dns.Channels} channel(s)";
     }
 
     private bool DrainOutbound()

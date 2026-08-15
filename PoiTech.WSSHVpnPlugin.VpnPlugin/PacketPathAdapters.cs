@@ -8,6 +8,24 @@ using Renci.SshNet.Channels;
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 
 /// <summary>
+/// Throughput counters, shared across every channel.
+/// </summary>
+/// <remarks>
+/// Deliberately crude and process-wide. Throughput has so far been inferred from a browser speed
+/// test, which measures the whole path and cannot say which end of it is the limit - raising the
+/// channel window sixteenfold changed nothing, and without numbers from inside the stack there was
+/// no way to tell whether the bytes were not arriving or not being delivered.
+/// </remarks>
+internal static class Counters
+{
+    /// <summary>Bytes written to SSH channels: what the client is uploading.</summary>
+    public static long BytesSent;
+
+    /// <summary>How often a channel's remote window had no room.</summary>
+    public static long WindowFull;
+}
+
+/// <summary>
 /// Presents an SSH <c>direct-tcpip</c> channel as the stack's byte channel.
 /// </summary>
 /// <remarks>
@@ -160,7 +178,19 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
 
         try
         {
-            return _stream.TrySend(data, offset, count, out written) switch
+            var result = _stream.TrySend(data, offset, count, out written);
+
+            if (written > 0)
+            {
+                _ = Interlocked.Add(ref Counters.BytesSent, written);
+            }
+
+            if (result == ChannelSendResult.WindowFull)
+            {
+                _ = Interlocked.Increment(ref Counters.WindowFull);
+            }
+
+            return result switch
             {
                 ChannelSendResult.Written => ByteChannelSendResult.Written,
                 ChannelSendResult.WindowFull => ByteChannelSendResult.Full,
@@ -251,9 +281,39 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
     /// </remarks>
     private const int MaximumConcurrentOpens = 8;
 
+    /// <summary>
+    /// How much the far end may send us before it has to wait for a window adjustment.
+    /// </summary>
+    /// <remarks>
+    /// This is the inbound speed limit, and the fork's 8 KiB default made it a severe one: a window
+    /// adjustment costs a round trip to the SSH server, so throughput is bounded by window over
+    /// round-trip time however fast the link is. Measured through the tunnel at 48 ms: 8 KiB gave
+    /// 633 kbit/s, 128 KiB gave 7.89 Mbit/s, and `ssh -D` to the same server over the same link gave
+    /// 278 Mbit/s. The difference was never SSH - OpenSSH advertises 2 MiB
+    /// (CHAN_TCP_WINDOW_DEFAULT, 64 x 32 KiB), and 2 MiB over 48 ms is about 340 Mbit/s, which is
+    /// the bracket its measurement falls in.
+    ///
+    /// So this matches OpenSSH. What made that affordable is that DirectTcpipStream now grows its
+    /// receive buffer on demand rather than allocating the window up front: a channel per TCP flow
+    /// means the window would otherwise be paid for on every idle connection.
+    /// </remarks>
+    private const uint ChannelWindowSize = 2 * 1024 * 1024;
+
+    /// <summary>
+    /// The per-channel receive buffer, which must not be smaller than the window we advertise.
+    /// </summary>
+    /// <remarks>
+    /// Sized to the window exactly: the far end is entitled to fill the window, and
+    /// <c>DirectTcpipStream</c> treats a buffer smaller than that as a configuration error rather
+    /// than something to handle at runtime. The cost is per live channel, so it is bounded by
+    /// whatever limits those.
+    /// </remarks>
+    private const int ChannelBufferSize = (int)ChannelWindowSize;
+
     private readonly SshClient _client;
     private readonly Action _wake;
     private readonly SemaphoreSlim _openSlots = new(MaximumConcurrentOpens, MaximumConcurrentOpens);
+    private int _reportedWindows;
 
     public SshByteChannelFactory(SshClient client, Action wake)
     {
@@ -284,7 +344,18 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
         {
             try
             {
-                var stream = _client.CreateDirectTcpipStream(host, port);
+                var stream = _client.CreateDirectTcpipStream(host, port, ChannelBufferSize, ChannelWindowSize);
+
+                if (Interlocked.Exchange(ref _reportedWindows, 1) == 0)
+                {
+                    // Once per session. What the server grants is the outbound limit, the mirror of
+                    // the window we advertise for inbound, and it is worth knowing rather than
+                    // assuming: OpenSSH's compile-time default is far larger than the fork's.
+                    PluginLog.Info(
+                        $"Channel windows: we advertise {ChannelWindowSize} bytes, " +
+                        $"the server granted {stream.RemoteWindowSize} with a {stream.RemotePacketSize}-byte packet limit");
+                }
+
                 var channel = new DirectTcpipByteChannel(stream);
                 channel.Signalled += (_, _) => _wake();
                 channel.Start();
@@ -326,6 +397,8 @@ internal sealed class InboundPacketSink : IPacketSink
 {
     private readonly InboundPacketQueue _queue;
     private readonly IOuterTransport _transport;
+    private long _bytesWritten;
+    private long _stalls;
     private bool _pending;
 
     public InboundPacketSink(InboundPacketQueue queue, IOuterTransport transport)
@@ -337,11 +410,20 @@ internal sealed class InboundPacketSink : IPacketSink
     /// <inheritdoc/>
     public bool CanAccept => _queue.HasCapacity;
 
+    /// <summary>Gets how many bytes have been handed to the platform.</summary>
+    public long BytesWritten => Interlocked.Read(ref _bytesWritten);
+
+    /// <summary>Gets how often the platform's buffer pool had no room.</summary>
+    public long Stalls => Interlocked.Read(ref _stalls);
+
     /// <inheritdoc/>
     public bool TryWrite(ReadOnlySpan<byte> packet)
     {
         if (!_queue.TryAcquire(out var buffer))
         {
+            // Worth counting rather than just refusing: if the inbound path is capped by the
+            // platform draining buffers rather than by anything upstream, this is where it shows.
+            _ = Interlocked.Increment(ref _stalls);
             return false;
         }
 
@@ -351,6 +433,7 @@ internal sealed class InboundPacketSink : IPacketSink
             buffer.Buffer.Length = (uint)packet.Length;
             _queue.Enqueue(buffer);
             _pending = true;
+            _ = Interlocked.Add(ref _bytesWritten, packet.Length);
             return true;
         }
         catch (Exception ex)

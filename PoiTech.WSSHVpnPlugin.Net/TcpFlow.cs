@@ -26,6 +26,20 @@ internal sealed class TcpFlow
     private const ushort OurMaximumSegmentSize = 1360;
 
     /// <summary>
+    /// How many segments one flow may send in a single visit before yielding.
+    /// </summary>
+    /// <remarks>
+    /// Without this a flow drains its channel until the sink refuses, so the sink's capacity becomes
+    /// the fairness quantum between inbound and outbound - and whatever thread drives the loop stops
+    /// draining what the operating system is sending while it does. Raising the inbound queue from 48
+    /// to 512 demonstrated the cost: the outbound queue overflowed and dropped 4566 packets in two
+    /// minutes, losing acknowledgements and killing the connections it was meant to speed up. A
+    /// bound here keeps the two directions independent, so either queue can be sized on its own
+    /// merits.
+    /// </remarks>
+    private const int InboundQuantum = 8;
+
+    /// <summary>
     /// How long an acknowledgement may wait for something to travel with.
     /// </summary>
     /// <remarks>
@@ -242,7 +256,9 @@ internal sealed class TcpFlow
             progressed = true;
         }
 
-        while (channel.TryRead(out var data))
+        var sent = 0;
+
+        while (sent < InboundQuantum && channel.TryRead(out var data))
         {
             if (!_sink.CanAccept)
             {
@@ -265,6 +281,7 @@ internal sealed class TcpFlow
                 channel.FlushWindowCredit();
             }
 
+            sent++;
             progressed = true;
         }
 

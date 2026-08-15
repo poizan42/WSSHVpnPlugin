@@ -272,6 +272,34 @@ public class StackLoopTests
         Assert.IsTrue(channel.Disposed, "the channel must not leak");
     }
 
+    /// <summary>
+    /// One flow may not drain its whole channel in a single visit. Whatever drives the loop has to
+    /// get back to the outbound direction: letting a flow run until the sink refuses makes the
+    /// sink's capacity the fairness quantum, and starves the queue the operating system is filling.
+    /// </summary>
+    [TestMethod]
+    public void OneVisit_SendsAtMostAQuantumOfSegments()
+    {
+        Syn();
+        var before = _sink.Packets.Count;
+
+        // Far more than a quantum's worth: 40 segments at our MSS.
+        _channels.Last!.ReceiveFromPeer(new byte[40 * 1360]);
+
+        _ = _stack.RunOnce();
+
+        var sentInOnePass = _sink.Packets.Count - before;
+        Assert.AreEqual(8, sentInOnePass, "a visit should stop at the quantum");
+
+        // And the rest still follows on later passes, rather than being lost.
+        for (var i = 0; i < 10; i++)
+        {
+            _ = _stack.RunOnce();
+        }
+
+        Assert.AreEqual(40, _sink.Packets.Count - before, "the remainder should still be delivered");
+    }
+
     [TestMethod]
     public void Reset_DiscardsTheFlow()
     {

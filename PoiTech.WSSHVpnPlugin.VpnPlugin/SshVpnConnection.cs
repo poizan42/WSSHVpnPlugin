@@ -51,16 +51,52 @@ internal sealed class SshVpnConnection : IDisposable
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
-        // TODO: keyboard-interactive, for servers that require it.
+        // A classic socket first, the WinRT socket only as the fallback. The WinRT transport was
+        // written on the belief that classic sockets are unusable in an app container - which dates
+        // from .NET Native and needed retesting on modern .NET. The order matters for speed: a
+        // session over a StreamSocket plateaued at the throughput of an unscaled 64 KB TCP window
+        // (~10 Mbit/s at a 48 ms round trip), while classic Winsock gets window scaling and receive
+        // auto-tuning. Which transport actually carried the session is in the log either way.
+        var authentication = CreateAuthenticationMethod(configuration, userName, password);
+
+        try
+        {
+            var boundAddress = localAddress is null ? null : System.Net.IPAddress.Parse(localAddress.CanonicalName);
+
+            return Establish(
+                configuration,
+                userName,
+                authentication,
+                new BoundSocketSshTransportFactory(boundAddress),
+                "classic socket");
+        }
+        catch (Exception ex) when (ex is System.Net.Sockets.SocketException or UnauthorizedAccessException)
+        {
+            PluginLog.Error("Classic socket refused; falling back to the WinRT socket", ex);
+
+            return Establish(
+                configuration,
+                userName,
+                authentication,
+                new StreamSocketSshTransportFactory(localAddress),
+                "WinRT StreamSocket");
+        }
+    }
+
+    private static SshVpnConnection Establish(
+        SshVpnConfiguration configuration,
+        string userName,
+        AuthenticationMethod authentication,
+        ISshTransportFactory transportFactory,
+        string transportName)
+    {
         var connectionInfo = new ConnectionInfo(
             configuration.Host,
             checked((int)configuration.Port),
             userName,
-            CreateAuthenticationMethod(configuration, userName, password))
+            authentication)
         {
-            // A WinRT StreamSocket rather than System.Net.Sockets.Socket: the plug-in runs in an app
-            // container, where the WinRT socket types are what is available.
-            TransportFactory = new StreamSocketSshTransportFactory(localAddress),
+            TransportFactory = transportFactory,
 
             // Send the close and move on, rather than waiting a second for the server to answer it.
             // Closing runs on the stack's thread, which owns every flow and must never block: at the
@@ -80,7 +116,7 @@ internal sealed class SshVpnConnection : IDisposable
             client.HostKeyReceived += connection.OnHostKeyReceived;
             client.KeepAliveInterval = KeepAliveInterval;
             client.Connect();
-            PluginLog.Info($"SSH session established with {configuration.Host}:{configuration.Port}");
+            PluginLog.Info($"SSH session established with {configuration.Host}:{configuration.Port} over {transportName}");
             return connection;
         }
         catch
