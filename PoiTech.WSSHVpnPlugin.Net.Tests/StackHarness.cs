@@ -93,8 +93,11 @@ internal sealed class FakeChannel : IByteChannel
 /// </summary>
 internal sealed class FakeChannelFactory : IByteChannelFactory
 {
-    private Action<IByteChannel>? _onOpened;
-    private Action? _onFailed;
+    /// <summary>
+    /// Deferred opens, oldest first. A queue rather than a single slot because more than one can be
+    /// outstanding at once - which is the case a leaked channel hides in.
+    /// </summary>
+    private readonly Queue<(Action<IByteChannel> OnOpened, Action OnFailed)> _pending = new();
 
     /// <summary>Set to open channels as soon as they are asked for.</summary>
     public bool OpenImmediately { get; set; } = true;
@@ -128,26 +131,32 @@ internal sealed class FakeChannelFactory : IByteChannelFactory
             return;
         }
 
-        _onOpened = onOpened;
-        _onFailed = onFailed;
+        _pending.Enqueue((onOpened, onFailed));
     }
 
-    /// <summary>Completes an open that was deferred, as a real one would be.</summary>
+    /// <summary>Gets how many deferred opens are waiting.</summary>
+    public int PendingOpens => _pending.Count;
+
+    /// <summary>Completes the oldest open that was deferred, as a real one would be.</summary>
     public FakeChannel CompleteOpen()
     {
-        var onOpened = _onOpened ?? throw new InvalidOperationException("No open is pending.");
-        _onOpened = null;
-        _onFailed = null;
-        return Complete(onOpened);
+        if (!_pending.TryDequeue(out var pending))
+        {
+            throw new InvalidOperationException("No open is pending.");
+        }
+
+        return Complete(pending.OnOpened);
     }
 
-    /// <summary>Fails an open that was deferred.</summary>
+    /// <summary>Fails the oldest open that was deferred.</summary>
     public void FailOpen()
     {
-        var onFailed = _onFailed ?? throw new InvalidOperationException("No open is pending.");
-        _onFailed = null;
-        _onOpened = null;
-        onFailed();
+        if (!_pending.TryDequeue(out var pending))
+        {
+            throw new InvalidOperationException("No open is pending.");
+        }
+
+        pending.OnFailed();
     }
 
     private FakeChannel Complete(Action<IByteChannel> onOpened)

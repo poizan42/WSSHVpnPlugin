@@ -43,6 +43,21 @@ internal sealed class PacketPath : IDisposable
     /// </remarks>
     private static readonly TimeSpan IdleWait = TimeSpan.FromMilliseconds(20);
 
+    /// <summary>
+    /// How many passes may fail in a row before the thread gives up.
+    /// </summary>
+    private const int MaximumConsecutiveFailures = 10;
+
+    /// <summary>
+    /// How often the counters are written to the log.
+    /// </summary>
+    /// <remarks>
+    /// Reported while running rather than only at shutdown. The host process does not always live
+    /// long enough to tear down cleanly - a run can end with no summary at all - and a milestone that
+    /// cannot be measured after the fact cannot be judged.
+    /// </remarks>
+    private static readonly TimeSpan ReportInterval = TimeSpan.FromSeconds(30);
+
     private readonly StackLoop _stack;
     private readonly InboundPacketSink _sink;
     private readonly Queue<byte[]> _outbound = new();
@@ -53,6 +68,7 @@ internal sealed class PacketPath : IDisposable
     private volatile bool _stopping;
     private int _disposed;
     private long _dropped;
+    private long _lastReport = Environment.TickCount64;
 
     public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport)
     {
@@ -120,9 +136,15 @@ internal sealed class PacketPath : IDisposable
     {
         PluginLog.Info("Stack thread started");
 
-        try
+        var failures = 0;
+
+        while (!_stopping)
         {
-            while (!_stopping)
+            // Per pass, not around the loop. A throw here used to end the thread, which left the
+            // tunnel up and carrying nothing for the rest of the activation - the worst failure this
+            // has, because everything above still reports connected. One bad pass is survivable;
+            // what is not survivable is losing the thread over it.
+            try
             {
                 var worked = DrainOutbound();
 
@@ -132,21 +154,61 @@ internal sealed class PacketPath : IDisposable
                 // One ring per pass, however many packets it produced.
                 _sink.Flush();
 
+                failures = 0;
+                ReportIfDue();
+
                 if (!worked)
                 {
                     _ = _wake.WaitOne(IdleWait);
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            PluginLog.Error("The stack thread failed; the tunnel will carry nothing", ex);
+            catch (Exception ex)
+            {
+                failures++;
+                PluginLog.Error($"The stack thread failed a pass ({failures} in a row)", ex);
+
+                if (failures >= MaximumConsecutiveFailures)
+                {
+                    // Bounded: a fault that recurs every pass is a spin, not a hiccup, and burning a
+                    // core to log it helps nobody.
+                    PluginLog.Error("Giving up on the stack thread; the tunnel will carry nothing");
+                    break;
+                }
+
+                // Not a hot loop while it recovers.
+                _ = _wake.WaitOne(IdleWait);
+            }
         }
 
+        PluginLog.Info($"Stack thread stopped — {Summarize()}");
+    }
+
+    /// <summary>
+    /// Writes the counters if the interval has elapsed.
+    /// </summary>
+    private void ReportIfDue()
+    {
+        var now = Environment.TickCount64;
+
+        if (now - _lastReport < (long)ReportInterval.TotalMilliseconds)
+        {
+            return;
+        }
+
+        _lastReport = now;
+        PluginLog.Info($"Stack — {Summarize()}");
+    }
+
+    /// <summary>
+    /// The counters worth judging a run by, in one line.
+    /// </summary>
+    private string Summarize()
+    {
         var dns = _stack.DnsCounters;
-        PluginLog.Info(
-            $"Stack thread stopped (dropped {Dropped} outbound packet(s), {_stack.Dropped} uninteresting; " +
-            $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped)");
+
+        return $"{_stack.FlowCount} flow(s) open, {Dropped} outbound packet(s) dropped, " +
+               $"{_stack.Dropped} uninteresting; DNS {dns.Answered} answered, " +
+               $"{dns.Truncated} truncated, {dns.Dropped} dropped";
     }
 
     private bool DrainOutbound()

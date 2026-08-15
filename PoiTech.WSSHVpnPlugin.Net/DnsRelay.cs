@@ -121,7 +121,20 @@ internal sealed class DnsRelay
         _open(
             destination,
             Port,
-            channel => query.Channel = channel,
+            channel =>
+            {
+                // The query may already have been given up on. An open outlives its query whenever
+                // the destination is slow, and a channel handed to a forgotten query is a channel
+                // nothing will ever close - left subscribed to the session and, because the session
+                // dispatches by walking its subscribers, slowing every message that follows.
+                if (query.Finished)
+                {
+                    channel.Dispose();
+                    return;
+                }
+
+                query.Channel = channel;
+            },
             () => query.Failed = true);
 
         return true;
@@ -151,6 +164,9 @@ internal sealed class DnsRelay
                 continue;
             }
 
+            // Marked before the channel is dropped, so an open still in flight knows to close
+            // whatever it produces rather than hand it to a query that no longer exists.
+            query.Finished = true;
             query.Channel?.Dispose();
             _queries.RemoveAt(i);
             progressed = true;
@@ -370,6 +386,15 @@ internal sealed class DnsRelay
         public int MaximumReply { get; set; }
 
         public IByteChannel? Channel { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the relay has given up on this query.
+        /// </summary>
+        /// <remarks>
+        /// Set before the query leaves the list, so a channel that opens afterwards is closed rather
+        /// than attached to something nobody will pump or dispose.
+        /// </remarks>
+        public bool Finished { get; set; }
 
         public bool Failed { get; set; }
 

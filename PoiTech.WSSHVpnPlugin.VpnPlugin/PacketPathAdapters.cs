@@ -11,12 +11,23 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// Presents an SSH <c>direct-tcpip</c> channel as the stack's byte channel.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Thin by design: the stack was written against a seam precisely so that everything SSH-shaped
 /// stops here and the stack itself can be tested with no session at all.
+/// </para>
+/// <para>
+/// Thin, but not transparent - nothing here may throw. Every one of these members is called from the
+/// stack's own thread, whose loop is wrapped in a single <c>try</c>: an exception does not fail the
+/// flow, it <em>exits the loop</em>, and the tunnel then carries nothing for the rest of the
+/// activation while still looking connected. The SSH calls underneath throw readily - a session that
+/// drops, or a channel the far end closed between the check and the call - so each one is caught here
+/// and turned into a channel that reports itself closed, which the stack already knows how to unwind.
+/// </para>
 /// </remarks>
 internal sealed class DirectTcpipByteChannel : IByteChannel
 {
     private readonly DirectTcpipStream _stream;
+    private bool _faulted;
 
     public DirectTcpipByteChannel(DirectTcpipStream stream)
     {
@@ -24,10 +35,43 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
     }
 
     /// <inheritdoc/>
-    public bool IsOpen => _stream.IsOpen;
+    public bool IsOpen
+    {
+        get
+        {
+            if (_faulted)
+            {
+                return false;
+            }
+
+            try
+            {
+                return _stream.IsOpen;
+            }
+            catch (Exception ex)
+            {
+                Fault(ex);
+                return false;
+            }
+        }
+    }
 
     /// <inheritdoc/>
-    public bool IsPeerEof => _stream.IsPeerEof;
+    public bool IsPeerEof
+    {
+        get
+        {
+            try
+            {
+                return !_faulted && _stream.IsPeerEof;
+            }
+            catch (Exception ex)
+            {
+                Fault(ex);
+                return false;
+            }
+        }
+    }
 
     /// <summary>
     /// Raised when the channel has data or has changed state, so the stack can be woken.
@@ -47,36 +91,142 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
     }
 
     /// <inheritdoc/>
-    public bool TryRead(out ArraySegment<byte> data) => _stream.TryRead(out data);
+    public bool TryRead(out ArraySegment<byte> data)
+    {
+        if (_faulted)
+        {
+            data = default;
+            return false;
+        }
+
+        try
+        {
+            return _stream.TryRead(out data);
+        }
+        catch (Exception ex)
+        {
+            Fault(ex);
+            data = default;
+            return false;
+        }
+    }
 
     /// <inheritdoc/>
-    public bool Advance(int count) => _stream.Advance(count);
+    public bool Advance(int count)
+    {
+        if (_faulted)
+        {
+            return false;
+        }
+
+        try
+        {
+            return _stream.Advance(count);
+        }
+        catch (Exception ex)
+        {
+            Fault(ex);
+            return false;
+        }
+    }
 
     /// <inheritdoc/>
-    public void FlushWindowCredit() => _stream.FlushWindowCredit();
+    public void FlushWindowCredit()
+    {
+        if (_faulted)
+        {
+            return;
+        }
+
+        try
+        {
+            _stream.FlushWindowCredit();
+        }
+        catch (Exception ex)
+        {
+            Fault(ex);
+        }
+    }
 
     /// <inheritdoc/>
     public ByteChannelSendResult TrySend(byte[] data, int offset, int count, out int written)
     {
-        return _stream.TrySend(data, offset, count, out written) switch
+        written = 0;
+
+        if (_faulted)
         {
-            ChannelSendResult.Written => ByteChannelSendResult.Written,
-            ChannelSendResult.WindowFull => ByteChannelSendResult.Full,
-            _ => ByteChannelSendResult.Closed,
-        };
+            return ByteChannelSendResult.Closed;
+        }
+
+        try
+        {
+            return _stream.TrySend(data, offset, count, out written) switch
+            {
+                ChannelSendResult.Written => ByteChannelSendResult.Written,
+                ChannelSendResult.WindowFull => ByteChannelSendResult.Full,
+                _ => ByteChannelSendResult.Closed,
+            };
+        }
+        catch (Exception ex)
+        {
+            Fault(ex);
+            written = 0;
+            return ByteChannelSendResult.Closed;
+        }
     }
 
     /// <inheritdoc/>
-    public void SendEof() => _stream.SendEof();
+    public void SendEof()
+    {
+        if (_faulted)
+        {
+            return;
+        }
+
+        try
+        {
+            _stream.SendEof();
+        }
+        catch (Exception ex)
+        {
+            Fault(ex);
+        }
+    }
 
     /// <inheritdoc/>
     public void Dispose()
     {
-        _stream.DataAvailable -= OnSignalled;
-        _stream.PeerEof -= OnSignalled;
-        _stream.PeerClosed -= OnSignalled;
-        _stream.WindowAvailable -= OnSignalled;
-        _stream.Dispose();
+        try
+        {
+            _stream.DataAvailable -= OnSignalled;
+            _stream.PeerEof -= OnSignalled;
+            _stream.PeerClosed -= OnSignalled;
+            _stream.WindowAvailable -= OnSignalled;
+            _stream.Dispose();
+        }
+        catch (Exception ex)
+        {
+            // Disposal failing is not actionable, but letting it escape ends the stack thread.
+            Fault(ex);
+        }
+    }
+
+    /// <summary>
+    /// Records that the channel is unusable, once.
+    /// </summary>
+    /// <remarks>
+    /// Reported once per channel rather than per call: a dead session fails every flow at line rate,
+    /// and logging each one would bury the first failure - the only one that says what happened.
+    /// </remarks>
+    private void Fault(Exception ex)
+    {
+        if (_faulted)
+        {
+            return;
+        }
+
+        _faulted = true;
+        PluginLog.Error("A channel failed and will be treated as closed", ex);
     }
 
     private void OnSignalled(object? sender, EventArgs e)

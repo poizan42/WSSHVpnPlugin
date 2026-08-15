@@ -25,6 +25,8 @@ public sealed class DnsRelayTests
     private FakeChannel? _channel;
     private List<(uint Address, ushort Port)> _opens = null!;
     private bool _refuseOpen;
+    private bool _deferOpen;
+    private Action? _completeOpen;
 
     [TestInitialize]
     public void Initialize()
@@ -33,6 +35,8 @@ public sealed class DnsRelayTests
         _clock = new FakeClock();
         _opens = new List<(uint, ushort)>();
         _refuseOpen = false;
+        _deferOpen = false;
+        _completeOpen = null;
 
         _relay = new DnsRelay(_sink, _clock, (address, port, onOpened, onFailed) =>
         {
@@ -41,6 +45,18 @@ public sealed class DnsRelayTests
             if (_refuseOpen)
             {
                 onFailed();
+                return;
+            }
+
+            if (_deferOpen)
+            {
+                // Held back so the test can decide when - and whether - the open lands.
+                _completeOpen = () =>
+                {
+                    _channel = new FakeChannel();
+                    onOpened(_channel);
+                };
+
                 return;
             }
 
@@ -219,6 +235,28 @@ public sealed class DnsRelayTests
 
         Assert.AreEqual(0, _relay.Outstanding);
         Assert.IsTrue(_channel!.Disposed, "the channel must not leak");
+    }
+
+    /// <summary>
+    /// An open outlives the query that wanted it whenever the destination is slow. The channel it
+    /// eventually produces must be closed, not handed to a query the relay has already given up on -
+    /// nothing would ever pump or dispose it, and the session keeps every channel it dispatches to.
+    /// </summary>
+    [TestMethod]
+    public void Channel_arriving_after_its_query_was_reaped_is_disposed()
+    {
+        // The open is still in flight when the query's deadline passes.
+        _deferOpen = true;
+        OfferQuery(BuildQuery());
+
+        _clock.Advance(TimeSpan.FromSeconds(10));
+        _ = _relay.RunOnce();
+        Assert.AreEqual(0, _relay.Outstanding, "the query should have been reaped");
+
+        _completeOpen!();
+
+        Assert.IsNotNull(_channel);
+        Assert.IsTrue(_channel!.Disposed, "the late channel must be closed, not leaked");
     }
 
     [TestMethod]

@@ -61,6 +61,14 @@ internal sealed class SshVpnConnection : IDisposable
             // A WinRT StreamSocket rather than System.Net.Sockets.Socket: the plug-in runs in an app
             // container, where the WinRT socket types are what is available.
             TransportFactory = new StreamSocketSshTransportFactory(localAddress),
+
+            // Send the close and move on, rather than waiting a second for the server to answer it.
+            // Closing runs on the stack's thread, which owns every flow and must never block: at the
+            // rate an idle machine opens and closes channels, waiting even one round trip there
+            // stalls every other flow. Nothing needs the acknowledgement — channel numbers are never
+            // reused (Session.NextChannelNumber only ever increments), so a late CHANNEL_CLOSE
+            // arrives for a number nobody answers to and is discarded.
+            ChannelCloseTimeout = TimeSpan.Zero,
         };
 
         var client = new SshClient(connectionInfo);
