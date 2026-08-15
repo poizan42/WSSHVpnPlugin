@@ -1,4 +1,4 @@
-# WSSHVpnPlugin
+﻿# WSSHVpnPlugin
 
 A Windows `IVpnPlugIn` provider that carries VPN traffic over an SSH connection.
 
@@ -6,7 +6,9 @@ A Windows `IVpnPlugIn` provider that carries VPN traffic over an SSH connection.
 
 | Project | What it is |
 | --- | --- |
-| `PoiTech.WSSHVpnPlugin.VpnPlugin` | The plug-in itself: a CsWinRT WinRT component holding `VpnBackgroundTask` (the class the platform activates) and `SSHVpnPlugin` (the `IVpnPlugIn` implementation). |
+| `PoiTech.WSSHVpnPlugin.Net` | The user-space TCP/IP stack: flow table, TCP state machine, and the DNS-over-TCP relay. Plain `net10.0` with no WinRT and no SSH — it reaches both through interfaces — so it runs on synthetic packets with no session and no threads. |
+| `PoiTech.WSSHVpnPlugin.Net.Tests` | MSTest against that stack. The only fast loop here: no deploy, under a second. |
+| `PoiTech.WSSHVpnPlugin.VpnPlugin` | The plug-in itself: a CsWinRT WinRT component holding `VpnBackgroundTask` (the class the platform activates) and `SSHVpnPlugin` (the `IVpnPlugIn` implementation). Also where WinRT and SSH are wired to the stack's interfaces, in `PacketPathAdapters.cs`. |
 | `PoiTech.WSSHVpnPlugin.App` | UWP XAML app. Its only job is to create the VPN profile through `VpnManagementAgent` — there is no system UI for provisioning a plug-in profile. |
 | `PoiTech.WSSHVpnPlugin.Package` | MSIX packaging project. Owns `Package.appxmanifest`. |
 | `SSH.NET` | Submodule; a fork of SSH.NET, because upstream keeps `Session.CreateChannelDirectTcpip` internal. |
@@ -59,23 +61,43 @@ Three pieces have to agree, and each was a separate build failure to get there:
 `networkingVpnProvider` is a restricted capability: fine for sideloading, needs Microsoft approval
 for Store submission.
 
-## Open design questions
+## The packet path
 
-**Packet path.** SSH forwards byte streams, not IP datagrams, so there is no packet-for-packet
-encapsulation. `Encapsulate` has to feed a user-space TCP/IP stack that maps each TCP flow onto a
-`direct-tcpip` channel and synthesises the return packets, injecting them with
-`RequestVpnPacketBuffer` / `AppendVpnReceivePacketBuffer`. UDP and ICMP need a separate answer.
+SSH forwards byte streams, not IP datagrams, so there is no packet-for-packet encapsulation and the
+usual `Encapsulate` / `Decapsulate` symmetry does not apply. `Encapsulate` consumes IP packets and
+returns nothing — the SSH session owns the wire — while a user-space TCP/IP stack terminates each TCP
+flow locally, carries it over its own `direct-tcpip` channel, and synthesises the return packets.
+Those go back through `Decapsulate`, which the platform raises when a byte is written to a loopback
+socket used as a doorbell.
 
-**Fork surface — channels.** `ISession`, `IChannelDirectTcpip` and `ChannelDirectTcpip` are still
-`internal`, and `IChannelDirectTcpip.Open` binds the channel to a `Socket` rather than exposing a
-byte stream — so the fork still needs both a visibility change and a socket-free way to open and
-pump a channel. This is the remaining reason the fork exists.
+DNS is the one exception to "TCP only", and not an optional one: assigning DNS servers pins the whole
+machine's name resolution to the tunnel the moment it starts, so UDP/53 going nowhere would break
+every name on the system rather than degrading. Each query is relayed over its own channel using the
+two-byte length framing of RFC 7766 and turned back into a datagram; a reply too large for one
+datagram comes back truncated, which makes the client retry over TCP. Other UDP and all ICMP are
+dropped.
+
+## Testing
+
+The stack is where the logic lives and it needs neither a package build nor a VPN activation:
+
+```bash
+dotnet test PoiTech.WSSHVpnPlugin.Net.Tests\PoiTech.WSSHVpnPlugin.Net.Tests.csproj
+```
+
+Anything reproducible from a packet belongs there rather than in a deploy — the plug-in half costs a
+build, a registration and an activation per attempt.
 
 ## The transport abstraction in the fork
 
-`VpnChannel.StartWithMainTransport` will only accept a WinRT socket, because the platform has to
-recognise the SSH connection to keep it out of the tunnel it installs. SSH.NET drove a
-`System.Net.Sockets.Socket`, so the fork gained a seam:
+The plug-in runs in an app container, where the WinRT socket types are what is usable. SSH.NET drove
+a `System.Net.Sockets.Socket`, so the fork gained a seam:
+
+(The original reason was different and turned out to be wrong: the session was going to run on the
+very socket handed to `AssociateTransport`, so that the platform would recognise it and keep it out
+of the tunnel. The platform takes exclusive ownership of that socket and reads it itself — we watched
+the SSH banner come back corrupted — so the session now runs on a socket of its own and the platform
+gets a loopback dummy. The seam is still needed, for the app-container reason above.)
 
 - `Renci.SshNet.Connection.SshTransport` — public abstract byte pipe (`Read`/`Write` plus async,
   `IsConnected`, `Shutdown`, `Dispose`).

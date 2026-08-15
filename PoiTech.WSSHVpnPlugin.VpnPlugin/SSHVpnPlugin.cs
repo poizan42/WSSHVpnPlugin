@@ -329,8 +329,8 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             {
                 spike?.SampleOutbound(VpnPacketBufferAccess.GetSpan(buffer).Slice(0, checked((int)buffer.Buffer.Length)));
 
-                // TODO: hand the IP packet to the user-space TCP/IP stack, which maps each TCP
-                // flow onto an SSH direct-tcpip channel.
+                // Copies and queues for the stack's own thread. It must not do more than that:
+                // this is the platform's thread, and anything that blocks here blocks the tunnel.
                 connection.SendOutbound(buffer);
             }
             catch (Exception ex)

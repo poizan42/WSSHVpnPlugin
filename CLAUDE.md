@@ -1,4 +1,4 @@
-# CLAUDE.md
+﻿# CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -31,7 +31,19 @@ Get-AppxPackage *3703e6b2-f1f9-447d-b506-da47be3094ff* | Remove-AppxPackage
 
 ## Tests
 
-This repo has none. The `SSH.NET` submodule has its own suite; fork changes should be validated there:
+`PoiTech.WSSHVpnPlugin.Net.Tests` covers the stack, and is the only fast loop in the repo — plain
+`net10.0`, no WinRT, no deploy, under a second:
+
+```
+dotnet test PoiTech.WSSHVpnPlugin.Net.Tests\PoiTech.WSSHVpnPlugin.Net.Tests.csproj
+```
+
+It drives `StackLoop` and `DnsRelay` with synthetic packets through `StackHarness.cs`'s fakes
+(`FakeChannel`, `FakeChannelFactory`, `FakeSink`, `FakeClock`, `Packets`) — use those rather than
+writing new ones. Anything in the stack that can be reproduced from a packet belongs here and not in
+a deploy: the plug-in half costs a package build, a registration and a VPN activation per attempt.
+
+The `SSH.NET` submodule has its own suite; fork changes should be validated there:
 
 ```
 dotnet test SSH.NET\test\Renci.SshNet.Tests\Renci.SshNet.Tests.csproj
@@ -54,11 +66,18 @@ have a much stricter bar than this repo's own code.
 
 ## Architecture
 
-Three projects plus the fork:
+Four projects plus a test project and the fork. The split that matters is **`.Net` versus
+everything else**: the stack is plain `net10.0` with no WinRT, so it can be tested in a second, while
+anything touching the platform costs a package build and a VPN activation per attempt. Keep new logic
+on the `.Net` side of that line wherever it has a choice.
 
-- **`PoiTech.WSSHVpnPlugin.VpnPlugin`** — the plug-in. A CsWinRT component (`CsWinRTComponent`),
-  so **public types must be WinRT-compatible**; keep everything except `SSHVpnPlugin` and
-  `VpnBackgroundTask` `internal`.
+- **`PoiTech.WSSHVpnPlugin.Net`** — the user-space TCP/IP stack. No WinRT, no SSH: it reaches both
+  through the `IByteChannel` / `IByteChannelFactory` / `IPacketSink` / `IStackClock` seams, which is
+  what lets the whole thing run on synthetic packets with no session and no threads.
+- **`PoiTech.WSSHVpnPlugin.Net.Tests`** — MSTest against those seams. See **Tests** above.
+- **`PoiTech.WSSHVpnPlugin.VpnPlugin`** — the plug-in, and the only place WinRT and SSH meet the
+  stack. A CsWinRT component (`CsWinRTComponent`), so **public types must be WinRT-compatible**; keep
+  everything except `SSHVpnPlugin` and `VpnBackgroundTask` `internal`.
 - **`PoiTech.WSSHVpnPlugin.App`** — UWP XAML app whose only real job is creating the VPN profile via
   `VpnManagementAgent`. There is no system UI for provisioning a plug-in profile, so this is the only
   way one gets created.
@@ -66,6 +85,10 @@ Three projects plus the fork:
 - **`SSH.NET`** — submodule, fork of upstream. It exists because
   `Session.CreateChannelDirectTcpip`, `ISession`, and `IChannelDirectTcpip` are all `internal`
   upstream.
+
+`PacketPathAdapters.cs` is where the seams are implemented (`DirectTcpipByteChannel`,
+`SshByteChannelFactory`, `InboundPacketSink`, `MonotonicClock`) — the one file to read to see how the
+two halves join.
 
 ### The activation chain
 
@@ -171,7 +194,13 @@ host and port, so there is no packet-for-packet encapsulation and the usual `Enc
 - `Encapsulate` consumes IP packets and returns **nothing** — the SSH session owns the wire, not the
   platform. A user-space TCP/IP stack has to demultiplex flows onto `direct-tcpip` channels.
 - `Decapsulate` is the *inbound* path, not a mirror of `Encapsulate`. See below.
-- UDP and ICMP need a separate answer; plain SSH has no primitive for either.
+- UDP and ICMP need a separate answer; plain SSH has no primitive for either. **DNS is the exception
+  that had to be solved**, because assigning DNS servers pins the whole machine's name resolution to
+  the tunnel the moment it starts — so UDP/53 going nowhere does not degrade, it breaks every name on
+  the system. `DnsRelay` carries each query over its own `direct-tcpip` channel with RFC 7766's
+  two-byte length prefix and turns the reply back into a datagram. Replies too large for one datagram
+  come back truncated with `TC` set, which makes the client retry over TCP — carried natively. Other
+  UDP and all ICMP are still dropped.
 
 ### The outer tunnel transport is a loopback dummy
 
@@ -226,14 +255,43 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   VPN's TAP adapter, so `<NetworkAdapter>` in the profile is a real requirement when nesting, not a
   nicety.
 
+### Threads, and which of them may block
+
+The stack is single-threaded **by contract, not by luck** — no flow locks any of its state, and each
+`TcpFlow` writes into a scratch buffer it assumes it has to itself. Two threads in one flow produce a
+corrupt packet rather than an exception, so the boundaries below are load-bearing:
+
+| Thread | Owns | Must never |
+|---|---|---|
+| **T-Plat** (the platform's, inside `Encapsulate`/`Decapsulate`) | copy outbound packets and queue them; append queued buffers to `decapsulatedPackets` | call into SSH; block |
+| **T-Listen** (SSH.NET's message listener) | copy inbound bytes into the per-flow buffer, set a readiness bit | wait on anything of ours; close or dispose a channel |
+| **T-Stack** (`PacketPath`'s thread) | the flow table, every TCB, timers, segment building, `GetVpnReceivePacketBuffer`, ringing the doorbell | block on anything |
+
+Every call into SSH.NET can block for up to 30 seconds — `Channel.SendData` waits on a window the
+listener thread must deliver, and `SendMessage` waits during rekey. That is why opening a channel
+happens on a worker, and why **the open's callback only queues**: `StackLoop` drains
+`_arrivals` on T-Stack at the top of `RunOnce`. Anything else added to the seams must do the same.
+
+Backpressure rather than blocking, in both directions: a full outbound queue drops (the OS
+retransmits), and a full `IPacketSink` leaves received bytes unreleased, which closes the SSH
+channel's window and slows the far end down.
+
 ### Open holes
 
 Deliberate, documented, and not to be silently papered over:
 
-- `SshVpnConnection.SendOutbound` is where the user-space TCP/IP stack goes.
-- `IChannelDirectTcpip` is still `internal`, and its `Open` binds a channel to a `Socket` rather than
-  exposing a byte stream, so the fork needs a visibility *and* an API change before the packet path
-  can use it.
+- **Retransmission of our own injected segments.** There is no RTO on the inbound path: a segment the
+  platform loses is never resent. It survives because both ends are on one machine.
+- **Out-of-order segments are dropped**, and no SACK is offered — consistent, but it makes any real
+  loss expensive.
+- **Channel opens have no short timeout.** `MaximumConcurrentOpens = 8` bounds the damage from
+  destinations the server cannot reach; it does not fix it. M1a's cancellable `OpenAsync` is the
+  mechanism, not yet plumbed through `CreateDirectTcpipStream`.
+- **IPv6 leaks.** An address is assigned (it must be, or `Start*` fails) but nothing is routed, so
+  IPv6 keeps using the physical NIC. Accepted; routing it in with no stack behind it would black-hole
+  it instead.
+- **UDP other than DNS, and all ICMP, are dropped.** No SSH primitive carries either.
+- `M0Spike` and its `<SpikeProbe>` switch are diagnostic scaffolding from the transport bring-up.
 
 ### The fork's transport seam
 
