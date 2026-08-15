@@ -135,6 +135,17 @@ internal sealed class SshVpnConfiguration
     /// </remarks>
     public string? NetworkAdapter { get; private init; }
 
+    /// <summary>
+    /// Gets the single destination the tracer flow will carry, as <c>address:port</c>, or
+    /// <see langword="null"/> to carry nothing.
+    /// </summary>
+    /// <remarks>
+    /// The tracer handles one connection and has no flow table, so without a target it adopts
+    /// whichever SYN happens to arrive first - and a Windows machine opens plenty of connections on
+    /// its own. Naming the destination is what makes it testable.
+    /// </remarks>
+    public string? TracerDestination { get; private init; }
+
     /// <summary>Gets the MTU to advertise on the virtual interface.</summary>
     public uint Mtu { get; private init; } = DefaultMtu;
 
@@ -196,6 +207,7 @@ internal sealed class SshVpnConfiguration
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
             NetworkAdapter = ReadString(root, "NetworkAdapter"),
+            TracerDestination = ReadString(root, "TracerDestination"),
             Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),

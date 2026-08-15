@@ -131,6 +131,10 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             // ask for packets as soon as the channel starts.
             StartChannel(channel, configuration, transport);
 
+            // The packet path needs the queue and the doorbell, neither of which exists until the
+            // channel has started.
+            connection.AttachPacketPath(inbound, transport, configuration.TracerDestination);
+
             if (configuration.SpikeProbe)
             {
                 var spike = M0Spike.Start(channel, connection, inbound, transport, configuration.ClientIPv4);

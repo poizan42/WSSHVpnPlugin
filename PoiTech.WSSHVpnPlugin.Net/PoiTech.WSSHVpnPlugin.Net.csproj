@@ -6,6 +6,12 @@
       test` can run it in a second rather than needing a package deploy and a VPN activation.
     -->
     <TargetFramework>net10.0</TargetFramework>
+    <!--
+      Needed even though nothing here is platform-specific: the plug-in publishes Native AOT per RID,
+      and a referenced library without matching identifiers fails the packaging build with
+      NETSDK1047. The fork carries the same property for the same reason.
+    -->
+    <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>

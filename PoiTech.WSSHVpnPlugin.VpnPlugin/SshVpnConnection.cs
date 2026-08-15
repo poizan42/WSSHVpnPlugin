@@ -20,6 +20,7 @@ internal sealed class SshVpnConnection : IDisposable
 
     private readonly SshClient _client;
     private readonly string? _expectedFingerprint;
+    private TracerFlow? _tracer;
     private int _disposed;
 
     private SshVpnConnection(SshClient client, string? expectedFingerprint)
@@ -177,18 +178,79 @@ internal sealed class SshVpnConnection : IDisposable
     }
 
     /// <summary>
+    /// Gives the connection the platform-side plumbing the packet path needs, once the channel has
+    /// started.
+    /// </summary>
+    /// <param name="inbound">The queue that carries packets back to the platform.</param>
+    /// <param name="transport">The transport whose doorbell provokes a decapsulate call.</param>
+    /// <remarks>
+    /// Separate from <see cref="Establish"/> because the SSH session is established before the
+    /// channel starts, and neither of these exists until it has.
+    /// </remarks>
+    public void AttachPacketPath(InboundPacketQueue inbound, IOuterTransport transport, string? tracerDestination)
+    {
+        ArgumentNullException.ThrowIfNull(inbound);
+        ArgumentNullException.ThrowIfNull(transport);
+
+        if (!TryParseEndpoint(tracerDestination, out var address, out var port))
+        {
+            PluginLog.Info("No tracer destination configured; outbound packets will be dropped.");
+            return;
+        }
+
+        PluginLog.Info($"Tracer will carry connections to {tracerDestination}");
+        _tracer = new TracerFlow(_client, inbound, transport, address, port);
+    }
+
+    /// <summary>
+    /// Parses an <c>address:port</c> pair.
+    /// </summary>
+    private static bool TryParseEndpoint(string? value, out uint address, out ushort port)
+    {
+        address = 0;
+        port = 0;
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var colon = value.LastIndexOf(':');
+        if (colon <= 0
+            || !System.Net.IPAddress.TryParse(value[..colon], out var parsed)
+            || parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork
+            || !ushort.TryParse(value[(colon + 1)..], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out port))
+        {
+            PluginLog.Error($"'{value}' is not a valid address:port; the tracer will carry nothing.");
+            return false;
+        }
+
+        address = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(parsed.GetAddressBytes());
+        return true;
+    }
+
+    /// <summary>
     /// Accepts an IP packet the platform wants sent through the tunnel.
     /// </summary>
     /// <remarks>
-    /// TODO: this is where the user-space TCP/IP stack goes. It has to demultiplex the packet by
-    /// flow, open a <c>direct-tcpip</c> channel for each new TCP connection (which is what the
-    /// SSH.NET fork exists to make reachable), and drive the SSH channel's byte stream. UDP and
-    /// ICMP need a separate answer — plain SSH has no forwarding primitive for either.
+    /// TODO: only one hardcoded TCP flow is carried, by <see cref="TracerFlow"/>. The real
+    /// implementation is a user-space TCP/IP stack that demultiplexes by flow and opens a
+    /// <c>direct-tcpip</c> channel per TCP connection. UDP and ICMP need a separate answer — plain
+    /// SSH has no forwarding primitive for either — and everything not carried is dropped here.
     /// </remarks>
     public void SendOutbound(VpnPacketBuffer packet)
     {
         ArgumentNullException.ThrowIfNull(packet);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        var tracer = _tracer;
+        if (tracer is null)
+        {
+            return;
+        }
+
+        var span = VpnPacketBufferAccess.GetSpan(packet);
+        _ = tracer.TryHandle(span[..checked((int)packet.Buffer.Length)]);
     }
 
     /// <inheritdoc/>
@@ -201,6 +263,7 @@ internal sealed class SshVpnConnection : IDisposable
 
         try
         {
+            _tracer?.Dispose();
             _client.HostKeyReceived -= OnHostKeyReceived;
             _client.Dispose();
         }
