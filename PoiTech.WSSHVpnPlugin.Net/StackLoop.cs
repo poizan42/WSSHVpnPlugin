@@ -39,6 +39,16 @@ internal sealed class StackLoop
     public long Dropped { get; private set; }
 
     /// <summary>
+    /// Called when a flow is first seen, with its four-tuple.
+    /// </summary>
+    /// <remarks>
+    /// For the host to log. The stack does not know how the host logs, and a flow's whole tuple is
+    /// the thing worth knowing when a connection turns up that should not have been routed here at
+    /// all - the destination alone does not say which interface the operating system chose.
+    /// </remarks>
+    public Action<TcpFlowKey>? FlowStarted { get; set; }
+
+    /// <summary>
     /// Offers an outbound packet to the stack.
     /// </summary>
     /// <param name="packet">The packet the operating system wants sent.</param>
@@ -75,6 +85,7 @@ internal sealed class StackLoop
         {
             flow = new TcpFlow(key, _sink, _clock);
             _flows[key] = flow;
+            FlowStarted?.Invoke(key);
         }
 
         var wantsChannel = flow.Accept(tcp);

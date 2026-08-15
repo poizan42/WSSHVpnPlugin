@@ -57,7 +57,12 @@ internal sealed class PacketPath : IDisposable
     public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport)
     {
         _sink = new InboundPacketSink(queue, transport);
-        _stack = new StackLoop(new SshByteChannelFactory(client, Wake), _sink, new MonotonicClock());
+        _stack = new StackLoop(new SshByteChannelFactory(client, Wake), _sink, new MonotonicClock())
+        {
+            FlowStarted = key => PluginLog.Info(
+                $"flow {Ipv4Packet.Format(key.LocalAddress)}:{key.LocalPort} -> " +
+                $"{Ipv4Packet.Format(key.RemoteAddress)}:{key.RemotePort}"),
+        };
 
         _thread = new Thread(Run)
         {

@@ -204,6 +204,15 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
 - **Never a literal `0.0.0.0/0` inclusion route** — recorded in the reference implementation as looping
   back through the tunnel even from a bound socket. Use `0.0.0.0/1` + `128.0.0.0/1`. And only add
   routes for a family that has an assigned address, or the platform hangs.
+- **`ExcludeLocalSubnets` does not keep the client's own LAN out of the tunnel.** Measured: with it
+  set, flows to the machine's own `/24` still arrive at `Encapsulate`, carrying the *tunnel* source
+  address — while `Get-NetRoute` shows the subnet on-link via the physical NIC at a better metric and
+  `Find-NetRoute` picks that NIC. The routing table is right and something above it redirects anyway,
+  so a route-table reading will tell you the opposite of what happens. The cost is real: every such
+  flow becomes a channel open the SSH server cannot serve, and each one blocks until the SSH timeout.
+  Explicit `Ipv4ExclusionRoutes` for the connected subnets is the next thing to try — and it has to
+  stay configurable, because routing *remote* private addresses into the tunnel is the whole point of
+  a VPN and uses the same machinery.
 - **SSH is source-bound** to a chosen interface (`OutboundInterface`), not kept out with
   `Ipv4ExclusionRoutes` (which returns `WSAEACCES`). `GetInternetConnectionProfile` is useless here —
   its "preferred interface" becomes the tunnel. The heuristic cannot tell our tunnel from another
