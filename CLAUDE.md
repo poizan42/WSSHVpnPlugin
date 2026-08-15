@@ -102,18 +102,51 @@ without the others breaks packaging or silently breaks activation:
    registration, or packaging fails with *"not allowed to have EntryPoint=... without
    ActivatableClassId"*.
 3. Its `<Path>` must name a binary exporting `DllGetActivationFactory`. CsWinRT's generator emits one
-   into the component assembly, but Native AOT links the component into the app's single executable,
-   so `PoiTech.WSSHVpnPlugin.App.csproj` carries `UnmanagedEntryPointsAssembly` +
-   `<LinkerArg Include="/EXPORT:DllGetActivationFactory" />` to keep and re-export it. Verify with
-   `dumpbin /exports` on the published exe if activation ever stops working.
+   into the component, and `PoiTech.WSSHVpnPlugin.VpnPlugin.csproj` carries
+   `UnmanagedEntryPointsAssembly` + `<LinkerArg Include="/EXPORT:DllGetActivationFactory" />` to keep
+   ILC from trimming it and to export it. Verify with `dumpbin /exports` if activation ever stops
+   working.
 
-Paths in the manifest are `PoiTech.WSSHVpnPlugin.App\PoiTech.WSSHVpnPlugin.App.exe` — the wapproj
-nests the app's payload in a subfolder, and `$targetnametoken$` resolves to the *wapproj* name here,
-not the app's, so it can't be used.
+Paths in the manifest are `<project>\<project>.exe` — the wapproj nests each payload in a subfolder
+named after its project, and `$targetnametoken$` resolves to the *wapproj* name here, so it can't be
+used.
 
-The app project also needs a `Microsoft.Windows.CsWinRT` PackageReference despite authoring no WinRT
-types: its targets are what strip the referenced component's `.winmd` out of compile references
-(otherwise `NETSDK1130`).
+### The plug-in is its own executable, and must be
+
+**The plug-in and the app are separate binaries and separate processes.** This is not cosmetic and it
+cost most of an evening to establish:
+
+- **Sharing the app's executable put the tunnel inside a XAML application's process**, because Native
+  AOT linked the component in and the manifest pointed at the app. When PLM suspended that
+  application, `DXamlCore::OnAfterAppSuspend` → `ReferenceTrackerManager::TriggerCollectionForSuspend`
+  → `ReferenceTrackerHost.DisconnectUnusedReferenceSources` called **`GC.Collect()` inside the VPN
+  host**. That collection deadlocks: `TrackerObjectManager.WalkExternalTrackerObjects` runs
+  `FindReferenceTargetsCallback`'s class constructor *inside the GC callout*, which allocates, which
+  waits for the collection it is already inside. Windows logs **`Application Hang`** — "stopped
+  interacting with Windows and was closed" — and kills the host **45–75 seconds after every connect**.
+  Traced from live `cdbX64 -pv` thread stacks; there is no crash dump, because a hang is not an
+  exception. Fixing it took the host out of XAML, and 24 samples across a 3-minute run then showed no
+  deadlock and no XAML frames at all.
+- **`backgroundtaskhost.exe` is not available.** Omitting `Executable` on the extension so the DLL
+  would be hosted generically fails registration with **`0x80080204`, "a task of this type requires a
+  custom background task host"**. A `vpnClient` task must name a host binary; the only choice is
+  *which* one.
+- So `PoiTech.WSSHVpnPlugin.VpnPlugin` is a `WinExe` with its own `Program.Main`, and both the
+  extension's `Executable` and the `inProcessServer` `<Path>` name it. `Main` is
+  `CoreApplication.RunWithActivationFactories(...)` — what `Application.Start` did, minus XAML.
+- **`IGetActivationFactory` is in `Windows.Foundation`**, not `Windows.ApplicationModel.Core`, and the
+  class implementing it **must be public**. As a private nested class it compiles and then dies at
+  runtime with `E_NOINTERFACE` from `CreateCCWForObjectForABI`: CsWinRT only generates COM callable
+  wrappers for authored — that is, public — types. That is the one deliberate exception to keeping
+  everything but `SSHVpnPlugin` and `VpnBackgroundTask` internal.
+- The app project **must not reference the plug-in**. It never used a type from it; the reference
+  existed only to make AOT link and re-export the factory, which is what caused all of the above.
+
+**`broadFileSystemAccess` consent resets on every reinstall.** `Remove-AppxPackage` +
+`Add-AppxPackage -Register` silently clears it, and the next connect fails with
+`ConnectProfileAsync: ServerConnection` and an `UnauthorizedAccessException` from `ReadThroughBroker`
+in the log. Re-enable it under Settings > Privacy & security > File system. Removing the package also
+**wipes `wsshvpn.log`**, so a failure right after a reinstall may leave nothing to read.
 
 ### Runtime flow
 

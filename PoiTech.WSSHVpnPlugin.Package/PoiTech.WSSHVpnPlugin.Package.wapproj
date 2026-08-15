@@ -94,5 +94,15 @@
       <SkipGetTargetFrameworkProperties>True</SkipGetTargetFrameworkProperties>
       <PublishProfile>Properties\PublishProfiles\win-$(Platform).pubxml</PublishProfile>
     </ProjectReference>
+    <!--
+      The plug-in is its own payload and its own background task host - a second executable in the
+      package, not part of the app's. Both the extension's Executable and the inProcessServer Path
+      in the manifest name it.
+    -->
+    <ProjectReference Include="..\PoiTech.WSSHVpnPlugin.VpnPlugin\PoiTech.WSSHVpnPlugin.VpnPlugin.csproj">
+      <UseLowTrustEntryPoint>True</UseLowTrustEntryPoint>
+      <SkipGetTargetFrameworkProperties>True</SkipGetTargetFrameworkProperties>
+      <PublishProfile>Properties\PublishProfiles\win-$(Platform).pubxml</PublishProfile>
+    </ProjectReference>
   </ItemGroup>
 </Project>

@@ -11,6 +11,23 @@
     <UseUwp>true</UseUwp>
     <DefaultLanguage>en-US</DefaultLanguage>
     <PublishAot>true</PublishAot>
+    <!--
+      Published as its own native DLL rather than linked into the app's executable, which is what
+      lets the platform host the plug-in in backgroundtaskhost.exe. Sharing the executable meant
+      sharing the process with a XAML application, and PLM suspending that application ran
+      DXamlCore::OnAfterAppSuspend -> ReferenceTrackerManager::TriggerCollectionForSuspend ->
+      GC.Collect() inside the VPN host. That collection deadlocks against a ComWrappers callout,
+      Windows logs "stopped interacting with Windows and was closed", and the tunnel dies about a
+      minute after every connect. A background host has no use for a XAML app; this keeps it out.
+
+      CsWinRT's generator emits the DllGetActivationFactory export, so the DLL satisfies the
+      package's windows.activatableClass.inProcessServer registration directly - no re-export from
+      the app is needed any more.
+    -->
+    <OutputType>WinExe</OutputType>
+    <Platforms>x86;x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
+    <PublishProfile>win-$(Platform).pubxml</PublishProfile>
     <DisableRuntimeMarshalling>true</DisableRuntimeMarshalling>
 
     <!--
@@ -35,6 +52,17 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The generator emits a [UnmanagedCallersOnly] DllGetActivationFactory into this assembly. ILC
+      has to be told to keep that entry point and the linker to export it, or the package's
+      windows.activatableClass.inProcessServer registration has nothing to bind to. This used to live
+      in the app project, back when the component was linked into the app's executable.
+    -->
+    <UnmanagedEntryPointsAssembly Include="PoiTech.WSSHVpnPlugin.VpnPlugin" />
+    <LinkerArg Include="/EXPORT:DllGetActivationFactory" />
   </ItemGroup>
 
   <ItemGroup>

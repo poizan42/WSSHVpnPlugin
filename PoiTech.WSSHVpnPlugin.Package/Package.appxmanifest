@@ -60,8 +60,16 @@
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
       <Extensions>
+        <!--
+          Executable is mandatory and must be the plug-in's own host, not the UI app's. Omitting it
+          so that backgroundtaskhost.exe would host the task fails registration with 0x80080204,
+          "a task of this type requires a custom background task host" - a vpnClient task must name
+          a host binary. Naming the UI app's executable is what used to put the tunnel inside a XAML
+          application's process, where suspension forced a GC that deadlocked and killed the host
+          about a minute after every connect.
+        -->
         <Extension Category="windows.backgroundTasks"
-                   Executable="PoiTech.WSSHVpnPlugin.App\PoiTech.WSSHVpnPlugin.App.exe"
+                   Executable="PoiTech.WSSHVpnPlugin.VpnPlugin\PoiTech.WSSHVpnPlugin.VpnPlugin.exe"
                    EntryPoint="PoiTech.WSSHVpnPlugin.VpnPlugin.VpnBackgroundTask">
           <BackgroundTasks>
             <uap:Task Type="vpnClient" />
@@ -103,13 +111,14 @@
       windows.activatableClass.inProcessServer".
 
       Path names the binary that exports DllGetActivationFactory. Under .NET Native that was
-      CLRHost.dll; with Native AOT everything is linked into the app's single native executable,
-      so CsWinRT's generated export is re-exported from there — see the UnmanagedEntryPointsAssembly
-      and LinkerArg items in the app project.
+      CLRHost.dll; here it is the plug-in's own executable, which is also its background task host.
+      It used to name the app's executable, because the component was linked into it - which is what
+      made the VPN host share a process with a XAML application, and what killed the tunnel about a
+      minute after every connect.
     -->
     <Extension Category="windows.activatableClass.inProcessServer">
       <InProcessServer>
-        <Path>PoiTech.WSSHVpnPlugin.App\PoiTech.WSSHVpnPlugin.App.exe</Path>
+        <Path>PoiTech.WSSHVpnPlugin.VpnPlugin\PoiTech.WSSHVpnPlugin.VpnPlugin.exe</Path>
         <ActivatableClass ActivatableClassId="PoiTech.WSSHVpnPlugin.VpnPlugin.VpnBackgroundTask" ThreadingModel="both" />
       </InProcessServer>
     </Extension>
