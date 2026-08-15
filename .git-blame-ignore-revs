@@ -1,0 +1,6 @@
+# Revisions to skip in git blame. GitHub honours this file automatically;
+# locally, enable it with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Convert existing sources to LF without a BOM
+7b00fa4e56d33a62e46b4dda0d396ada7bfda841
