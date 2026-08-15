@@ -246,3 +246,20 @@ internal static class Packets
         return buffer.AsSpan(0, total).ToArray();
     }
 }
+
+/// <summary>
+/// A clock the test moves by hand.
+/// </summary>
+/// <remarks>
+/// Delayed acknowledgements and retransmission timeouts are measured in tens and hundreds of
+/// milliseconds. A suite that waited for them would take minutes and still be flaky.
+/// </remarks>
+internal sealed class FakeClock : IStackClock
+{
+    public TimeSpan Now { get; private set; }
+
+    public void Advance(TimeSpan by)
+    {
+        Now += by;
+    }
+}

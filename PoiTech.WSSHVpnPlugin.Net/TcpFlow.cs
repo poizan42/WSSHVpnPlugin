@@ -25,8 +25,20 @@ internal sealed class TcpFlow
     /// <summary>Our MTU less the IPv4 and TCP headers.</summary>
     private const ushort OurMaximumSegmentSize = 1360;
 
+    /// <summary>
+    /// How long an acknowledgement may wait for something to travel with.
+    /// </summary>
+    /// <remarks>
+    /// The usual value. Both ends are on this machine, so the round trip is negligible and the delay
+    /// is pure latency - but a bare acknowledgement per segment is a packet the platform has to carry
+    /// for nothing, and waiting lets it ride along with the response the peer is usually about to
+    /// get anyway.
+    /// </remarks>
+    private static readonly TimeSpan AckDelay = TimeSpan.FromMilliseconds(40);
+
     private readonly TcpFlowKey _key;
     private readonly IPacketSink _sink;
+    private readonly IStackClock _clock;
     private readonly byte[] _scratch = new byte[1500];
 
     private IByteChannel? _channel;
@@ -35,11 +47,14 @@ internal sealed class TcpFlow
     private uint _receiveNext;
     private ushort _peerMaximumSegmentSize = 536;
     private bool _channelEofSent;
+    private bool _ackDue;
+    private TimeSpan _ackDueAt;
 
-    public TcpFlow(TcpFlowKey key, IPacketSink sink)
+    public TcpFlow(TcpFlowKey key, IPacketSink sink, IStackClock clock)
     {
         _key = key;
         _sink = sink;
+        _clock = clock;
         _state = TcpState.Listen;
     }
 
@@ -111,9 +126,19 @@ internal sealed class TcpFlow
             return false;
         }
 
+        var accepted = 0;
+
         if (tcp.Payload.Length > 0)
         {
-            DeliverToChannel(tcp.Payload);
+            accepted = DeliverToChannel(tcp.Payload);
+
+            if (accepted < tcp.Payload.Length)
+            {
+                // The channel is full. Acknowledge only what went, immediately rather than after a
+                // delay, so the peer learns the window has closed without waiting.
+                SendAck();
+                return false;
+            }
         }
 
         if ((flags & TcpFlags.Fin) != 0)
@@ -125,14 +150,15 @@ internal sealed class TcpFlow
                 _state = TcpState.CloseWait;
             }
 
+            // A FIN is acknowledged at once: nothing more is coming to piggyback on.
             SendAck();
             SendChannelEof();
             return false;
         }
 
-        if (tcp.Payload.Length > 0)
+        if (accepted > 0)
         {
-            SendAck();
+            ScheduleAck();
         }
 
         return false;
@@ -185,6 +211,15 @@ internal sealed class TcpFlow
 
         var progressed = false;
 
+        // An acknowledgement that has waited long enough goes now. Sending data below carries the
+        // current acknowledgement number with it anyway, so this only fires when there is nothing
+        // to piggyback on.
+        if (_ackDue && _clock.Now >= _ackDueAt)
+        {
+            SendAck();
+            progressed = true;
+        }
+
         while (channel.TryRead(out var data))
         {
             if (!_sink.CanAccept)
@@ -230,26 +265,34 @@ internal sealed class TcpFlow
         _channel = null;
     }
 
-    private void DeliverToChannel(ReadOnlySpan<byte> payload)
+    /// <summary>
+    /// Passes payload to the channel, and reports how much of it was taken.
+    /// </summary>
+    /// <remarks>
+    /// Only what the channel accepted is acknowledged. Acknowledging the rest would promise delivery
+    /// of bytes that were dropped, and the peer would never send them again - the connection would
+    /// simply lose a piece of its stream. Leaving them unacknowledged makes the peer retransmit,
+    /// which is exactly the mechanism TCP already has for this, so the stack needs no buffer of its
+    /// own to hold them in.
+    /// </remarks>
+    private int DeliverToChannel(ReadOnlySpan<byte> payload)
     {
         var channel = _channel;
         if (channel is null)
         {
-            return;
+            return 0;
         }
 
-        // TODO (M2, second pass): a send the channel cannot take needs to be retried when its window
-        // opens, and the data held meanwhile. Today the flow stalls, which is visible and wrong
-        // rather than silent and wrong.
         var buffer = payload.ToArray();
-        _ = channel.TrySend(buffer, 0, buffer.Length, out var written);
+        var result = channel.TrySend(buffer, 0, buffer.Length, out var written);
 
-        _receiveNext += (uint)payload.Length;
-
-        if (written < buffer.Length)
+        if (result == ByteChannelSendResult.Closed)
         {
-            _ = written;
+            return 0;
         }
+
+        _receiveNext += (uint)written;
+        return written;
     }
 
     private void SendChannelEof()
@@ -263,13 +306,37 @@ internal sealed class TcpFlow
         _channel?.SendEof();
     }
 
+    /// <summary>
+    /// Notes that an acknowledgement is owed, to be sent shortly unless something carries it sooner.
+    /// </summary>
+    /// <remarks>
+    /// A second segment arriving while one is already owed is acknowledged at once, which is what
+    /// every implementation does and what keeps a bulk transfer from waiting out the delay on every
+    /// other segment.
+    /// </remarks>
+    private void ScheduleAck()
+    {
+        if (_ackDue)
+        {
+            SendAck();
+            return;
+        }
+
+        _ackDue = true;
+        _ackDueAt = _clock.Now + AckDelay;
+    }
+
     private void SendAck()
     {
+        _ackDue = false;
         _ = SendSegment(TcpFlags.Ack, ReadOnlySpan<byte>.Empty);
     }
 
     private bool SendSegment(TcpFlags flags, ReadOnlySpan<byte> payload, ushort? mss = null)
     {
+        // Every segment carries the acknowledgement number, so anything we send settles the debt.
+        _ackDue = false;
+
         var tcpStart = Ipv4Packet.MinimumHeaderLength;
         var headerLength = TcpSegment.MinimumHeaderLength + (mss.HasValue ? 4 : 0);
 

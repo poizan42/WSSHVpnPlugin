@@ -21,13 +21,15 @@ internal sealed class StackLoop
 {
     private readonly IByteChannelFactory _channels;
     private readonly IPacketSink _sink;
+    private readonly IStackClock _clock;
     private readonly Dictionary<TcpFlowKey, TcpFlow> _flows = new();
     private readonly List<TcpFlowKey> _finished = new();
 
-    public StackLoop(IByteChannelFactory channels, IPacketSink sink)
+    public StackLoop(IByteChannelFactory channels, IPacketSink sink, IStackClock clock)
     {
         _channels = channels;
         _sink = sink;
+        _clock = clock;
     }
 
     /// <summary>Gets the number of flows currently tracked.</summary>
@@ -71,7 +73,7 @@ internal sealed class StackLoop
 
         if (!_flows.TryGetValue(key, out var flow))
         {
-            flow = new TcpFlow(key, _sink);
+            flow = new TcpFlow(key, _sink, _clock);
             _flows[key] = flow;
         }
 

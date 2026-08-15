@@ -21,6 +21,7 @@ public class StackLoopTests
 
     private FakeChannelFactory _channels = null!;
     private FakeSink _sink = null!;
+    private FakeClock _clock = null!;
     private StackLoop _stack = null!;
 
     [TestInitialize]
@@ -28,7 +29,8 @@ public class StackLoopTests
     {
         _channels = new FakeChannelFactory();
         _sink = new FakeSink();
-        _stack = new StackLoop(_channels, _sink);
+        _clock = new FakeClock();
+        _stack = new StackLoop(_channels, _sink, _clock);
     }
 
     private void Syn(ushort? mss = 1460, ushort port = ClientPort)
@@ -131,6 +133,9 @@ public class StackLoopTests
         CollectionAssert.AreEqual(
             Encoding.ASCII.GetBytes("GET / HTTP/1.1\r\n\r\n"),
             _channels.Last!.Sent.ToArray());
+
+        _clock.Advance(TimeSpan.FromMilliseconds(50));
+        _ = _stack.RunOnce();
 
         var ack = _sink.Last();
         Assert.AreEqual(TcpFlags.Ack, ack.Flags);
@@ -312,5 +317,129 @@ public class StackLoopTests
 
         _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1019, 0, TcpFlags.Fin | TcpFlags.Ack));
         Assert.IsTrue(_channels.Last.EofSent);
+    }
+
+    /// <summary>
+    /// An acknowledgement waits briefly for something to travel with, rather than costing a packet
+    /// of its own.
+    /// </summary>
+    [TestMethod]
+    public void Acknowledgement_IsDelayed()
+    {
+        Syn();
+        var before = _sink.Packets.Count;
+
+        Send(1001, "hello");
+
+        Assert.AreEqual(before, _sink.Packets.Count, "the acknowledgement should not have gone yet");
+
+        _clock.Advance(TimeSpan.FromMilliseconds(50));
+        _ = _stack.RunOnce();
+
+        Assert.AreEqual(TcpFlags.Ack, _sink.Last().Flags);
+        Assert.AreEqual(1006u, _sink.Last().Ack);
+    }
+
+    [TestMethod]
+    public void DelayedAcknowledgement_DoesNotFireEarly()
+    {
+        Syn();
+        Send(1001, "hello");
+        var before = _sink.Packets.Count;
+
+        _clock.Advance(TimeSpan.FromMilliseconds(10));
+        _ = _stack.RunOnce();
+
+        Assert.AreEqual(before, _sink.Packets.Count);
+    }
+
+    /// <summary>
+    /// A second segment while one acknowledgement is already owed is answered at once, or a bulk
+    /// transfer waits out the delay on every other segment.
+    /// </summary>
+    [TestMethod]
+    public void SecondSegment_IsAcknowledgedImmediately()
+    {
+        Syn();
+        Send(1001, "one");
+        var before = _sink.Packets.Count;
+
+        Send(1004, "two");
+
+        Assert.AreEqual(before + 1, _sink.Packets.Count);
+        Assert.AreEqual(1007u, _sink.Last().Ack);
+    }
+
+    /// <summary>
+    /// Data travelling back carries the acknowledgement, so no bare one should follow it.
+    /// </summary>
+    [TestMethod]
+    public void OutgoingData_CarriesTheAcknowledgement()
+    {
+        Syn();
+        Send(1001, "hello");
+
+        _channels.Last!.ReceiveFromPeer(Encoding.ASCII.GetBytes("hi"));
+        _ = _stack.RunOnce();
+
+        Assert.AreEqual(1006u, _sink.Last().Ack, "the reply should acknowledge what arrived");
+
+        var after = _sink.Packets.Count;
+        _clock.Advance(TimeSpan.FromMilliseconds(50));
+        _ = _stack.RunOnce();
+
+        Assert.AreEqual(after, _sink.Packets.Count, "the debt was already settled by the data segment");
+    }
+
+    /// <summary>
+    /// The critical one. A channel that can only take part of a segment must leave the rest
+    /// unacknowledged, so the peer sends it again. Acknowledging it would promise delivery of bytes
+    /// that were dropped, and the stream would silently lose a piece.
+    /// </summary>
+    [TestMethod]
+    public void PartiallyAcceptedData_IsOnlyAcknowledgedAsFarAsItWasTaken()
+    {
+        Syn();
+        _channels.Last!.SendLimit = 4;
+
+        Send(1001, "abcdefghij");
+
+        CollectionAssert.AreEqual(Encoding.ASCII.GetBytes("abcd"), _channels.Last.Sent.ToArray());
+
+        var ack = _sink.Last();
+        Assert.AreEqual(TcpFlags.Ack, ack.Flags);
+        Assert.AreEqual(1005u, ack.Ack, "only the four bytes that were taken may be acknowledged");
+    }
+
+    [TestMethod]
+    public void RetransmissionAfterAPartialTake_IsAcceptedFromWhereItLeftOff()
+    {
+        Syn();
+        _channels.Last!.SendLimit = 4;
+        Send(1001, "abcdefghij");
+
+        // The peer retransmits the remainder, and by now the channel has room.
+        _channels.Last.SendLimit = -1;
+        Send(1005, "efghij");
+
+        CollectionAssert.AreEqual(Encoding.ASCII.GetBytes("abcdefghij"), _channels.Last.Sent.ToArray());
+
+        // The second delivery was complete, so its acknowledgement is delayed like any other.
+        _clock.Advance(TimeSpan.FromMilliseconds(50));
+        _ = _stack.RunOnce();
+
+        Assert.AreEqual(1011u, _sink.Last().Ack);
+    }
+
+    [TestMethod]
+    public void ClosedChannel_AcknowledgesNothing()
+    {
+        Syn();
+        _channels.Last!.IsOpen = false;
+        var ackBefore = _sink.Last().Ack;
+
+        Send(1001, "anything");
+
+        Assert.AreEqual(ackBefore, _sink.Last().Ack, "nothing was delivered, so nothing may be acknowledged");
     }
 }
