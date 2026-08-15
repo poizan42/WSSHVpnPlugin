@@ -1,4 +1,4 @@
-﻿# WSSHVpnPlugin
+# WSSHVpnPlugin
 
 A Windows `IVpnPlugIn` provider that carries VPN traffic over an SSH connection.
 

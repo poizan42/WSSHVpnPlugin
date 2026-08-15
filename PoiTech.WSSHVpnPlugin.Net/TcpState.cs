@@ -1,4 +1,4 @@
-﻿namespace PoiTech.WSSHVpnPlugin.Net;
+namespace PoiTech.WSSHVpnPlugin.Net;
 
 /// <summary>
 /// The states a flow passes through.

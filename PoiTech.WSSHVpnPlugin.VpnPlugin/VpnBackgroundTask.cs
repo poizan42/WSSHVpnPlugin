@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Threading;
 using Windows.ApplicationModel.Background;
 using Windows.ApplicationModel.Core;

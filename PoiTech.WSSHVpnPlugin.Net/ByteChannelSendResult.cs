@@ -1,4 +1,4 @@
-﻿namespace PoiTech.WSSHVpnPlugin.Net;
+namespace PoiTech.WSSHVpnPlugin.Net;
 
 /// <summary>
 /// The outcome of a non-blocking send on an <see cref="IByteChannel"/>.

@@ -1,4 +1,4 @@
-﻿namespace PoiTech.WSSHVpnPlugin.Net;
+namespace PoiTech.WSSHVpnPlugin.Net;
 
 /// <summary>
 /// Identifies a TCP flow by its four-tuple.

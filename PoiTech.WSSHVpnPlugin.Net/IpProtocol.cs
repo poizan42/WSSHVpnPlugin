@@ -1,4 +1,4 @@
-﻿namespace PoiTech.WSSHVpnPlugin.Net;
+namespace PoiTech.WSSHVpnPlugin.Net;
 
 /// <summary>
 /// The IP protocol numbers this stack cares about.
