@@ -82,7 +82,6 @@ public sealed partial class MainPage : Page
             (FingerprintBox, "HostKeyFingerprint"),
             (ClientAddressBox, "ClientIPv4"),
             (NetworkAdapterBox, "NetworkAdapter"),
-            (TracerBox, "TracerDestination"),
             (DnsBox, "DnsServers"),
             (StartDelayBox, "StartDelaySeconds"),
         };
@@ -305,12 +304,6 @@ public sealed partial class MainPage : Page
         if (networkAdapter.Length > 0)
         {
             root.Add(new XElement("NetworkAdapter", networkAdapter));
-        }
-
-        var tracerDestination = TracerBox.Text.Trim();
-        if (tracerDestination.Length > 0)
-        {
-            root.Add(new XElement("TracerDestination", tracerDestination));
         }
 
         var privateKeyPath = PrivateKeyPathBox.Text.Trim();

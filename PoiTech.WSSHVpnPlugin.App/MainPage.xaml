@@ -36,7 +36,6 @@
             <TextBox x:Name="FingerprintBox" Header="Host key fingerprint" PlaceholderText="SHA256:..."/>
             <TextBox x:Name="ClientAddressBox" Header="Client IPv4 address" Text="192.168.255.2"/>
             <TextBox x:Name="NetworkAdapterBox" Header="Connect SSH from" PlaceholderText="(leave empty to choose automatically)"/>
-            <TextBox x:Name="TracerBox" Header="Tracer destination (address:port, one flow only)" PlaceholderText="1.1.1.1:80"/>
             <TextBox x:Name="DnsBox" Header="DNS servers (comma separated)" PlaceholderText="1.1.1.1"/>
             <CheckBox x:Name="SpikeProbeCheck" Content="Run M0 diagnostic probes"/>
             <CheckBox x:Name="RemoteTransportCheck" Content="Give the platform a real connection to the SSH server (not loopback)"/>

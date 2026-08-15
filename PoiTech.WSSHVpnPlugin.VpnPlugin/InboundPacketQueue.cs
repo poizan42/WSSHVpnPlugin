@@ -51,6 +51,27 @@ internal sealed class InboundPacketQueue
     }
 
     /// <summary>
+    /// Gets a value indicating whether a buffer could be borrowed right now.
+    /// </summary>
+    /// <value>
+    /// <see langword="true"/> if there is room; otherwise, <see langword="false"/>.
+    /// </value>
+    /// <remarks>
+    /// Free of side effects, so the stack can ask before doing work it would have to throw away.
+    /// It reserves nothing, so a caller that asks and then does not take is not charged for it.
+    /// </remarks>
+    public bool HasCapacity
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return !_closed && _outstanding < Capacity;
+            }
+        }
+    }
+
+    /// <summary>
     /// Gets a value indicating whether the queue has been closed and drained, so that the channel
     /// can be stopped.
     /// </summary>

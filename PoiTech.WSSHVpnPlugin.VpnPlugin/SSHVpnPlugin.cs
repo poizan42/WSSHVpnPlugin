@@ -133,7 +133,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
             // The packet path needs the queue and the doorbell, neither of which exists until the
             // channel has started.
-            connection.AttachPacketPath(inbound, transport, configuration.TracerDestination);
+            connection.AttachPacketPath(inbound, transport);
 
             if (configuration.SpikeProbe)
             {
