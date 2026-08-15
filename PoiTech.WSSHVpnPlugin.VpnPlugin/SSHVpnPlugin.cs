@@ -663,6 +663,22 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             }
         }
 
+        // Exclusions after inclusions, and reported either way: the reference implementation records
+        // this API failing with an access error, so whether it is accepted here is worth knowing from
+        // the log rather than inferred from behaviour.
+        foreach (var route in configuration.ExclusionRoutes)
+        {
+            try
+            {
+                assignment.Ipv4ExclusionRoutes.Add(ParseRoute(route));
+                PluginLog.Info($"Excluding {route} from the tunnel");
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Error($"Could not exclude '{route}'", ex);
+            }
+        }
+
         return assignment;
     }
 

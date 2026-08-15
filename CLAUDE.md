@@ -210,11 +210,18 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   `Find-NetRoute` picks that NIC. The routing table is right and something above it redirects anyway,
   so a route-table reading will tell you the opposite of what happens. The cost is real: every such
   flow becomes a channel open the SSH server cannot serve, and each one blocks until the SSH timeout.
-  Explicit `Ipv4ExclusionRoutes` for the connected subnets is the next thing to try — and it has to
-  stay configurable, because routing *remote* private addresses into the tunnel is the whole point of
-  a VPN and uses the same machinery.
+- **`Ipv4ExclusionRoutes` *does* work, and is the fix for the above.** Measured across two runs of
+  comparable length with nothing else changed: 11 flows to the client's own subnet before, 0 after,
+  and no other flow affected. The route is accepted without complaint — no `WSAEACCES`, which is what
+  the reference implementation recorded when using this API for a different purpose (keeping the SSH
+  server itself reachable), so that failure does not generalise. Exposed as `<ExcludeRoute>` and kept
+  configurable rather than made a blanket rule about private addresses: routing a *remote* private
+  range in is the whole point of a VPN and uses the same machinery, so the two cases can only be told
+  apart by the person configuring it.
 - **SSH is source-bound** to a chosen interface (`OutboundInterface`), not kept out with
-  `Ipv4ExclusionRoutes` (which returns `WSAEACCES`). `GetInternetConnectionProfile` is useless here —
+  `Ipv4ExclusionRoutes` (which returned `WSAEACCES` for that purpose in the reference implementation;
+  ours is untested for it, and the exclusion of ordinary subnets above works fine).
+  `GetInternetConnectionProfile` is useless here —
   its "preferred interface" becomes the tunnel. The heuristic cannot tell our tunnel from another
   VPN's TAP adapter, so `<NetworkAdapter>` in the profile is a real requirement when nesting, not a
   nicety.

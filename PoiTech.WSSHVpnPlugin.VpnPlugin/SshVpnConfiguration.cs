@@ -148,6 +148,18 @@ internal sealed class SshVpnConfiguration
     public IReadOnlyList<string> InclusionRoutes { get; private init; } = Array.Empty<string>();
 
     /// <summary>
+    /// Gets the IPv4 routes to keep out of the tunnel, in CIDR form.
+    /// </summary>
+    /// <remarks>
+    /// Explicit rather than a blanket rule about private addresses, because the same machinery
+    /// carries the opposite case: reaching the network on the far side is the point of a VPN, and its
+    /// addresses are private too. What belongs here is the client's own subnets - the printer, the
+    /// domain controller, the machine next to it - which the far side cannot reach and should not be
+    /// asked to.
+    /// </remarks>
+    public IReadOnlyList<string> ExclusionRoutes { get; private init; } = Array.Empty<string>();
+
+    /// <summary>
     /// Reads the configuration carried by the VPN profile.
     /// </summary>
     /// <exception cref="FormatException">The profile is missing a server, or the custom configuration is malformed.</exception>
@@ -199,6 +211,7 @@ internal sealed class SshVpnConfiguration
             Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),
+            ExclusionRoutes = ReadStringList(root, "ExcludeRoute"),
         };
     }
 

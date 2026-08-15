@@ -82,6 +82,7 @@ public sealed partial class MainPage : Page
             (FingerprintBox, "HostKeyFingerprint"),
             (ClientAddressBox, "ClientIPv4"),
             (NetworkAdapterBox, "NetworkAdapter"),
+            (ExcludeRoutesBox, "ExcludeRoutes"),
             (DnsBox, "DnsServers"),
             (StartDelayBox, "StartDelaySeconds"),
         };
@@ -350,6 +351,15 @@ public sealed partial class MainPage : Page
             if (trimmed.Length > 0)
             {
                 root.Add(new XElement("DnsServer", trimmed));
+            }
+        }
+
+        foreach (var route in ExcludeRoutesBox.Text.Split(','))
+        {
+            var trimmed = route.Trim();
+            if (trimmed.Length > 0)
+            {
+                root.Add(new XElement("ExcludeRoute", trimmed));
             }
         }
 
