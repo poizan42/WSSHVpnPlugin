@@ -1,4 +1,4 @@
-﻿# CLAUDE.md
+# CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -341,10 +341,11 @@ been removed in .NET 5+. Import the namespace before concluding it's missing.
 
 ## Conventions
 
-- **CRLF and a UTF-8 BOM** on `.cs`, `.xaml`, and `.appxmanifest`. There is no `.gitattributes`, so
-  writing LF or dropping the BOM turns an edit into a whole-file rewrite in the diff. Check before
-  committing.
-- File-scoped namespaces (`.editorconfig`).
+- `.editorconfig` sets `end_of_line = lf`, `charset = utf-8` and file-scoped namespaces. Nothing
+  needs checking by hand: Roslyn reads BOM-less UTF-8 correctly (it tries UTF-8 first and only falls
+  back to the ANSI codepage on invalid bytes), and git is not configured to normalise anything.
+  Existing files predate this and are still CRLF with a BOM, which is simply what Visual Studio
+  writes by default — so expect a mix until they are touched.
 - The plug-in runs in the background task host with no debugger attached; `PluginLog` appends to
   `wsshvpn.log` in the package local folder. Prefer adding to that over `Debug.WriteLine` alone.
 - Host keys are pinned from the profile, and an unpinned key is **refused** rather than trusted on
