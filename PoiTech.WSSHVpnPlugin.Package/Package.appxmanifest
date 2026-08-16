@@ -72,15 +72,12 @@
                    Executable="PoiTech.WSSHVpnPlugin.VpnPlugin\PoiTech.WSSHVpnPlugin.VpnPlugin.exe"
                    EntryPoint="PoiTech.WSSHVpnPlugin.VpnPlugin.VpnBackgroundTask">
           <BackgroundTasks>
-            <uap:Task Type="vpnClient" />
             <!--
-              AssociateTransport registers the outer tunnel transport as a ControlChannelTrigger, and
-              Start* then calls WaitForPushEnabled on it, which fails here with a denial from the
-              trigger broker. Declaring the controlChannel task type is what entitles a package to
-              hold a control channel at all. Maple ships without it, so this may not be the cause -
-              but the declaration is free and the failure is inside that subsystem.
+              vpnClient alone. A controlChannel task type was declared here through the era when
+              StartWithMainTransport failed with E_OUTOFMEMORY and the ControlChannelTrigger broker
+              was the suspect; the real cause was the empty IPv6 address list.
             -->
-            <Task Type="controlChannel" />
+            <uap:Task Type="vpnClient" />
           </BackgroundTasks>
         </Extension>
       </Extensions>
