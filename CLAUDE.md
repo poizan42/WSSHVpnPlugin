@@ -308,7 +308,12 @@ failed experiment, so check here before re-deriving any of it:
   five seconds later by *"did not complete in response to a cancel notification"* in the
   `Microsoft-Windows-BackgroundTaskInfrastructure/Operational` event log and the host's execution.
   Neither `extendedBackgroundTaskTime` (declared) nor `AlwaysAllowed` background access (granted,
-  with consent dialog) lifts it. Both are still in the manifest/app; neither was sufficient.
+  with consent dialog) lifted it while the doorbell still flooded the prolog. Both were removed
+  again afterwards; full downloads then succeeded, proving the capability unnecessary. Nuance: the
+  `AlwaysAllowed` *grant* survives `Remove-AppxPackage` (it is stored against the app identity, not
+  the package), so it was still in effect during the removal test — strictly unfalsified, though
+  the mechanism evidence says it never mattered. Flip the app's background permission in Settings
+  if that ever needs settling.
 - **Why activations starved: `ProcessEventAsync` runs a delivery prolog first.** A mid-stall dump
   (taken by a log-tailing watcher 30 s before the execution, symbolized later) shows the
   89-second-old activation inside `VpnChannelFactory::ProcessEventAsync → VpnExeProcessTask →
