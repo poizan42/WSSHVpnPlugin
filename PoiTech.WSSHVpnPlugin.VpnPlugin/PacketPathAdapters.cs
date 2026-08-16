@@ -646,5 +646,10 @@ internal sealed class InboundPacketSink : IPacketSink
 internal sealed class MonotonicClock : IStackClock
 {
     /// <inheritdoc/>
-    public TimeSpan Now => TimeSpan.FromMilliseconds(Environment.TickCount64);
+    /// <remarks>
+    /// Built from ticks, not <see cref="TimeSpan.FromMilliseconds(double)"/>: that overload rounds
+    /// through a double with range checks, and this property is read several times per flow per
+    /// stack pass — it showed up by name in a live CPU sample of the stack thread.
+    /// </remarks>
+    public TimeSpan Now => new(Environment.TickCount64 * TimeSpan.TicksPerMillisecond);
 }

@@ -30,19 +30,46 @@ internal static class InternetChecksum
     /// </remarks>
     public static uint Accumulate(uint sum, ReadOnlySpan<byte> data)
     {
+        ulong total = sum;
+
+        // Eight bytes per step rather than two. RFC 1071's sum is congruent mod 2^16-1 whatever
+        // the word size - 2^64 = 1 (mod 2^16-1) - so 64-bit chunks added with end-around carry
+        // reach the same folded value the 16-bit loop did, at a quarter of the reads. This loop
+        // was the stack thread's single largest CPU cost, sampled live at 60+ Mbit/s: one 16-bit
+        // big-endian read per word, ~680 of them per packet.
+        while (data.Length >= 8)
+        {
+            var chunk = BinaryPrimitives.ReadUInt64BigEndian(data);
+            total += chunk;
+
+            if (total < chunk)
+            {
+                total++;
+            }
+
+            data = data[8..];
+        }
+
         while (data.Length >= 2)
         {
-            sum += BinaryPrimitives.ReadUInt16BigEndian(data);
+            total += BinaryPrimitives.ReadUInt16BigEndian(data);
             data = data[2..];
         }
 
         if (data.Length == 1)
         {
             // An odd trailing byte is padded on the right, not the left.
-            sum += (uint)(data[0] << 8);
+            total += (uint)(data[0] << 8);
         }
 
-        return sum;
+        // Folded back to 32 bits - congruence is preserved, 2^16-1 divides 2^32-1 - so the running
+        // sum keeps the shape the next block and Finish expect.
+        while ((total >> 32) != 0)
+        {
+            total = (total & 0xFFFFFFFF) + (total >> 32);
+        }
+
+        return (uint)total;
     }
 
     /// <summary>
