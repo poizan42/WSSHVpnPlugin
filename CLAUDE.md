@@ -355,6 +355,13 @@ measured, and most plausible theories were wrong; the order below is the order o
   segments are contractually dead — and crediting and reclaiming *must* move together, or the window
   outruns the tail space. Rule of thumb it establishes: **nothing may mutate, in place, an array a
   peeked segment points into.**
+- **The remaining per-packet RCWs went the same way as the first one: raw ABI.** `VpnChannelAbi`
+  carries hand-written function-pointer vtables, every IID and slot cited from the SDK's MIDL
+  headers, and the inbound queue carries owned `IVpnPacketBuffer` pointers. Traps that survive only
+  as those citations: `GetVpnReceivePacketBuffer` is `IVpnChannel2` slot 11 while `IVpnChannel`'s
+  slot 11 is `LogDiagnosticMessage`, and `RemoveAtEnd` precedes `RemoveAtBegin` on the list.
+  Measured immediately after: 67.7 Mbit/s peak, ~62 sustained, zero retransmissions — up from the
+  51-peak/40-sustained of the projected path.
 
 ### Open holes
 
