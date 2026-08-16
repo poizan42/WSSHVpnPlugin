@@ -61,6 +61,7 @@ internal sealed class PacketPath : IDisposable
 
     private readonly StackLoop _stack;
     private readonly InboundPacketSink _sink;
+    private readonly SshByteChannelFactory _factory;
     private readonly Queue<byte[]> _outbound = new();
     private readonly object _gate = new();
     private readonly AutoResetEvent _wake = new(initialState: false);
@@ -79,10 +80,11 @@ internal sealed class PacketPath : IDisposable
     private long _lastAdjusts;
     private long _lastCredited;
 
-    public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport)
+    public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport, TimeSpan openTimeout)
     {
         _sink = new InboundPacketSink(queue, transport);
-        _stack = new StackLoop(new SshByteChannelFactory(client, Wake), _sink, new MonotonicClock())
+        _factory = new SshByteChannelFactory(client, Wake, openTimeout);
+        _stack = new StackLoop(_factory, _sink, new MonotonicClock())
         {
             FlowStarted = key => PluginLog.Info(
                 $"flow {Ipv4Packet.Format(key.LocalAddress)}:{key.LocalPort} -> " +
@@ -230,9 +232,9 @@ internal sealed class PacketPath : IDisposable
 
         // The transport's own read profile: how many socket reads that traffic cost, how big they
         // were, and how long each one blocked the message listener for.
-        var reads = Interlocked.Read(ref Renci.SshNet.Connection.StreamSocketSshTransport.ReadCount);
-        var readBytes = Interlocked.Read(ref Renci.SshNet.Connection.StreamSocketSshTransport.BytesRead);
-        var readTicks = Interlocked.Read(ref Renci.SshNet.Connection.StreamSocketSshTransport.ReadTicks);
+        var reads = Renci.SshNet.Connection.StreamSocketSshTransport.ReadCount;
+        var readBytes = Renci.SshNet.Connection.StreamSocketSshTransport.BytesRead;
+        var readTicks = Renci.SshNet.Connection.StreamSocketSshTransport.ReadTicks;
 
         var deltaReads = reads - _lastReads;
         var averageRead = deltaReads > 0 ? (readBytes - _lastReadBytes) / (double)deltaReads : 0;
@@ -244,14 +246,14 @@ internal sealed class PacketPath : IDisposable
         _lastReadBytes = readBytes;
         _lastReadTicks = readTicks;
 
-        var adjusts = Interlocked.Read(ref Renci.SshNet.DirectTcpipStream.WindowAdjustsSent);
-        var credited = Interlocked.Read(ref Renci.SshNet.DirectTcpipStream.WindowBytesCredited);
+        var adjusts = Renci.SshNet.DirectTcpipStream.WindowAdjustsSent;
+        var credited = Renci.SshNet.DirectTcpipStream.WindowBytesCredited;
         var deltaAdjusts = adjusts - _lastAdjusts;
         var creditRate = (credited - _lastCredited) * 8.0 / seconds / 1_000_000.0;
         _lastAdjusts = adjusts;
         _lastCredited = credited;
 
-        return $"{_stack.FlowCount} flow(s) open, down {down:F1} Mbit/s, up {up:F1} Mbit/s " +
+        return $"{_stack.FlowCount} flow(s) open over {_factory.LiveChannels} live channel(s), down {down:F1} Mbit/s, up {up:F1} Mbit/s " +
                $"({_sink.Stalls} platform stall(s), {Interlocked.Read(ref Counters.WindowFull)} window-full); " +
                $"credit {deltaAdjusts / seconds:F1} adjust/s worth {creditRate:F1} Mbit/s; " +
                $"transport {deltaReads / seconds:F0} read/s avg {averageRead:F0} B in {microsPerRead:F0} us; " +

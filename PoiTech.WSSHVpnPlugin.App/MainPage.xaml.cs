@@ -84,6 +84,7 @@ public sealed partial class MainPage : Page
             (NetworkAdapterBox, "NetworkAdapter"),
             (ExcludeRoutesBox, "ExcludeRoutes"),
             (DnsBox, "DnsServers"),
+            (OpenTimeoutBox, "OpenTimeoutSeconds"),
             (StartDelayBox, "StartDelaySeconds"),
         };
     }
@@ -343,6 +344,13 @@ public sealed partial class MainPage : Page
         if (startDelay.Length > 0 && startDelay != "0")
         {
             root.Add(new XElement("StartDelaySeconds", startDelay));
+        }
+
+        // Only written when it differs from the plug-in's default, so an empty box means "default".
+        var openTimeout = OpenTimeoutBox.Text.Trim();
+        if (openTimeout.Length > 0 && openTimeout != "3")
+        {
+            root.Add(new XElement("OpenTimeoutSeconds", openTimeout));
         }
 
         foreach (var dns in DnsBox.Text.Split(','))

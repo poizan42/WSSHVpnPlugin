@@ -138,6 +138,18 @@ internal sealed class SshVpnConfiguration
     /// <summary>Gets the MTU to advertise on the virtual interface.</summary>
     public uint Mtu { get; private init; } = DefaultMtu;
 
+    /// <summary>
+    /// Gets how many seconds a channel open may wait for the server's answer before the connection
+    /// it carries is refused.
+    /// </summary>
+    /// <remarks>
+    /// Bounds the caller's wait, not the channel's life: a timed-out open is abandoned, and the
+    /// abandoned object holds its slot until the server answers. The default must stay below the
+    /// DNS relay's 5-second query deadline, or an open outlives the query that wanted it whenever a
+    /// DNS server channel has to be re-established.
+    /// </remarks>
+    public uint OpenTimeoutSeconds { get; private init; } = 3;
+
     /// <summary>Gets the DNS servers to assign, if any.</summary>
     public IReadOnlyList<string> DnsServers { get; private init; } = Array.Empty<string>();
 
@@ -209,6 +221,7 @@ internal sealed class SshVpnConfiguration
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
             NetworkAdapter = ReadString(root, "NetworkAdapter"),
             Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
+            OpenTimeoutSeconds = ReadUInt32(root, "OpenTimeoutSeconds", 3),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),
             ExclusionRoutes = ReadStringList(root, "ExcludeRoute"),

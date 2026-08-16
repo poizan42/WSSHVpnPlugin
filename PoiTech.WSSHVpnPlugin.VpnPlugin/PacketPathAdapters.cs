@@ -45,11 +45,14 @@ internal static class Counters
 internal sealed class DirectTcpipByteChannel : IByteChannel
 {
     private readonly DirectTcpipStream _stream;
+    private readonly Action? _released;
     private bool _faulted;
+    private bool _disposed;
 
-    public DirectTcpipByteChannel(DirectTcpipStream stream)
+    public DirectTcpipByteChannel(DirectTcpipStream stream, Action? released = null)
     {
         _stream = stream;
+        _released = released;
     }
 
     /// <inheritdoc/>
@@ -224,20 +227,58 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// The unsubscription is synchronous, so a dead stream cannot keep raising
+    /// <see cref="Signalled"/> into a flow that no longer exists. Only the stream's own disposal is
+    /// deferred: it sends the close sequence and used to wait a round trip for the server's answer,
+    /// and this runs on the stack's thread, which must never wait on the network.
+    /// </remarks>
     public void Dispose()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
         try
         {
             _stream.DataAvailable -= OnSignalled;
             _stream.PeerEof -= OnSignalled;
             _stream.PeerClosed -= OnSignalled;
             _stream.WindowAvailable -= OnSignalled;
-            _stream.Dispose();
         }
         catch (Exception ex)
         {
             // Disposal failing is not actionable, but letting it escape ends the stack thread.
             Fault(ex);
+        }
+
+        _ = DisposeStreamAsync();
+    }
+
+    /// <summary>
+    /// Disposes the stream without holding the calling thread, and releases the factory's
+    /// live-channel slot once it is done.
+    /// </summary>
+    /// <remarks>
+    /// Fire-and-forget, but the exceptions are observed: an unobserved faulted task is a crash
+    /// vector in a background-task host.
+    /// </remarks>
+    private async Task DisposeStreamAsync()
+    {
+        try
+        {
+            await _stream.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Fault(ex);
+        }
+        finally
+        {
+            _released?.Invoke();
         }
     }
 
@@ -271,15 +312,27 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
 internal sealed class SshByteChannelFactory : IByteChannelFactory
 {
     /// <summary>
-    /// How many opens may be in flight at once.
+    /// How many channels may be alive at once: opens in flight, open channels, and abandoned opens
+    /// still awaiting the server's answer.
     /// </summary>
     /// <remarks>
-    /// An open blocks its thread until the server answers, and a destination the server cannot reach
-    /// blocks it for the full SSH timeout. A Windows machine offers a steady supply of those — every
-    /// connection to a host on the local network arrives here and cannot be served — so without a
-    /// bound they accumulate on the thread pool and starve the opens that would have succeeded.
+    /// <para>
+    /// This replaced a pool of 8 blocking opens, and the difference in kind matters more than the
+    /// number. An open used to park a thread until the server answered — a destination the server
+    /// cannot reach parked it for the full 30-second SSH timeout, and a Windows machine offers a
+    /// steady supply of those. Under a sustained download the refusals cascaded into a browser retry
+    /// storm that killed the transfer; measured on an idle machine, 4.2 opens/s arrived against
+    /// those 8 slots. Now an open in flight is a <c>TaskCompletionSource</c> and a timed-out one is
+    /// an object waiting for the server's answer, so the bound is on memory and server-side channel
+    /// state, not on threads.
+    /// </para>
+    /// <para>
+    /// The count deliberately includes the abandoned-awaiting-answer opens: each one is a channel
+    /// the server may still be holding, so they are exactly what a cap on server-side state has to
+    /// cover.
+    /// </para>
     /// </remarks>
-    private const int MaximumConcurrentOpens = 8;
+    private const int MaximumLiveChannels = 128;
 
     /// <summary>
     /// How much the far end may send us before it has to wait for a window adjustment.
@@ -312,69 +365,134 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
 
     private readonly SshClient _client;
     private readonly Action _wake;
-    private readonly SemaphoreSlim _openSlots = new(MaximumConcurrentOpens, MaximumConcurrentOpens);
+    private readonly TimeSpan _openTimeout;
+    private int _live;
     private int _reportedWindows;
 
-    public SshByteChannelFactory(SshClient client, Action wake)
+    public SshByteChannelFactory(SshClient client, Action wake, TimeSpan openTimeout)
     {
         _client = client;
         _wake = wake;
+        _openTimeout = openTimeout;
     }
+
+    /// <summary>Gets how many channels are alive right now, for the periodic report.</summary>
+    public int LiveChannels => Volatile.Read(ref _live);
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Opening is a round trip, so it happens on a worker: the stack's own thread must never block,
-    /// and a channel open would hold it for the length of a network exchange.
+    /// The open starts on a worker because sending the request can block — on the socket lock, or
+    /// for the length of a rekey — and the stack's own thread must never wait on either. The worker
+    /// is released at the first await rather than held for the server's answer.
     /// </remarks>
     public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed)
     {
         var host = Ipv4Format(address);
 
-        if (!_openSlots.Wait(0))
+        if (Interlocked.Increment(ref _live) > MaximumLiveChannels)
         {
+            _ = Interlocked.Decrement(ref _live);
+
             // Refused rather than queued. The peer is told at once and can retry, which is far
             // better than holding its SYN while a queue of doomed opens drains.
-            PluginLog.Error($"Refusing a channel to {host}:{port}: {MaximumConcurrentOpens} opens already in flight");
+            PluginLog.Error($"Refusing a channel to {host}:{port}: {MaximumLiveChannels} channels already live");
             onFailed();
             _wake();
             return;
         }
 
-        _ = Task.Run(() =>
+        _ = Task.Run(() => OpenAsync(host, port, onOpened, onFailed));
+    }
+
+    /// <summary>
+    /// Opens one channel, bounded by the open timeout rather than by SSH's 30-second one.
+    /// </summary>
+    /// <remarks>
+    /// A timed-out open is abandoned, never disposed: the server owes an answer, and the channel
+    /// stays subscribed until it arrives, then closes anything that was granted. The live-channel
+    /// slot is held for that whole time, because until the answer comes the server may be holding
+    /// the channel too.
+    /// </remarks>
+    private async Task OpenAsync(string host, ushort port, Action<IByteChannel> onOpened, Action onFailed)
+    {
+        DirectTcpipStream? stream = null;
+
+        try
         {
-            try
-            {
-                var stream = _client.CreateDirectTcpipStream(host, port, ChannelBufferSize, ChannelWindowSize);
+            stream = _client.CreateUnopenedDirectTcpipStream(ChannelBufferSize, ChannelWindowSize);
 
-                if (Interlocked.Exchange(ref _reportedWindows, 1) == 0)
+            using (var timeout = new CancellationTokenSource(_openTimeout))
+            {
+                await stream.OpenAsync(host, port, timeout.Token).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            var reason = ex is OperationCanceledException
+                ? $"no answer within {_openTimeout.TotalSeconds:0.#} s"
+                : ex.Message;
+            PluginLog.Error($"Could not open a channel to {host}:{port}: {reason}");
+
+            // The peer is refused before the reap, not after: the reap can take as long as the
+            // server needs to answer, and the flow should not wait on it.
+            onFailed();
+            _wake();
+
+            if (stream is not null)
+            {
+                try
                 {
-                    // Once per session. What the server grants is the outbound limit, the mirror of
-                    // the window we advertise for inbound, and it is worth knowing rather than
-                    // assuming: OpenSSH's compile-time default is far larger than the fork's.
-                    PluginLog.Info(
-                        $"Channel windows: we advertise {ChannelWindowSize} bytes, " +
-                        $"the server granted {stream.RemoteWindowSize} with a {stream.RemotePacketSize}-byte packet limit");
+                    await stream.AbandonAsync().ConfigureAwait(false);
                 }
-
-                var channel = new DirectTcpipByteChannel(stream);
-                channel.Signalled += (_, _) => _wake();
-                channel.Start();
-
-                onOpened(channel);
+                catch (Exception reapEx)
+                {
+                    PluginLog.Error($"Abandoning the open to {host}:{port} failed", reapEx);
+                }
             }
-            catch (Exception ex)
+
+            _ = Interlocked.Decrement(ref _live);
+            return;
+        }
+
+        DirectTcpipByteChannel? channel = null;
+
+        try
+        {
+            if (Interlocked.Exchange(ref _reportedWindows, 1) == 0)
             {
-                PluginLog.Error($"Could not open a channel to {host}:{port}: {ex.Message}");
-                onFailed();
+                // Once per session. What the server grants is the outbound limit, the mirror of
+                // the window we advertise for inbound, and it is worth knowing rather than
+                // assuming: OpenSSH's compile-time default is far larger than the fork's.
+                PluginLog.Info(
+                    $"Channel windows: we advertise {ChannelWindowSize} bytes, " +
+                    $"the server granted {stream.RemoteWindowSize} with a {stream.RemotePacketSize}-byte packet limit");
             }
-            finally
-            {
-                _ = _openSlots.Release();
 
-                // Either way the stack has work to do: answer the handshake, or refuse it.
-                _wake();
+            // The channel owns the live slot from here: its disposal releases it.
+            channel = new DirectTcpipByteChannel(stream, () => Interlocked.Decrement(ref _live));
+            channel.Signalled += (_, _) => _wake();
+            channel.Start();
+
+            onOpened(channel);
+            _wake();
+        }
+        catch (Exception ex)
+        {
+            PluginLog.Error($"Could not hand the stack its channel to {host}:{port}", ex);
+            onFailed();
+            _wake();
+
+            if (channel is not null)
+            {
+                // Disposing the channel releases the live slot through its callback.
+                channel.Dispose();
             }
-        });
+            else
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+                _ = Interlocked.Decrement(ref _live);
+            }
+        }
     }
 
     private static string Ipv4Format(uint address)

@@ -20,13 +20,15 @@ internal sealed class SshVpnConnection : IDisposable
 
     private readonly SshClient _client;
     private readonly string? _expectedFingerprint;
+    private readonly TimeSpan _openTimeout;
     private PacketPath? _packetPath;
     private int _disposed;
 
-    private SshVpnConnection(SshClient client, string? expectedFingerprint)
+    private SshVpnConnection(SshClient client, string? expectedFingerprint, TimeSpan openTimeout)
     {
         _client = client;
         _expectedFingerprint = expectedFingerprint;
+        _openTimeout = openTimeout;
     }
 
     /// <summary>
@@ -110,7 +112,8 @@ internal sealed class SshVpnConnection : IDisposable
         var client = new SshClient(connectionInfo);
         var connection = new SshVpnConnection(
             client,
-            NormalizeFingerprint(configuration.HostKeyFingerprint));
+            NormalizeFingerprint(configuration.HostKeyFingerprint),
+            TimeSpan.FromSeconds(configuration.OpenTimeoutSeconds));
         try
         {
             client.HostKeyReceived += connection.OnHostKeyReceived;
@@ -236,7 +239,7 @@ internal sealed class SshVpnConnection : IDisposable
         ArgumentNullException.ThrowIfNull(inbound);
         ArgumentNullException.ThrowIfNull(transport);
 
-        var path = new PacketPath(_client, inbound, transport);
+        var path = new PacketPath(_client, inbound, transport, _openTimeout);
         _packetPath = path;
         path.Start();
 

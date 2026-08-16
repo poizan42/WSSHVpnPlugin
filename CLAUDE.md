@@ -336,9 +336,14 @@ measured, and most plausible theories were wrong; the order below is the order o
   from the release accounting).
 - **The fairness quantum in `TcpFlow` (8 segments per flow per visit) is load-bearing**: without it
   the inbound queue capacity silently doubles as the inbound/outbound fairness bound.
-- **What kills fast downloads now: the 8-slot blocking channel-open pool** — the not-yet-built
-  async-open work (P1-P3 of the packet-path plan). Under sustained load, slow opens hold slots for
-  the 30 s SSH timeout, refusals cascade, and a browser retry storm follows.
+- **The 8-slot blocking channel-open pool was the last measured killer of fast downloads**: slow
+  opens held slots for the 30 s SSH timeout, refusals cascaded, and a browser retry storm followed
+  (flows 30→63 with `Refusing a channel` flooding the log at the moment of death). Replaced by
+  async opens: an open in flight is a `TaskCompletionSource`, a timed-out open (default 3 s,
+  `<OpenTimeoutSeconds>`) is *abandoned* — never disposed, because before confirmation a dispose
+  puts nothing on the wire and unsubscribes from a confirmation that may still arrive, leaking the
+  channel server-side. The abandoned object holds a slot in `MaximumLiveChannels = 128`
+  (opens in flight + open channels + abandoned-awaiting-answer) until the server answers.
 
 ### Open holes
 
@@ -346,9 +351,6 @@ Deliberate, documented, and not to be silently papered over:
 
 - **Out-of-order segments are dropped**, and no SACK is offered — consistent, but it makes any real
   loss expensive.
-- **Channel opens have no short timeout.** `MaximumConcurrentOpens = 8` bounds the damage from
-  destinations the server cannot reach; it does not fix it. M1a's cancellable `OpenAsync` is the
-  mechanism, not yet plumbed through `CreateDirectTcpipStream`.
 - **IPv6 leaks.** An address is assigned (it must be, or `Start*` fails) but nothing is routed, so
   IPv6 keeps using the physical NIC. Accepted; routing it in with no stack behind it would black-hole
   it instead.

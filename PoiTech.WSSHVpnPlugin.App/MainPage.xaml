@@ -38,6 +38,7 @@
             <TextBox x:Name="NetworkAdapterBox" Header="Connect SSH from" PlaceholderText="(leave empty to choose automatically)"/>
             <TextBox x:Name="ExcludeRoutesBox" Header="Keep out of the tunnel (comma separated CIDR)" PlaceholderText="192.168.1.0/24"/>
             <TextBox x:Name="DnsBox" Header="DNS servers (comma separated)" PlaceholderText="1.1.1.1"/>
+            <TextBox x:Name="OpenTimeoutBox" Header="Channel open timeout, seconds (must stay below the 5 s DNS deadline)" Text="3"/>
             <CheckBox x:Name="SpikeProbeCheck" Content="Run M0 diagnostic probes"/>
             <CheckBox x:Name="RemoteTransportCheck" Content="Give the platform a real connection to the SSH server (not loopback)"/>
             <TextBox x:Name="StartDelayBox" Header="Delay before Start, seconds (0 = none; for attaching a debugger)" Text="0"/>
