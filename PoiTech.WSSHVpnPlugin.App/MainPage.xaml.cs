@@ -110,12 +110,14 @@ public sealed partial class MainPage : Page
         });
     }
 
-    // No background-access request before connecting, deliberately. RequestAccessAsync (and for a
-    // while RequestAccessKindAsync(AlwaysAllowed), and the extendedBackgroundTaskTime capability)
-    // lived here through the activation-watchdog hunt; a full-speed download with the app's
-    // background permission set to DeniedByUser proved that vpnClient activations bypass the user
-    // background-access policy entirely, so the request never did anything. See CLAUDE.md's
-    // activation-watchdog section.
+    // No background-access request before connecting, deliberately. RequestAccessAsync was added
+    // while StartWithMainTransport failed with E_OUTOFMEMORY and a refused background quota was one
+    // of the candidate explanations - the real cause was the empty IPv6 address list - and it later
+    // grew an AlwaysAllowed arm (plus the extendedBackgroundTaskTime capability) during the
+    // activation-watchdog hunt, whose real cause was the doorbell flooding the delivery prolog. A
+    // full-speed download with the app's background permission set to DeniedByUser then proved that
+    // vpnClient activations bypass the user background-access policy entirely, so the request never
+    // did anything at any point. See CLAUDE.md.
     private async void OnConnectClick(object sender, RoutedEventArgs e)
     {
         await RunAsync("Connect", async () =>
