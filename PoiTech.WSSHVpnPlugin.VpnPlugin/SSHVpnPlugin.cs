@@ -764,20 +764,34 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         // Off this thread, always: StopChannel is reached from inside the platform's own callbacks
         // (the final Decapsulate drain above), and Stop called from within a channel callback
-        // blocks - measured as "Stopping the channel" with no "Channel stopped" ever following,
-        // the disconnect activation then dying at the platform's 90-second watchdog. On a worker
-        // the callback returns, the activation completes, and Stop proceeds unobstructed.
+        // blocks the disconnect activation into the platform's 90-second watchdog.
         _ = System.Threading.Tasks.Task.Run(() =>
         {
-            try
+            PluginLog.Info($"Stopping the channel: {reason}");
+
+            var stop = System.Threading.Tasks.Task.Run(() =>
             {
-                PluginLog.Info($"Stopping the channel: {reason}");
-                channel.Stop();
-                PluginLog.Info($"Channel stopped: {reason}");
-            }
-            catch (Exception ex)
+                try
+                {
+                    channel.Stop();
+                    PluginLog.Info($"Channel stopped: {reason}");
+                }
+                catch (Exception ex)
+                {
+                    PluginLog.Error($"Stopping the channel failed ({reason})", ex);
+                }
+            });
+
+            // Bounded, because after a clean disconnect Stop never returns at all - verified
+            // repeatedly as "Stopping the channel" with no "Channel stopped" ever following, most
+            // plausibly because it waits on the connection-long activation, which cannot complete.
+            // The host is condemned from the moment of disconnect either way; what retirement buys
+            // is that a quick reconnect gets a fresh host instead of dying with this one at the
+            // platform's +90 s execution, so it must not be gated behind a call that never comes
+            // back.
+            if (!stop.Wait(TimeSpan.FromSeconds(5)))
             {
-                PluginLog.Error($"Stopping the channel failed ({reason})", ex);
+                PluginLog.Info("Stop did not return within 5 s; retiring the host around it");
             }
 
             ResetState();
