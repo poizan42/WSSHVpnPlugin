@@ -61,6 +61,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
     /// <summary>0 until the first batch, 1 once the raw list size matched the projection, -1 if it did not.</summary>
     private int _abiListChecked;
+
+    /// <summary>0 until the first outbound packet, 1 once its shape check passed, -1 if it failed.</summary>
+    private int _abiPacketChecked;
     private int _encapsulateCalls;
 
     private long _encapsulateFailureCount;
@@ -380,7 +383,23 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
                 try
                 {
-                    var hrSpan = VpnChannelAbi.AcquireSpan(packet, out inner, out byteAccess, out var data, out _);
+                    var hrSpan = VpnChannelAbi.AcquireSpan(packet, out inner, out byteAccess, out var data, out var capacity);
+
+                    if (hrSpan >= 0 && Volatile.Read(ref _abiPacketChecked) == 0)
+                    {
+                        // The outbound half of the first-packet shape check: the pointer from
+                        // RemoveAtBegin and the buffer behind it must answer to the interfaces the
+                        // slot table says they are, before anything per-packet is trusted.
+                        if (!VpnChannelAbi.VerifyPacketShape(packet, inner, capacity, out var why))
+                        {
+                            Volatile.Write(ref _abiPacketChecked, -1);
+                            PluginLog.Error($"ABI self-check failed on the first outbound packet: {why}; terminating rather than corrupting");
+                            channel.TerminateConnection("The VPN plug-in's ABI self-check failed.");
+                            return;
+                        }
+
+                        Volatile.Write(ref _abiPacketChecked, 1);
+                    }
 
                     if (hrSpan >= 0)
                     {
@@ -660,6 +679,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         Volatile.Write(ref _decapsulateCalls, 0);
         Volatile.Write(ref _abiListChecked, 0);
+        Volatile.Write(ref _abiPacketChecked, 0);
     }
 
     /// <summary>
