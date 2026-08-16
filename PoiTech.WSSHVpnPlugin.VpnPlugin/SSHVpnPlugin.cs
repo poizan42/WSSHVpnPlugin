@@ -44,6 +44,22 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private const int EmptyQueueSpins = 8;
 
     /// <summary>
+    /// How many packets one <see cref="Decapsulate"/> call may return before handing the thread
+    /// back to the platform.
+    /// </summary>
+    /// <remarks>
+    /// A decapsulate call is a background-task event, and the platform has a patience for those.
+    /// Unbounded, the loop only returned once the queue stayed empty - which at 105 Mbit/s it
+    /// never did, the stack refilling it faster than the appends drained it - so one call ran for
+    /// the whole download until the platform declared the host hung, spawned a replacement
+    /// mid-transfer, and killed the tunnel at its healthiest. (That replacement-host mystery
+    /// predates this code; it was the same wedge at rates that only occasionally sustained.)
+    /// Returning early is safe because we ring our own doorbell on the way out whenever work
+    /// remains: the next event picks up where this one stopped.
+    /// </remarks>
+    private const int MaximumAppendsPerDecapsulate = 512;
+
+    /// <summary>
     /// How long <see cref="Disconnect"/> gives the platform to call <see cref="Decapsulate"/> one
     /// last time before reporting that it did not.
     /// </summary>
@@ -516,6 +532,15 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                     }
 
                     appended++;
+
+                    if (appended >= MaximumAppendsPerDecapsulate)
+                    {
+                        // The thread goes back to the platform before its hung-task patience runs
+                        // out; the ring asks for the next call, which continues from here.
+                        GetTransport()?.RingDoorbell();
+                        return;
+                    }
+
                     spins = 0;
                     continue;
                 }
@@ -615,6 +640,14 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         lock (_stateGate)
         {
             return _inbound;
+        }
+    }
+
+    private IOuterTransport? GetTransport()
+    {
+        lock (_stateGate)
+        {
+            return _transport;
         }
     }
 
