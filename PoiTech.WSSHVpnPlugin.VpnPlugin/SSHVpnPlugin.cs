@@ -58,6 +58,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private Timer? _stopWatchdog;
     private int _channelStopped;
     private int _decapsulateCalls;
+
+    /// <summary>0 until the first batch, 1 once the raw list size matched the projection, -1 if it did not.</summary>
+    private int _abiListChecked;
     private int _encapsulateCalls;
 
     private long _encapsulateFailureCount;
@@ -305,7 +308,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// afterwards, which is what a plug-in that never returns its buffers looks like.
     /// </para>
     /// </remarks>
-    public void Encapsulate(VpnChannel channel, VpnPacketBufferList packets, VpnPacketBufferList encapsulatedPackets)
+    public unsafe void Encapsulate(VpnChannel channel, VpnPacketBufferList packets, VpnPacketBufferList encapsulatedPackets)
     {
         ArgumentNullException.ThrowIfNull(packets);
 
@@ -317,34 +320,118 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             return;
         }
 
+        // One QI per batch buys raw vtable calls per packet: the projected path cost an RCW per
+        // RemoveAtBegin and two more per .Buffer get. The pointer is owned, so the cleanup calls
+        // below stay valid whatever the garbage collector thinks of the projected wrapper.
+        var hrList = VpnChannelAbi.GetList(packets, out var list);
+        if (hrList < 0)
+        {
+            PluginLog.Error($"The packet list does not expose IVpnPacketBufferList (0x{hrList:X8})");
+            return;
+        }
+
         var spike = GetSpike();
         var failures = 0;
 
-        // Size is captured first: the list is rotated, not drained, so re-reading it would loop.
-        var count = packets.Size;
-        for (uint i = 0; i < count; i++)
+        try
         {
-            var buffer = packets.RemoveAtBegin();
-            try
+            // Size is captured first: the list is rotated, not drained, so re-reading it would loop.
+            var hr = VpnChannelAbi.ListSize(list, out var count);
+            if (hr < 0)
             {
-                spike?.SampleOutbound(VpnPacketBufferAccess.GetSpan(buffer.Buffer).Slice(0, checked((int)buffer.Buffer.Length)));
+                PluginLog.Error($"Reading the packet list size failed (0x{hr:X8})");
+                return;
+            }
 
-                // Copies and queues for the stack's own thread. It must not do more than that:
-                // this is the platform's thread, and anything that blocks here blocks the tunnel.
-                connection.SendOutbound(buffer);
-            }
-            catch (Exception ex)
+            if (Volatile.Read(ref _abiListChecked) == 0)
             {
-                // Deliberately not logged per packet: a systematic failure here runs at line rate
-                // and would fill the disk. Count them and log once for the batch instead.
-                failures++;
-                _lastEncapsulateFailure = ex;
+                // One-time crosscheck of the raw slot table against the projection, before the
+                // per-packet slots are trusted. A wrong get_Size would show as a mismatch here
+                // rather than as a corrupted dereference below.
+                if (count != packets.Size)
+                {
+                    Volatile.Write(ref _abiListChecked, -1);
+                    PluginLog.Error($"ABI self-check failed: raw list size {count} != projected {packets.Size}; terminating rather than corrupting");
+                    channel.TerminateConnection("The VPN plug-in's ABI self-check failed.");
+                    return;
+                }
+
+                Volatile.Write(ref _abiListChecked, 1);
             }
-            finally
+
+            if (Volatile.Read(ref _abiListChecked) < 0)
             {
-                // Unconditional: a buffer dropped on a failure is one the platform never gets back.
-                packets.Append(buffer);
+                return;
             }
+
+            for (uint i = 0; i < count; i++)
+            {
+                hr = VpnChannelAbi.ListRemoveAtBegin(list, out var packet);
+                if (hr < 0 || packet == default)
+                {
+                    // Cannot rotate what could not be taken; stop the batch rather than spin.
+                    failures++;
+                    _lastEncapsulateFailure = VpnChannelAbi.FailureFor(hr, "RemoveAtBegin");
+                    break;
+                }
+
+                var inner = default(IntPtr);
+                var byteAccess = default(IntPtr);
+
+                try
+                {
+                    var hrSpan = VpnChannelAbi.AcquireSpan(packet, out inner, out byteAccess, out var data, out _);
+
+                    if (hrSpan >= 0)
+                    {
+                        hrSpan = VpnChannelAbi.GetLength(inner, out var length);
+
+                        if (hrSpan >= 0)
+                        {
+                            var payload = new ReadOnlySpan<byte>(data, checked((int)length));
+                            spike?.SampleOutbound(payload);
+
+                            // Copies and queues for the stack's own thread. It must not do more:
+                            // this is the platform's thread, and anything that blocks here blocks
+                            // the tunnel.
+                            connection.SendOutbound(payload);
+                        }
+                    }
+
+                    if (hrSpan < 0)
+                    {
+                        failures++;
+                        _lastEncapsulateFailure = VpnChannelAbi.FailureFor(hrSpan, "Reading an outbound packet");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Deliberately not logged per packet: a systematic failure here runs at line
+                    // rate and would fill the disk. Count them and log once for the batch instead.
+                    failures++;
+                    _lastEncapsulateFailure = ex;
+                }
+                finally
+                {
+                    VpnChannelAbi.ReleaseSpan(inner, byteAccess);
+
+                    // Two unconditional obligations, separately: the rotation - a buffer dropped
+                    // on a failure is one the platform never gets back, and a platform that stops
+                    // getting buffers back stops delivering - and then our own reference.
+                    var hrAppend = VpnChannelAbi.ListAppend(list, packet);
+                    if (hrAppend < 0)
+                    {
+                        failures++;
+                        _lastEncapsulateFailure = VpnChannelAbi.FailureFor(hrAppend, "Rotating an outbound packet back");
+                    }
+
+                    VpnChannelAbi.Release(packet);
+                }
+            }
+        }
+        finally
+        {
+            VpnChannelAbi.Release(list);
         }
 
         if (failures > 0)
@@ -381,30 +468,55 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         LogFirstDecapsulateCalls(encapBuffer);
 
-        var spins = 0;
-        var appended = 0;
-
-        while (true)
+        var hrList = VpnChannelAbi.GetList(decapsulatedPackets, out var list);
+        if (hrList < 0)
         {
-            if (inbound.TryDequeue(out var buffer))
-            {
-                decapsulatedPackets.Append(buffer);
-                appended++;
-                spins = 0;
-                continue;
-            }
+            PluginLog.Error($"The decapsulated-packet list does not expose IVpnPacketBufferList (0x{hrList:X8})");
+            return;
+        }
 
-            // Nothing left, and nothing more coming: this is the call Disconnect asked for.
-            if (inbound.IsFinished)
-            {
-                StopChannel(channel, $"the inbound queue drained after disconnect, {appended} returned");
-                return;
-            }
+        try
+        {
+            var spins = 0;
+            var appended = 0;
 
-            if (++spins >= EmptyQueueSpins)
+            while (true)
             {
-                return;
+                if (inbound.TryDequeue(out var packet))
+                {
+                    // Append copies - the list takes its own reference - so ours is released
+                    // either way: on failure we hold the sole reference and dropping it without
+                    // releasing would leak the platform's buffer outright.
+                    var hr = VpnChannelAbi.ListAppend(list, packet);
+                    VpnChannelAbi.Release(packet);
+
+                    if (hr < 0)
+                    {
+                        PluginLog.Error($"Appending an inbound packet failed (0x{hr:X8})");
+                        return;
+                    }
+
+                    appended++;
+                    spins = 0;
+                    continue;
+                }
+
+                // Nothing left, and nothing more coming: this is the call Disconnect asked for.
+                if (inbound.IsFinished)
+                {
+                    StopChannel(channel, $"the inbound queue drained after disconnect, {appended} returned");
+                    return;
+                }
+
+                if (++spins >= EmptyQueueSpins)
+                {
+                    return;
+                }
             }
+        }
+        finally
+        {
+            VpnChannelAbi.Release(list);
         }
     }
 
@@ -524,12 +636,14 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         CloseSession();
 
         IOuterTransport? transport;
+        InboundPacketQueue? inbound;
         Timer? watchdog;
 
         lock (_stateGate)
         {
             transport = _transport;
             _transport = null;
+            inbound = _inbound;
             _inbound = null;
             watchdog = _stopWatchdog;
             _stopWatchdog = null;
@@ -538,7 +652,14 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         watchdog?.Dispose();
         transport?.Dispose();
 
+        // The queue holds raw references now - to still-queued packet buffers and to the channel
+        // interface - and nothing has a finalizer to catch them. The old projected queue just
+        // dropped its RCWs here and let the GC clean up eventually; raw pointers must be released
+        // deliberately or never.
+        inbound?.ReleaseAll();
+
         Volatile.Write(ref _decapsulateCalls, 0);
+        Volatile.Write(ref _abiListChecked, 0);
     }
 
     /// <summary>

@@ -169,11 +169,14 @@ internal sealed class M0Spike : IDisposable
     /// <see cref="SSHVpnPlugin.Encapsulate"/> addressed to TEST-NET-1 — which proves the whole
     /// inject-to-stack-and-back loop, not merely that the calls returned without throwing.
     /// </remarks>
-    private void ProbeDoorbellInjection()
+    private unsafe void ProbeDoorbellInjection()
     {
+        var inner = default(IntPtr);
+        var byteAccess = default(IntPtr);
+
         try
         {
-            if (!_inbound.TryAcquire(out var buffer))
+            if (!_inbound.TryAcquire(out var packet))
             {
                 PluginLog.Error(
                     "M0'(2): the platform would not lend a receive buffer on this thread, so the " +
@@ -181,21 +184,36 @@ internal sealed class M0Spike : IDisposable
                 return;
             }
 
-            var span = VpnPacketBufferAccess.GetSpan(buffer.Buffer);
-            var length = WriteIcmpEchoRequest(span, ProbeSource, _clientAddress);
-            buffer.Buffer.Length = (uint)length;
+            var hr = VpnChannelAbi.AcquireSpan(packet, out inner, out byteAccess, out var data, out var capacity);
 
-            _inbound.Enqueue(buffer);
-            _transport.RingDoorbell();
+            if (hr >= 0)
+            {
+                var length = WriteIcmpEchoRequest(new Span<byte>(data, (int)capacity), ProbeSource, _clientAddress);
+                hr = VpnChannelAbi.SetLength(inner, (uint)length);
 
-            PluginLog.Info(
-                $"M0'(2): queued a {length}-byte ICMP echo request and rang the doorbell. A " +
-                "'Decapsulate called' line means the platform answered; an 'outbound: ICMP 192.0.2.1' " +
-                "line means the whole round trip worked.");
+                if (hr >= 0)
+                {
+                    _inbound.Enqueue(packet);
+                    _transport.RingDoorbell();
+
+                    PluginLog.Info(
+                        $"M0'(2): queued a {length}-byte ICMP echo request and rang the doorbell. A " +
+                        "'Decapsulate called' line means the platform answered; an 'outbound: ICMP 192.0.2.1' " +
+                        "line means the whole round trip worked.");
+                    return;
+                }
+            }
+
+            _inbound.Return(packet);
+            PluginLog.Error($"M0'(2): writing into the receive buffer failed (0x{hr:X8})");
         }
         catch (Exception ex)
         {
             PluginLog.Error("M0'(2): the doorbell injection path FAILED", ex);
+        }
+        finally
+        {
+            VpnChannelAbi.ReleaseSpan(inner, byteAccess);
         }
     }
 

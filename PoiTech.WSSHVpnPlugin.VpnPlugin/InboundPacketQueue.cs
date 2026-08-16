@@ -19,6 +19,13 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// returns it.
 /// </para>
 /// <para>
+/// What it carries is raw, owned <c>IVpnPacketBuffer</c> pointers, not projected objects: the
+/// projection costs an RCW per acquired buffer, on the packet path, for an object that lives
+/// microseconds. Owning raw references makes every disposition explicit — a dequeued pointer is
+/// appended and released, a failed one goes back through <see cref="Return"/>, and teardown ends
+/// in <see cref="ReleaseAll"/> — because nothing here has a finalizer to catch a mistake.
+/// </para>
+/// <para>
 /// Acquiring is bounded because the platform's buffer pool is not documented to be large, and a
 /// plug-in that exhausts it stops being able to request buffers at all. A refused acquisition is
 /// not an error: it is the signal to stop producing, which for TCP means advertising a smaller
@@ -54,18 +61,52 @@ internal sealed class InboundPacketQueue
     /// </remarks>
     public const int Capacity = 512;
 
+    /// <summary>
+    /// Keeps the projected channel alive; its object reference is what the raw pointer was taken
+    /// from, and other parts of the plug-in still use the projected API on it.
+    /// </summary>
     private readonly VpnChannel _channel;
-    private readonly Queue<VpnPacketBuffer> _queue = new(Capacity);
+
+    private readonly Queue<IntPtr> _queue = new(Capacity);
     private readonly object _gate = new();
 
+    /// <summary>Owned <c>IVpnChannel2</c> reference; the receive-buffer acquire goes through it.</summary>
+    private IntPtr _channel2;
+
     private int _outstanding;
+
+    /// <summary>How many threads are inside the platform's acquire call right now.</summary>
+    /// <remarks>
+    /// Exists for one race: teardown joins the producer threads with <em>bounded</em> waits and
+    /// proceeds regardless, so <see cref="ReleaseAll"/> can run while a straggler is still inside
+    /// the call through <see cref="_channel2"/>. Releasing the pointer under that call would be a
+    /// use-after-free the old projected path never had — the RCW held its own reference. The last
+    /// acquirer to leave performs the deferred release instead.
+    /// </remarks>
+    private int _acquiring;
+
     private bool _closed;
+
+    /// <summary>
+    /// Terminal: every pointer still held has been released, and every pointer handed in from now
+    /// on is released immediately instead of stored — nothing will ever drain this queue again.
+    /// </summary>
+    private bool _released;
 
     public InboundPacketQueue(VpnChannel channel)
     {
         ArgumentNullException.ThrowIfNull(channel);
 
         _channel = channel;
+
+        // Both the acquisition of the pointer every packet will go through, and the connect-time
+        // self-check that the IID and the QI machinery are right - failing loudly here beats
+        // dereferencing garbage under traffic.
+        var hr = VpnChannelAbi.GetChannel2(channel, out _channel2);
+        if (hr < 0)
+        {
+            throw VpnChannelAbi.FailureFor(hr, "The channel does not expose IVpnChannel2; the raw packet path cannot run");
+        }
     }
 
     /// <summary>
@@ -107,7 +148,7 @@ internal sealed class InboundPacketQueue
     /// <summary>
     /// Borrows a receive buffer from the platform to write a packet into.
     /// </summary>
-    /// <param name="buffer">Receives the borrowed buffer.</param>
+    /// <param name="packet">Receives an owned <c>IVpnPacketBuffer</c> pointer.</param>
     /// <returns>
     /// <see langword="true"/> if a buffer was borrowed; <see langword="false"/> if the queue is
     /// closed or already holds as many as it may.
@@ -118,74 +159,135 @@ internal sealed class InboundPacketQueue
     /// queue plain arrays and copy them into platform buffers inside the decapsulate handler, at the
     /// cost of a second copy per packet.
     /// </remarks>
-    public bool TryAcquire(out VpnPacketBuffer buffer)
+    public bool TryAcquire(out IntPtr packet)
     {
+        packet = default;
+
         lock (_gate)
         {
             if (_closed || _outstanding >= Capacity)
             {
-                buffer = null!;
                 return false;
             }
 
             _outstanding++;
+            _acquiring++;
         }
 
-        try
-        {
-            buffer = _channel.GetVpnReceivePacketBuffer();
-        }
-        catch (Exception ex)
-        {
-            lock (_gate)
-            {
-                _outstanding--;
-            }
+        // Outside the gate: this is a cross-process platform call, and holding the lock across it
+        // would block the platform thread's dequeue for its duration.
+        var hr = VpnChannelAbi.GetReceiveBuffer(_channel2, out packet);
 
-            PluginLog.Error("The platform would not lend a receive buffer", ex);
-            buffer = null!;
-            return false;
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Queues a filled buffer for the platform to collect.
-    /// </summary>
-    /// <remarks>
-    /// A buffer queued after the queue closed is still queued: it has to be given back, and the
-    /// final drain is what does that.
-    /// </remarks>
-    public void Enqueue(VpnPacketBuffer buffer)
-    {
-        ArgumentNullException.ThrowIfNull(buffer);
+        var releasePacket = false;
+        var deferredChannel = default(IntPtr);
 
         lock (_gate)
         {
-            _queue.Enqueue(buffer);
+            _acquiring--;
+
+            if (hr < 0 || packet == default)
+            {
+                _outstanding--;
+            }
+            else if (_released)
+            {
+                // Torn down while we were inside the call. The pointer is ours and nobody will
+                // ever drain it, so it is released rather than borrowed.
+                releasePacket = true;
+                _outstanding--;
+            }
+
+            if (_released && _acquiring == 0 && _channel2 != default)
+            {
+                deferredChannel = _channel2;
+                _channel2 = default;
+            }
+        }
+
+        if (releasePacket)
+        {
+            VpnChannelAbi.Release(packet);
+            packet = default;
+        }
+
+        VpnChannelAbi.Release(deferredChannel);
+
+        if (hr < 0)
+        {
+            PluginLog.Error($"The platform would not lend a receive buffer (0x{hr:X8})");
+        }
+
+        return packet != default;
+    }
+
+    /// <summary>
+    /// Queues a filled buffer for the platform to collect, taking over its reference.
+    /// </summary>
+    /// <remarks>
+    /// A buffer queued after the queue closed is still queued: it has to be given back, and the
+    /// final drain is what does that. Only after <see cref="ReleaseAll"/> — when no drain will
+    /// ever come — is it released instead.
+    /// </remarks>
+    public void Enqueue(IntPtr packet)
+    {
+        var release = false;
+
+        lock (_gate)
+        {
+            if (_released)
+            {
+                release = true;
+                _outstanding--;
+            }
+            else
+            {
+                _queue.Enqueue(packet);
+            }
+        }
+
+        if (release)
+        {
+            VpnChannelAbi.Release(packet);
         }
     }
 
     /// <summary>
-    /// Takes the next buffer to hand back, if there is one.
+    /// Gives back a buffer that was acquired but never filled, releasing it and its slot.
     /// </summary>
-    /// <param name="buffer">Receives the buffer.</param>
+    /// <remarks>
+    /// The failure path's counterpart to <see cref="Enqueue"/>. Without it a producer that
+    /// acquired and then failed leaks the reference <em>and</em> permanently charges the failure
+    /// against <see cref="Capacity"/> — which is exactly what the old projected path silently did.
+    /// </remarks>
+    public void Return(IntPtr packet)
+    {
+        lock (_gate)
+        {
+            _outstanding--;
+        }
+
+        VpnChannelAbi.Release(packet);
+    }
+
+    /// <summary>
+    /// Takes the next buffer to hand back, if there is one. The caller takes over the reference.
+    /// </summary>
+    /// <param name="packet">Receives the owned pointer.</param>
     /// <returns>
     /// <see langword="true"/> if a buffer was taken; otherwise, <see langword="false"/>.
     /// </returns>
-    public bool TryDequeue(out VpnPacketBuffer buffer)
+    public bool TryDequeue(out IntPtr packet)
     {
         lock (_gate)
         {
             if (!_queue.TryDequeue(out var queued))
             {
-                buffer = null!;
+                packet = default;
                 return false;
             }
 
             _outstanding--;
-            buffer = queued;
+            packet = queued;
             return true;
         }
     }
@@ -199,5 +301,55 @@ internal sealed class InboundPacketQueue
         {
             _closed = true;
         }
+    }
+
+    /// <summary>
+    /// Releases every reference this queue still holds. Terminal.
+    /// </summary>
+    /// <remarks>
+    /// For teardown, after the final drain has had its chance. A released buffer is not
+    /// <em>returned</em> — the platform never gets it back through Decapsulate — but that is no
+    /// worse than the old path, where the same buffers waited for the GC finalizer; with raw
+    /// pointers the release must be explicit or it never happens. The channel pointer's release is
+    /// deferred to the last in-flight acquirer when one is still inside the platform call, because
+    /// teardown's thread joins are bounded and proceed regardless.
+    /// </remarks>
+    public void ReleaseAll()
+    {
+        List<IntPtr>? drained = null;
+        var channel2 = default(IntPtr);
+
+        lock (_gate)
+        {
+            _closed = true;
+            _released = true;
+
+            if (_queue.Count > 0)
+            {
+                drained = new List<IntPtr>(_queue.Count);
+
+                while (_queue.TryDequeue(out var packet))
+                {
+                    drained.Add(packet);
+                    _outstanding--;
+                }
+            }
+
+            if (_acquiring == 0)
+            {
+                channel2 = _channel2;
+                _channel2 = default;
+            }
+        }
+
+        if (drained is not null)
+        {
+            foreach (var packet in drained)
+            {
+                VpnChannelAbi.Release(packet);
+            }
+        }
+
+        VpnChannelAbi.Release(channel2);
     }
 }

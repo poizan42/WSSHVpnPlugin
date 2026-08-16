@@ -271,6 +271,7 @@ internal sealed class PacketPath : IDisposable
                $"credit {deltaAdjusts / seconds:F1} adjust/s worth {creditRate:F1} Mbit/s; " +
                $"transport {deltaReads / seconds:F0} read/s avg {averageRead:F0} B in {microsPerRead:F0} us; " +
                $"{_stack.Retransmissions} retransmission(s), {_refusals.RefusedFromCache} refused from cache; " +
+               $"{GC.CollectionCount(0)} gen0 collection(s); " +
                $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
                $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +
                $"over {dns.Channels} channel(s)";

@@ -527,6 +527,9 @@ internal sealed class InboundPacketSink : IPacketSink
     private long _stalls;
     private bool _pending;
 
+    /// <summary>0 until the first packet, 1 once the ABI shape check passed, -1 if it failed.</summary>
+    private int _verified;
+
     public InboundPacketSink(InboundPacketQueue queue, IOuterTransport transport)
     {
         _queue = queue;
@@ -543,7 +546,13 @@ internal sealed class InboundPacketSink : IPacketSink
     public long Stalls => Interlocked.Read(ref _stalls);
 
     /// <inheritdoc/>
-    public bool TryWrite(ReadOnlySpan<byte> packet)
+    /// <remarks>
+    /// Raw vtable calls throughout — this runs per packet, and the projected API costs an RCW per
+    /// buffer and another per <c>.Buffer</c> get. On any failure the buffer goes back through
+    /// <see cref="InboundPacketQueue.Return"/>: dropping it would lose the platform's buffer
+    /// <em>and</em> permanently charge it against the queue's budget.
+    /// </remarks>
+    public unsafe bool TryWrite(ReadOnlySpan<byte> packet)
     {
         if (!_queue.TryAcquire(out var buffer))
         {
@@ -553,13 +562,54 @@ internal sealed class InboundPacketSink : IPacketSink
             return false;
         }
 
+        var inner = default(IntPtr);
+        var byteAccess = default(IntPtr);
+
         try
         {
-            // One .Buffer access per packet, reused for the span and the length: the property get
-            // marshals a WinRT object each time it is called.
-            var inner = buffer.Buffer;
-            packet.CopyTo(VpnPacketBufferAccess.GetSpan(inner));
-            inner.Length = (uint)packet.Length;
+            var hr = VpnChannelAbi.AcquireSpan(buffer, out inner, out byteAccess, out var data, out var capacity);
+
+            if (hr >= 0 && Volatile.Read(ref _verified) == 0)
+            {
+                if (!VpnChannelAbi.VerifyPacketShape(buffer, inner, capacity, out var why))
+                {
+                    // A failed shape check means the slot table is wrong for this machine; every
+                    // dereference after this point would be garbage. Refuse the path loudly and
+                    // permanently rather than corrupt.
+                    Volatile.Write(ref _verified, -1);
+                    PluginLog.Error($"ABI self-check failed on the first inbound packet: {why}; the inbound path is disabled");
+                }
+                else
+                {
+                    Volatile.Write(ref _verified, 1);
+                }
+            }
+
+            if (Volatile.Read(ref _verified) < 0)
+            {
+                _queue.Return(buffer);
+                return false;
+            }
+
+            if (hr >= 0 && packet.Length <= (int)capacity)
+            {
+                packet.CopyTo(new Span<byte>(data, (int)capacity));
+                hr = VpnChannelAbi.SetLength(inner, (uint)packet.Length);
+            }
+            else if (hr >= 0)
+            {
+                // ERROR_INSUFFICIENT_BUFFER as an HRESULT: the packet cannot fit the platform's
+                // buffer, which is a frame-size configuration problem, not a transient.
+                hr = unchecked((int)0x8007007A);
+            }
+
+            if (hr < 0)
+            {
+                _queue.Return(buffer);
+                PluginLog.Error($"Failed to hand a packet to the platform (0x{hr:X8})");
+                return false;
+            }
+
             _queue.Enqueue(buffer);
             _pending = true;
             _ = Interlocked.Add(ref _bytesWritten, packet.Length);
@@ -567,8 +617,13 @@ internal sealed class InboundPacketSink : IPacketSink
         }
         catch (Exception ex)
         {
+            _queue.Return(buffer);
             PluginLog.Error("Failed to hand a packet to the platform", ex);
             return false;
+        }
+        finally
+        {
+            VpnChannelAbi.ReleaseSpan(inner, byteAccess);
         }
     }
 

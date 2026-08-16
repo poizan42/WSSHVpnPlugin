@@ -253,21 +253,15 @@ internal sealed class SshVpnConnection : IDisposable
     /// Hands it to the stack's thread and returns. Every TCP flow gets its own <c>direct-tcpip</c>
     /// channel; anything else — UDP, ICMP, broadcast, multicast — is dropped by the stack, since
     /// plain SSH has no forwarding primitive for any of it. DNS is the gap that matters, and it is
-    /// answered by carrying it over TCP instead.
+    /// answered by carrying it over TCP instead. Takes the bytes rather than the platform's buffer
+    /// object: the caller owns the buffer's rotation, and this class has no per-packet WinRT
+    /// dependency at all.
     /// </remarks>
-    public void SendOutbound(VpnPacketBuffer packet)
+    public void SendOutbound(ReadOnlySpan<byte> packet)
     {
-        ArgumentNullException.ThrowIfNull(packet);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        var path = _packetPath;
-        if (path is null)
-        {
-            return;
-        }
-
-        var span = VpnPacketBufferAccess.GetSpan(packet.Buffer);
-        path.Offer(span[..checked((int)packet.Buffer.Length)]);
+        _packetPath?.Offer(packet);
     }
 
     /// <inheritdoc/>
