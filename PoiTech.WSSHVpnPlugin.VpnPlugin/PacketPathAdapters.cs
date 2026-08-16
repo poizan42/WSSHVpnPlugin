@@ -610,8 +610,16 @@ internal sealed class InboundPacketSink : IPacketSink
                 return false;
             }
 
-            _queue.Enqueue(buffer);
-            _pending = true;
+            if (_queue.Enqueue(buffer))
+            {
+                // Only the empty-to-non-empty transition arms a ring. Every doorbell datagram is
+                // work the platform's event prolog must complete before any activation can run,
+                // and per-batch ringing at line rate starved that prolog into the 90-second
+                // watchdog - host and tunnel with it. A drain that leaves work behind rings on its
+                // own way out, so a non-empty queue is always owed a visit.
+                _pending = true;
+            }
+
             _ = Interlocked.Add(ref _bytesWritten, packet.Length);
             return true;
         }
@@ -648,6 +656,35 @@ internal sealed class InboundPacketSink : IPacketSink
         _pending = false;
         _transport.RingDoorbell();
     }
+
+    /// <summary>
+    /// The safety net under the transition-ring protocol: re-rings for a queue that has sat
+    /// undrained implausibly long, which is what an actually lost doorbell datagram looks like.
+    /// </summary>
+    /// <remarks>
+    /// Called from the stack's own loop, so it costs two reads per pass and nothing at all when
+    /// the tunnel is idle. Rate-limited so a wedged platform is nudged, not flooded.
+    /// </remarks>
+    public void Nudge()
+    {
+        const long UndrainedPatienceMs = 250;
+
+        if (!_queue.HasQueued || _queue.IsDraining || _queue.MillisecondsSinceLastDrain < UndrainedPatienceMs)
+        {
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        if (now - _lastNudgeAt < UndrainedPatienceMs)
+        {
+            return;
+        }
+
+        _lastNudgeAt = now;
+        _transport.RingDoorbell();
+    }
+
+    private long _lastNudgeAt;
 }
 
 /// <summary>

@@ -175,8 +175,10 @@ internal sealed class PacketPath : IDisposable
                 // Inbound, timers and anything a channel signalled.
                 worked |= _stack.RunOnce();
 
-                // One ring per pass, however many packets it produced.
+                // A ring when one is owed - the queue's empty-to-non-empty transition - and the
+                // safety re-ring for a queue sitting undrained past all plausibility.
                 _sink.Flush();
+                _sink.Nudge();
 
                 failures = 0;
                 ReportIfDue();

@@ -76,6 +76,7 @@ internal sealed class InboundPacketQueue
 
     private int _outstanding;
     private int _draining;
+    private long _lastDrainStarted;
 
     /// <summary>How many threads are inside the platform's acquire call right now.</summary>
     /// <remarks>
@@ -225,14 +226,30 @@ internal sealed class InboundPacketQueue
     /// <summary>
     /// Queues a filled buffer for the platform to collect, taking over its reference.
     /// </summary>
+    /// <returns>
+    /// <see langword="true"/> if the queue was empty and this made it non-empty — the transition
+    /// on which the producer owes a doorbell ring.
+    /// </returns>
     /// <remarks>
+    /// <para>
     /// A buffer queued after the queue closed is still queued: it has to be given back, and the
     /// final drain is what does that. Only after <see cref="ReleaseAll"/> — when no drain will
     /// ever come — is it released instead.
+    /// </para>
+    /// <para>
+    /// The transition is the ring's whole economy. Every doorbell datagram becomes work the
+    /// platform's event prolog must complete before <em>any</em> activation can proceed — dumped
+    /// mid-stall, the 90-second-old activation was inside
+    /// <c>VpnExeHlpProcessProlog → VpnChannelImpl::CompleteDelivery</c>, fed by per-batch rings at
+    /// line rate. Ringing per transition, with the drain's own exit ring covering whatever it
+    /// leaves behind, keeps a non-empty queue always owed a visit by induction while sending tens
+    /// of datagrams a second instead of hundreds.
+    /// </para>
     /// </remarks>
-    public void Enqueue(IntPtr packet)
+    public bool Enqueue(IntPtr packet)
     {
         var release = false;
+        var transition = false;
 
         lock (_gate)
         {
@@ -243,6 +260,7 @@ internal sealed class InboundPacketQueue
             }
             else
             {
+                transition = _queue.Count == 0;
                 _queue.Enqueue(packet);
             }
         }
@@ -251,6 +269,8 @@ internal sealed class InboundPacketQueue
         {
             VpnChannelAbi.Release(packet);
         }
+
+        return transition;
     }
 
     /// <summary>
@@ -323,8 +343,19 @@ internal sealed class InboundPacketQueue
     /// <summary>Marks the start of a decapsulate drain.</summary>
     public void BeginDrain()
     {
+        Volatile.Write(ref _lastDrainStarted, Environment.TickCount64);
         Volatile.Write(ref _draining, 1);
     }
+
+    /// <summary>
+    /// Gets how long it has been since the platform last came to drain, for the safety re-ring.
+    /// </summary>
+    /// <remarks>
+    /// Transition rings plus exit rings cover every ordinary path; what they cannot survive is an
+    /// actual lost datagram. A queue that stays non-empty with no drain for longer than this
+    /// suggests the ring went missing, and the producer sends another.
+    /// </remarks>
+    public long MillisecondsSinceLastDrain => Environment.TickCount64 - Volatile.Read(ref _lastDrainStarted);
 
     /// <summary>Marks the end of a decapsulate drain.</summary>
     public void EndDrain()
