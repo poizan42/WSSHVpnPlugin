@@ -723,8 +723,20 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     }
 
     /// <summary>
-    /// Stops the channel, once.
+    /// Ends the channel's life, once — deliberately without calling <see cref="VpnChannel.Stop"/>.
     /// </summary>
+    /// <remarks>
+    /// Stop can never return after a disconnect, and the reason is the platform's, not ours,
+    /// established from a dump taken inside the block with public symbols:
+    /// <c>VpnChannelImpl::DisconnectInternal</c> acquires the channel's SRW lock (this+0xE8) and
+    /// then, whenever a transport was associated, virtually calls <c>VpnChannelImpl::Stop</c>,
+    /// whose first act is to acquire the same non-reentrant lock — the disconnect activation
+    /// self-deadlocks inside the platform on every clean disconnect. A Stop of ours merely queues
+    /// a second victim behind that deadlock (observed in the same dump). Nothing in this process
+    /// can complete the disconnect; the platform resolves it by killing the host, which is why
+    /// <c>DisconnectProfileAsync</c> completes exactly when the host exits. The fastest correct
+    /// teardown is therefore: release our own state and exit now.
+    /// </remarks>
     private void StopChannel(VpnChannel? channel, string reason)
     {
         if (channel is null || Interlocked.Exchange(ref _channelStopped, 1) != 0)
@@ -733,37 +745,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         }
 
         // Off this thread, always: StopChannel is reached from inside the platform's own callbacks
-        // (the final Decapsulate drain above), and Stop called from within a channel callback
-        // blocks the disconnect activation into the platform's 90-second watchdog.
+        // (the final Decapsulate drain above), which should return to the platform rather than die
+        // mid-call when the exit lands.
         _ = System.Threading.Tasks.Task.Run(() =>
         {
-            PluginLog.Info($"Stopping the channel: {reason}");
-
-            var stop = System.Threading.Tasks.Task.Run(() =>
-            {
-                try
-                {
-                    channel.Stop();
-                    PluginLog.Info($"Channel stopped: {reason}");
-                }
-                catch (Exception ex)
-                {
-                    PluginLog.Error($"Stopping the channel failed ({reason})", ex);
-                }
-            });
-
-            // Bounded, because after a clean disconnect Stop never returns at all - verified
-            // repeatedly as "Stopping the channel" with no "Channel stopped" ever following, most
-            // plausibly because it waits on the connection-long activation, which cannot complete.
-            // The host is condemned from the moment of disconnect either way; what retirement buys
-            // is that a quick reconnect gets a fresh host instead of dying with this one at the
-            // platform's +90 s execution, so it must not be gated behind a call that never comes
-            // back.
-            if (!stop.Wait(TimeSpan.FromSeconds(5)))
-            {
-                PluginLog.Info("Stop did not return within 5 s; retiring the host around it");
-            }
-
+            PluginLog.Info($"Retiring the channel without calling Stop: {reason}");
             ResetState();
             RetireHost();
         });
@@ -802,10 +788,10 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// Watches for the last decapsulate call that <see cref="Disconnect"/> asked for.
     /// </summary>
     /// <remarks>
-    /// If it never comes, the channel is left running rather than stopped behind the platform's
-    /// back: buffers we have not returned are precisely what makes <see cref="VpnChannel.Stop"/>
-    /// dangerous, so stopping anyway would trade a stall for a killed host process. The queue state
-    /// is logged either way, because which branch happens is a fact about the platform worth having.
+    /// If it never comes, the channel is left running rather than torn down behind the platform's
+    /// back: buffers we have not returned belong to the platform, so retiring anyway would trade a
+    /// stall for yanking them out from under it. The queue state is logged either way, because
+    /// which branch happens is a fact about the platform worth having.
     /// </remarks>
     private void ArmStopWatchdog(VpnChannel channel)
     {
@@ -839,19 +825,19 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         var inbound = GetInbound();
         if (inbound is null || inbound.IsFinished)
         {
-            // Nothing of the platform's is still in our hands, so stopping is safe even though the
+            // Nothing of the platform's is still in our hands, so retiring is safe even though the
             // platform never came back to us.
             PluginLog.Error(
-                "The platform did not call Decapsulate again after Disconnect; stopping the channel " +
-                "directly, which is safe only because the inbound queue is empty.");
+                "The platform did not call Decapsulate again after Disconnect; retiring directly, " +
+                "which is safe only because the inbound queue is empty.");
             StopChannel(channel, "watchdog, queue empty");
             return;
         }
 
         PluginLog.Error(
             "The platform did not call Decapsulate again after Disconnect and the inbound queue " +
-            "still holds platform buffers. Not stopping the channel: returning those buffers is the " +
-            "precondition for stopping, and stopping without them risks the host process.");
+            "still holds platform buffers. Not retiring: returning those buffers is the " +
+            "precondition, and exiting with them in hand yanks them out from under the platform.");
     }
 
     /// <summary>

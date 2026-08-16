@@ -268,12 +268,21 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   enqueue is a transition"); that deadlock is closed by `Decapsulate`'s exit ring (a drain that
   leaves work behind rings on its way out), which makes a non-empty queue always owed a visit by
   induction, and a 250 ms safety re-ring in the stack loop covers an actually lost datagram.
-- **`Disconnect` must not call `channel.Stop()`** — and *nothing* may call it from inside a platform
-  callback: `Stop()` from within the final `Decapsulate` blocks forever ("Stopping the channel" with
-  no "Channel stopped" ever following), parking the disconnect activation into the watchdog.
-  `StopChannel` therefore runs `Stop()` on a worker thread. Close the queue, ring once more, and let
-  `Decapsulate` schedule the stop when it finds the queue drained; `OnStopWatchdog` reports whether
-  that last call arrived.
+- **Nothing may call `channel.Stop()` after a disconnect — it can never return, and the deadlock is
+  the platform's own.** Named from a dump taken inside the block (public symbols, disassembly
+  verified): `VpnChannelImpl::DisconnectInternal` acquires the channel's SRW lock (`this+0xE8`) and
+  then, whenever a transport was associated, virtually calls `VpnChannelImpl::Stop`, whose first act
+  is to acquire the same non-reentrant lock — the disconnect activation self-deadlocks inside
+  `ProcessEventAsync` on every clean disconnect. A `Stop()` of ours just queues a second victim
+  behind that deadlock (both were on-stack in the same dump, blocked at `Stop+0x5b`,
+  `LockExclusive`). Nothing in-process can complete the disconnect; the platform resolves it by
+  killing the host, which is why `DisconnectProfileAsync` completes exactly when the host exits.
+  So `StopChannel` stops nothing: it releases our state and retires the host, and the disconnect
+  completes as fast as the final drain. The teardown choreography stays: close the queue, ring once
+  more, let `Decapsulate` schedule the retirement when it finds the queue drained;
+  `OnStopWatchdog` reports whether that last call arrived. (Curiosity from the same disassembly:
+  `Stop` checks a WIL flag literally named `Feature_VPN_BugFixes_25A` right after taking the lock —
+  Microsoft may have a staged fix for this family of bugs.)
 - **Never a literal `0.0.0.0/0` inclusion route** — recorded in the reference implementation as looping
   back through the tunnel even from a bound socket. Use `0.0.0.0/1` + `128.0.0.0/1`. And only add
   routes for a family that has an assigned address, or the platform hangs.
@@ -332,18 +341,16 @@ failed experiment, so check here before re-deriving any of it:
   a 250 ms `ActivationYield` window; `Decapsulate` returns (ringing if work remains) and
   `Encapsulate` stops taking. This cannot save an activation stuck inside the platform's own
   prolog, but it makes legitimate cancels graceful.
-- **A spent host must exit.** The activation that carried a connection never completes even after a
-  clean stop, and the platform cancels it 90 s after disconnect and kills the host — harmless,
-  except that a reconnect made inside that window moves into the condemned host and dies with it
-  (observed: reconnect at +18 s, dead at +90 s). `RetireHost` exits the process once teardown
-  finishes, after a clean disconnect or a failed connect, so a fresh connect always gets a fresh
-  host. The wait on `channel.Stop()` inside that teardown is **bounded at 5 s**, because after a
-  clean disconnect Stop never returns even from a worker thread (verified: "Stopping the channel"
-  with no "Channel stopped", then the +90 s cancel — most plausibly Stop waits on the very
-  activation that cannot complete). The host is condemned from the disconnect either way; exiting
-  around the blocked Stop is the same thing the platform does at +90 s, just before a reconnect
-  can move in. `Decapsulate` events are bounded (512 appends per call) for the same reason — no
-  single event may approach the watchdog.
+- **A spent host must exit.** The activation that carried a connection never completes (parked in
+  `VpnExeProcessTask → VpnExeWaitForTaskToIdle`, seen on-stack in the stop-block dump), and the
+  platform cancels it 90 s after disconnect and kills the host — harmless, except that a reconnect
+  made inside that window moves into the condemned host and dies with it (observed: reconnect at
+  +18 s, dead at +90 s). `RetireHost` exits the process once teardown finishes, after a clean
+  disconnect or a failed connect, so a fresh connect always gets a fresh host. Teardown calls no
+  `channel.Stop()` at all — see the DisconnectInternal self-deadlock above; the earlier 5-second
+  bounded wait around Stop existed only while the block was unexplained, and host exit is what
+  actually completes the system-side disconnect. `Decapsulate` events are bounded (512 appends per
+  call) for the same reason as the yield window — no single event may approach the watchdog.
 - **Worker-thread injection without the doorbell does not work.** The M0'(5) probe
   (`RequestVpnPacketBuffer` + `AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers` from a
   worker) appends without error and the packet is never delivered — every probe line in every log
