@@ -344,6 +344,17 @@ measured, and most plausible theories were wrong; the order below is the order o
   puts nothing on the wire and unsubscribes from a confirmation that may still arrive, leaking the
   channel server-side. The abandoned object holds a slot in `MaximumLiveChannels = 128`
   (opens in flight + open channels + abandoned-awaiting-answer) until the server answers.
+- **After the opens were fixed, downloads still died — of data corruption, not congestion.** The
+  post-mortem line (logged when a client resets a live flow) showed a *healthy* sender at the moment
+  of death: data moving, window open, zero retransmissions — which for a TLS flow means exactly one
+  thing, a failed record MAC. Cause: `DirectTcpipStream` compacted its receive buffer **in place on
+  the listener thread**, an overlapping copy under the segment T-Stack was concurrently reading via
+  `TryRead`. Release-on-ACK made it probable: the held region grew from near-nothing to megabytes,
+  so every append compacted under a reader. Fix in the fork: the receive path only ever grows into a
+  *fresh* array; reclaiming happens in `FlushWindowCredit` on the consumer's thread, where peeked
+  segments are contractually dead — and crediting and reclaiming *must* move together, or the window
+  outruns the tail space. Rule of thumb it establishes: **nothing may mutate, in place, an array a
+  peeked segment points into.**
 
 ### Open holes
 
