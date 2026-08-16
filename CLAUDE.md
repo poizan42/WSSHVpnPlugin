@@ -257,12 +257,21 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
 - **Inbound injection goes through `Decapsulate`, woken by a doorbell.** Writing one byte to the back
   socket makes the platform raise the event. The producer calls `GetVpnReceivePacketBuffer()` on its
   *own* thread, writes the packet directly into that buffer and queues it (`InboundPacketQueue`);
-  `Decapsulate` only appends, which is what returns the buffer. One copy, not two. Ring the doorbell
-  **per batch, unconditionally** — transition-only ringing stalls forever if a single ring is lost.
-- **`Disconnect` must not call `channel.Stop()`.** Buffers we have not returned block the background
-  task and the platform kills the host process. Close the queue, ring once more, and let `Decapsulate`
-  stop the channel when it finds the queue drained. Whether that last call actually arrives is
-  unresolved — `SSHVpnPlugin.OnStopWatchdog` reports which way it went.
+  `Decapsulate` only appends, which is what returns the buffer. One copy, not two. The back socket is
+  a classic UDP `Socket`, not a `DatagramSocket`: it only ever sends, and the WinRT stream adapter
+  cost an async-operation RCW plus a reflection-computed interface GUID per ring, sampled live.
+- **Ring per empty→non-empty transition, never per batch** — see the activation-watchdog section
+  below for why per-batch rings kill the host at line rate. The old per-batch rule existed because
+  transition-only ringing once stalled forever ("nothing drains, so it never empties, so no later
+  enqueue is a transition"); that deadlock is closed by `Decapsulate`'s exit ring (a drain that
+  leaves work behind rings on its way out), which makes a non-empty queue always owed a visit by
+  induction, and a 250 ms safety re-ring in the stack loop covers an actually lost datagram.
+- **`Disconnect` must not call `channel.Stop()`** — and *nothing* may call it from inside a platform
+  callback: `Stop()` from within the final `Decapsulate` blocks forever ("Stopping the channel" with
+  no "Channel stopped" ever following), parking the disconnect activation into the watchdog.
+  `StopChannel` therefore runs `Stop()` on a worker thread. Close the queue, ring once more, and let
+  `Decapsulate` schedule the stop when it finds the queue drained; `OnStopWatchdog` reports whether
+  that last call arrived.
 - **Never a literal `0.0.0.0/0` inclusion route** — recorded in the reference implementation as looping
   back through the tunnel even from a bound socket. Use `0.0.0.0/1` + `128.0.0.0/1`. And only add
   routes for a family that has an assigned address, or the platform hangs.
@@ -287,6 +296,54 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   its "preferred interface" becomes the tunnel. The heuristic cannot tell our tunnel from another
   VPN's TAP adapter, so `<NetworkAdapter>` in the profile is a real requirement when nesting, not a
   nicety.
+
+### The 90-second activation watchdog, and the event prolog that trips it
+
+The hardest hunt after the throughput ladder: at sustained 100+ Mbit/s the host died every few
+minutes — the "dead replacement host" mystery, finally solved. Every belief below was bought with a
+failed experiment, so check here before re-deriving any of it:
+
+- **Every background-task activation must complete within 90 seconds** — measured to the
+  millisecond, repeatedly, as `BackgroundTaskCancellationReason.ExecutionTimeExceeded` followed
+  five seconds later by *"did not complete in response to a cancel notification"* in the
+  `Microsoft-Windows-BackgroundTaskInfrastructure/Operational` event log and the host's execution.
+  Neither `extendedBackgroundTaskTime` (declared) nor `AlwaysAllowed` background access (granted,
+  with consent dialog) lifts it. Both are still in the manifest/app; neither was sufficient.
+- **Why activations starved: `ProcessEventAsync` runs a delivery prolog first.** A mid-stall dump
+  (taken by a log-tailing watcher 30 s before the execution, symbolized later) shows the
+  89-second-old activation inside `VpnChannelFactory::ProcessEventAsync → VpnExeProcessTask →
+  VpnExeHlpProcessProlog → VpnChannelImpl::CompleteDelivery → DatagramSocketServer::CompleteDelivery`
+  — completing pending transport-datagram deliveries before its own event may run. Per-batch
+  doorbell rings at line rate fed that prolog hundreds of datagrams a second; it never finished.
+  Idle sessions drain it in seconds. The fix is the transition-ring protocol above; after it, the
+  log shows scheduling activations completing every few seconds *during* a 165 Mbit/s download.
+- **The platform keeps one rolling scheduling activation alive** — the next starts moments after
+  the previous completes. `GetKeepAlivePayload` is *not* what completes them (never called, logged
+  to prove it).
+- **A cancelled activation should still yield**: `VpnBackgroundTask` registers `Canceled` and opens
+  a 250 ms `ActivationYield` window; `Decapsulate` returns (ringing if work remains) and
+  `Encapsulate` stops taking. This cannot save an activation stuck inside the platform's own
+  prolog, but it makes legitimate cancels graceful.
+- **A spent host must exit.** The activation that carried a connection never completes even after a
+  clean stop, and the platform cancels it 90 s after disconnect and kills the host — harmless,
+  except that a reconnect made inside that window moved into the condemned host and died with it
+  (observed: reconnect at +18 s, dead at +90 s). `RetireHost` exits the process as soon as its
+  connection is fully torn down, after a clean stop or a failed connect, so a fresh connect always
+  gets a fresh host. `Decapsulate` events are bounded (512 appends per call) for the same reason —
+  no single event may approach the watchdog.
+- **Worker-thread injection without the doorbell does not work.** The M0'(5) probe
+  (`RequestVpnPacketBuffer` + `AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers` from a
+  worker) appends without error and the packet is never delivered — every probe line in every log
+  lacks the echo that the doorbell path produces seconds earlier. The doorbell is load-bearing.
+- **Forensics that worked**: activation start/completion logging with instance IDs (matches the ID
+  in the cancel notification); a background watcher that tails `wsshvpn.log` and dumps the host
+  when an activation is 55 s old and uncompleted; `.dump /ma` needs no symbols at capture time.
+  **Symbols need the network, and the network is the tunnel**: during a stall no new connection
+  opens, so `.reload` silently resolves nothing — fetch PDBs after reconnecting.
+  `Windows.Networking.pdb` on the public server has private symbols; `Windows.Networking.Vpn.pdb`
+  is public-only. Also mind that non-invasive attaches suspend the whole process: a debugger that
+  then fetches symbols *through the suspended tunnel* deadlocks itself and kills the session — that
+  is what once dropped the user's connection during sampling.
 
 ### Threads, and which of them may block
 
@@ -362,6 +419,14 @@ measured, and most plausible theories were wrong; the order below is the order o
   slot 11 is `LogDiagnosticMessage`, and `RemoveAtEnd` precedes `RemoveAtBegin` on the list.
   Measured immediately after: 67.7 Mbit/s peak, ~62 sustained, zero retransmissions — up from the
   51-peak/40-sustained of the projected path.
+- **The last two rungs were the checksum and the doorbell.** `InternetChecksum.Accumulate` read one
+  big-endian 16-bit word at a time (~680 reads/packet) — the stack thread's largest sampled cost —
+  and now sums 64-bit chunks with end-around carry (RFC 1071 is congruent mod 2^16−1 at any word
+  size; tests pin it to the definitional loop). `MonotonicClock.Now` stopped rounding through a
+  double. The doorbell ring stopped being a WinRT stream-adapter write (an async-op RCW plus a
+  reflected GUID per ring) and became one syscall on a classic UDP socket. With the activation
+  watchdog also fixed: **165 Mbit/s peak, two full 6.1 GB downloads back to back** — the full arc
+  from 630 kbit/s is ~260×.
 
 ### Open holes
 
