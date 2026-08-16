@@ -80,6 +80,8 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
     /// <summary>0 until the first outbound packet, 1 once its shape check passed, -1 if it failed.</summary>
     private int _abiPacketChecked;
+
+    private int _keepAliveCalls;
     private int _encapsulateCalls;
 
     private long _encapsulateFailureCount;
@@ -649,6 +651,16 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// </remarks>
     public void GetKeepAlivePayload(VpnChannel channel, out VpnPacketBuffer keepAlivePacket)
     {
+        // Budgeted, like the activation logs: at idle the scheduling activations complete on the
+        // keep-alive cadence, so whether this call precedes each completion - and whether it stops
+        // arriving under load, starving the activation into the 90-second watchdog - is the
+        // question the log has to answer.
+        var count = Interlocked.Increment(ref _keepAliveCalls);
+        if (count <= 25)
+        {
+            PluginLog.Info($"GetKeepAlivePayload called (#{count})");
+        }
+
         keepAlivePacket = null!;
     }
 
