@@ -130,41 +130,6 @@ internal sealed class SshVpnConnection : IDisposable
     }
 
     /// <summary>
-    /// Runs a command round trip to prove the SSH session is still usable.
-    /// </summary>
-    /// <param name="detail">Receives a description of what happened, either way.</param>
-    /// <returns>
-    /// <see langword="true"/> if the round trip succeeded; otherwise, <see langword="false"/>.
-    /// </returns>
-    /// <remarks>
-    /// A full round trip rather than <c>IsConnected</c> or a keep-alive, both of which would still
-    /// look healthy if something else were consuming our inbound bytes. Called only from the M0
-    /// spike thread — never from the session's own message loop.
-    /// </remarks>
-    public bool TryProbe(out string detail)
-    {
-        try
-        {
-            using var command = _client.CreateCommand("echo wsshvpn-probe");
-            var result = command.Execute()?.Trim();
-
-            if (string.Equals(result, "wsshvpn-probe", StringComparison.Ordinal))
-            {
-                detail = "round trip ok";
-                return true;
-            }
-
-            detail = $"unexpected response '{result}'";
-            return false;
-        }
-        catch (Exception ex)
-        {
-            detail = ex.Message;
-            return false;
-        }
-    }
-
-    /// <summary>
     /// Chooses how to authenticate: a private key when the profile names one, otherwise a password.
     /// </summary>
     /// <remarks>

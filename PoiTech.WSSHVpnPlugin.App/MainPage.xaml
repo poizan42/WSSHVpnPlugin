@@ -39,11 +39,7 @@
             <TextBox x:Name="ExcludeRoutesBox" Header="Keep out of the tunnel (comma separated CIDR)" PlaceholderText="192.168.1.0/24"/>
             <TextBox x:Name="DnsBox" Header="DNS servers (comma separated)" PlaceholderText="1.1.1.1"/>
             <TextBox x:Name="OpenTimeoutBox" Header="Channel open timeout, seconds (must stay below the 5 s DNS deadline)" Text="3"/>
-            <CheckBox x:Name="SpikeProbeCheck" Content="Run M0 diagnostic probes"/>
-            <CheckBox x:Name="RemoteTransportCheck" Content="Give the platform a real connection to the SSH server (not loopback)"/>
             <TextBox x:Name="StartDelayBox" Header="Delay before Start, seconds (0 = none; for attaching a debugger)" Text="0"/>
-            <CheckBox x:Name="AssignIPv6Check" Content="Assign an IPv6 address and IPv6 routes (fd00::2)"/>
-            <CheckBox x:Name="LargeFrameCheck" Content="Use mtu 1500 / maxFrameSize 1512 instead of ours"/>
         </StackPanel>
 
         <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" Margin="0,16,0,16">

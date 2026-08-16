@@ -48,10 +48,6 @@ public sealed partial class MainPage : Page
             }
         }
 
-        SpikeProbeCheck.IsChecked = values.ContainsKey("SpikeProbe") && values["SpikeProbe"] is true;
-        RemoteTransportCheck.IsChecked = values.ContainsKey("RemoteDummyTransport") && values["RemoteDummyTransport"] is true;
-        AssignIPv6Check.IsChecked = values.ContainsKey("AssignIPv6") && values["AssignIPv6"] is true;
-        LargeFrameCheck.IsChecked = values.ContainsKey("LargeFrameSize") && values["LargeFrameSize"] is true;
     }
 
     private void SaveSettings()
@@ -63,10 +59,6 @@ public sealed partial class MainPage : Page
             values[key] = box.Text;
         }
 
-        values["SpikeProbe"] = SpikeProbeCheck.IsChecked == true;
-        values["RemoteDummyTransport"] = RemoteTransportCheck.IsChecked == true;
-        values["AssignIPv6"] = AssignIPv6Check.IsChecked == true;
-        values["LargeFrameSize"] = LargeFrameCheck.IsChecked == true;
     }
 
     private (TextBox Box, string Key)[] SettingsBoxes()
@@ -293,26 +285,6 @@ public sealed partial class MainPage : Page
         if (fingerprint.Length > 0)
         {
             root.Add(new XElement("HostKeyFingerprint", fingerprint));
-        }
-
-        if (SpikeProbeCheck.IsChecked == true)
-        {
-            root.Add(new XElement("SpikeProbe", "true"));
-        }
-
-        if (RemoteTransportCheck.IsChecked == true)
-        {
-            root.Add(new XElement("RemoteDummyTransport", "true"));
-        }
-
-        if (AssignIPv6Check.IsChecked == true)
-        {
-            root.Add(new XElement("AssignIPv6", "true"));
-        }
-
-        if (LargeFrameCheck.IsChecked == true)
-        {
-            root.Add(new XElement("LargeFrameSize", "true"));
         }
 
         var startDelay = StartDelayBox.Text.Trim();

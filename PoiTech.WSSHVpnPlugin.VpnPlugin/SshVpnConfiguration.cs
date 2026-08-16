@@ -58,50 +58,15 @@ internal sealed class SshVpnConfiguration
     public string? PrivateKeyPath { get; private init; }
 
     /// <summary>
-    /// Gets a value indicating whether to run the M0 diagnostic probes. Scaffolding; see
-    /// <see cref="M0Spike"/>.
-    /// </summary>
-    public bool SpikeProbe { get; private init; }
-
-    /// <summary>
-    /// Gets a value indicating whether to hand the platform a real connection to the SSH server as
-    /// the outer tunnel transport, rather than a loopback pair.
-    /// </summary>
-    /// <remarks>
-    /// A spike switch, not a setting. The loopback shape is what the reference implementations ship,
-    /// but it has never got past <c>StartWithMainTransport</c> here, and another plug-in on this
-    /// machine starts successfully with a real remote socket. See <see cref="RemoteDummyTransport"/>.
-    /// </remarks>
-    public bool RemoteDummyTransport { get; private init; }
-
-    /// <summary>
-    /// Gets a value indicating whether to assign an IPv6 address.
-    /// </summary>
-    /// <remarks>
-    /// Effectively mandatory: <c>Start*</c> fails with <c>E_OUTOFMEMORY</c> when the assigned IPv6
-    /// address list is empty, which is what blocked this plug-in for a long time. Kept as a switch
-    /// only so that finding stays reproducible.
-    /// </remarks>
-    public bool AssignIPv6 { get; private init; }
-
-    /// <summary>
     /// Gets a value indicating whether to route IPv6 into the tunnel as well as assigning an address.
     /// </summary>
     /// <remarks>
-    /// Off by default and expected to stay off until the stack can carry IPv6: routing it in with
-    /// nothing behind it black-holes IPv6 instead of leaving it on the physical interface.
+    /// An IPv6 <em>address</em> is always assigned — <c>Start*</c> fails with <c>E_OUTOFMEMORY</c>
+    /// when the assigned IPv6 address list is empty — but this is off by default and expected to
+    /// stay off until the stack can carry IPv6: routing it in with nothing behind it black-holes
+    /// IPv6 instead of leaving it on the physical interface.
     /// </remarks>
     public bool RouteIPv6 { get; private init; }
-
-    /// <summary>
-    /// Gets a value indicating whether to pass the reference implementation's frame sizes
-    /// (<c>mtu 1500</c>, <c>maxFrameSize 1512</c>) rather than our own.
-    /// </summary>
-    /// <remarks>
-    /// Note theirs has the frame size <em>above</em> the MTU, where ours had it below the documented
-    /// ceiling but only 100 bytes above a smaller MTU.
-    /// </remarks>
-    public bool LargeFrameSize { get; private init; }
 
     /// <summary>
     /// Gets how long to wait before starting the channel, so a debugger can be attached to the
@@ -211,11 +176,7 @@ internal sealed class SshVpnConfiguration
             Port = ReadUInt32(root, "Port", 22),
             UserName = ReadString(root, "UserName"),
             PrivateKeyPath = ReadString(root, "PrivateKeyPath"),
-            SpikeProbe = string.Equals(ReadString(root, "SpikeProbe"), "true", StringComparison.OrdinalIgnoreCase),
-            RemoteDummyTransport = string.Equals(ReadString(root, "RemoteDummyTransport"), "true", StringComparison.OrdinalIgnoreCase),
-            AssignIPv6 = string.Equals(ReadString(root, "AssignIPv6"), "true", StringComparison.OrdinalIgnoreCase),
             RouteIPv6 = string.Equals(ReadString(root, "RouteIPv6"), "true", StringComparison.OrdinalIgnoreCase),
-            LargeFrameSize = string.Equals(ReadString(root, "LargeFrameSize"), "true", StringComparison.OrdinalIgnoreCase),
             StartDelaySeconds = ReadUInt32(root, "StartDelaySeconds", 0),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",

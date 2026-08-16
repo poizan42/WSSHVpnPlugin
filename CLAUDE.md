@@ -451,7 +451,10 @@ Deliberate, documented, and not to be silently papered over:
   IPv6 keeps using the physical NIC. Accepted; routing it in with no stack behind it would black-hole
   it instead.
 - **UDP other than DNS, and all ICMP, are dropped.** No SSH primitive carries either.
-- `M0Spike` and its `<SpikeProbe>` switch are diagnostic scaffolding from the transport bring-up.
+- The bring-up scaffolding is gone: `M0Spike` (`<SpikeProbe>`), `RemoteDummyTransport`,
+  `<LargeFrameSize>` and the `<AssignIPv6>` switch were all removed once their questions were
+  answered — the IPv6 address assignment is now unconditional, because there is no working value of
+  "off". `<StartDelaySeconds>` stays; attaching a debugger to a per-activation host needs it.
 
 ### The fork's transport seam
 

@@ -70,7 +70,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private SshVpnConnection? _connection;
     private IOuterTransport? _transport;
     private InboundPacketQueue? _inbound;
-    private M0Spike? _spike;
     private Timer? _stopWatchdog;
     private int _channelStopped;
     private int _decapsulateCalls;
@@ -129,9 +128,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 credential?.PasskeyCredential?.Password ?? string.Empty,
                 OutboundInterface.Select(configuration.NetworkAdapter));
 
-            IOuterTransport transport = configuration.RemoteDummyTransport
-                ? RemoteDummyTransport.Create(channel, configuration.Host, configuration.Port)
-                : LoopbackTransport.Create(channel);
+            IOuterTransport transport = LoopbackTransport.Create(channel);
 
             var inbound = new InboundPacketQueue(channel);
 
@@ -158,15 +155,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             // The packet path needs the queue and the doorbell, neither of which exists until the
             // channel has started.
             connection.AttachPacketPath(inbound, transport);
-
-            if (configuration.SpikeProbe)
-            {
-                var spike = M0Spike.Start(channel, connection, inbound, transport, configuration.ClientIPv4);
-                lock (_stateGate)
-                {
-                    _spike = spike;
-                }
-            }
         }
         catch (Exception ex)
         {
@@ -192,17 +180,16 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// </remarks>
     private static void StartChannel(VpnChannel channel, SshVpnConfiguration configuration, IOuterTransport transport)
     {
-        // Every other difference from a known-good implementation has now been eliminated by
-        // experiment, so the arguments are the last candidate. These are Maple's exact values,
-        // including an assigned IPv6 address and IPv6 routes we have no stack for: the point is to
-        // replicate something that ships, not to be correct. If this is what starts the channel, the
-        // differences get bisected from here.
         var ipv4 = new List<HostName> { new HostName(configuration.ClientIPv4) };
-        var ipv6 = configuration.AssignIPv6
-            ? new List<HostName> { new HostName("fd00::2") }
-            : new List<HostName>();
-        var mtu = configuration.LargeFrameSize ? 1500u : configuration.Mtu;
-        var frameSize = configuration.LargeFrameSize ? 1512u : GetMaxFrameSize(configuration.Mtu);
+
+        // Unconditional, and not because IPv6 is carried: Start* fails with E_OUTOFMEMORY - a
+        // resource error that has nothing to do with resources - whenever the assigned IPv6
+        // address list is empty. Bisected to this single variable during the bring-up; it was an
+        // option for a while and there is no working value of "off".
+        var ipv6 = new List<HostName> { new HostName("fd00::2") };
+
+        var mtu = configuration.Mtu;
+        var frameSize = GetMaxFrameSize(configuration.Mtu);
 
         try
         {
@@ -356,7 +343,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             return;
         }
 
-        var spike = GetSpike();
         var failures = 0;
 
         try
@@ -437,13 +423,10 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
                         if (hrSpan >= 0)
                         {
-                            var payload = new ReadOnlySpan<byte>(data, checked((int)length));
-                            spike?.SampleOutbound(payload);
-
                             // Copies and queues for the stack's own thread. It must not do more:
                             // this is the platform's thread, and anything that blocks here blocks
                             // the tunnel.
-                            connection.SendOutbound(payload);
+                            connection.SendOutbound(new ReadOnlySpan<byte>(data, checked((int)length)));
                         }
                     }
 
@@ -688,32 +671,19 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         }
     }
 
-    private M0Spike? GetSpike()
-    {
-        lock (_stateGate)
-        {
-            return _spike;
-        }
-    }
-
     /// <summary>
-    /// Stops the spike and the SSH session, leaving the channel and its transport alone.
+    /// Stops the SSH session, leaving the channel and its transport alone.
     /// </summary>
     private void CloseSession()
     {
         SshVpnConnection? connection;
-        M0Spike? spike;
 
         lock (_stateGate)
         {
             connection = _connection;
             _connection = null;
-            spike = _spike;
-            _spike = null;
         }
 
-        // The spike probes the connection, so stop it before disposing what it probes.
-        spike?.Dispose();
         connection?.Dispose();
     }
 
