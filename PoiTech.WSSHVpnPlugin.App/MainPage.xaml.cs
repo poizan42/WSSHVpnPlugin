@@ -4,7 +4,6 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 using Windows.ApplicationModel;
-using Windows.ApplicationModel.Background;
 using Windows.Networking.Vpn;
 using Windows.Storage;
 using Windows.UI.Xaml;
@@ -111,50 +110,19 @@ public sealed partial class MainPage : Page
         });
     }
 
+    // No background-access request before connecting, deliberately. RequestAccessAsync (and for a
+    // while RequestAccessKindAsync(AlwaysAllowed), and the extendedBackgroundTaskTime capability)
+    // lived here through the activation-watchdog hunt; a full-speed download with the app's
+    // background permission set to DeniedByUser proved that vpnClient activations bypass the user
+    // background-access policy entirely, so the request never did anything. See CLAUDE.md's
+    // activation-watchdog section.
     private async void OnConnectClick(object sender, RoutedEventArgs e)
     {
         await RunAsync("Connect", async () =>
         {
-            await EnsureBackgroundAccessAsync();
-
             var status = await _agent.ConnectProfileAsync(BuildProfile());
             Log($"ConnectProfileAsync: {status}");
         });
-    }
-
-    /// <summary>
-    /// Asks for background execution access before connecting.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// Associating a transport with the VPN channel registers it as a <c>ControlChannelTrigger</c>,
-    /// and <c>ControlChannelTrigger</c> is documented as requiring this call first. The plug-in
-    /// itself cannot make it — it runs in a background task, and the access being requested is the
-    /// right to run there — so the foreground app has to, and it applies to the whole package.
-    /// </para>
-    /// <para>
-    /// Worth logging rather than firing and forgetting: <c>StartWithMainTransport</c> currently fails
-    /// with <c>E_OUTOFMEMORY</c>, which is traced to the trigger broker refusing over RPC, and a
-    /// refused background quota is a candidate explanation for a resource error of that shape.
-    /// </para>
-    /// </remarks>
-    private async Task EnsureBackgroundAccessAsync()
-    {
-        try
-        {
-            // Plain RequestAccessAsync only. AlwaysAllowed was requested here for a while when the
-            // 90-second activation watchdog was suspected of being an energy quota; it made no
-            // difference - the real cause was the doorbell flooding the platform's delivery prolog
-            // (see CLAUDE.md) - so the request and the extendedBackgroundTaskTime capability were
-            // removed again.
-            var before = BackgroundExecutionManager.GetAccessStatus();
-            var after = await BackgroundExecutionManager.RequestAccessAsync();
-            Log($"Background access: {before} -> {after}");
-        }
-        catch (Exception ex)
-        {
-            Log($"Background access request failed: {ex.Message}");
-        }
     }
 
     private async void OnDisconnectClick(object sender, RoutedEventArgs e)
