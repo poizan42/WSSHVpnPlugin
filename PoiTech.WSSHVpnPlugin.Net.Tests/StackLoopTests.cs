@@ -383,6 +383,54 @@ public class StackLoopTests
         Assert.AreEqual(count, _sink.Packets.Count, "acknowledged data is never resent");
     }
 
+    /// <summary>
+    /// The server's EOF arrives right behind its last data, while megabytes may still be buffered
+    /// for the client. Every byte of that tail must still be delivered, and the FIN after it.
+    /// </summary>
+    /// <remarks>
+    /// This is the final moment of every download, and it wedged exactly there: the EOF moved the
+    /// flow into FinWait, the pump's guard only admitted the established states, and the tail sat
+    /// in the buffer forever - the transfer showing "a few seconds left" until the user gave up.
+    /// </remarks>
+    [TestMethod]
+    public void ServerEofWithABufferedTail_DeliversEverythingThenCloses()
+    {
+        Syn();
+        var channel = _channels.Last!;
+        var synAckSequence = _sink.Last().Seq;
+
+        // More than one visit's quantum, so the EOF is seen while most of the tail is unsent.
+        var tail = new byte[30000];
+        for (var i = 0; i < tail.Length; i++)
+        {
+            tail[i] = (byte)i;
+        }
+
+        channel.ReceiveFromPeer(tail);
+        channel.IsPeerEof = true;
+
+        for (var visit = 0; visit < 10; visit++)
+        {
+            _ = _stack.RunOnce();
+        }
+
+        var payload = _sink.Packets
+            .Select((_, index) => _sink.At(index))
+            .Where(p => p.DestinationPort == ClientPort && p.Payload.Length > 0)
+            .SelectMany(p => p.Payload)
+            .ToArray();
+
+        CollectionAssert.AreEqual(tail, payload, "the whole tail must reach the client before the close");
+        Assert.IsTrue(_sink.Last().Flags.HasFlag(TcpFlags.Fin), "the FIN follows once every buffered byte has been sent");
+
+        // The client acknowledges everything including the FIN, and closes its own side.
+        var finalAck = synAckSequence + 1 + (uint)tail.Length + 1;
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, finalAck, TcpFlags.Fin | TcpFlags.Ack));
+
+        Assert.AreEqual(0, _stack.FlowCount);
+        Assert.IsTrue(channel.Disposed);
+    }
+
     [TestMethod]
     public void Reset_DiscardsTheFlow()
     {

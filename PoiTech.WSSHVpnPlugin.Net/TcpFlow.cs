@@ -327,7 +327,15 @@ internal sealed class TcpFlow
     public bool PumpInbound()
     {
         var channel = _channel;
-        if (channel is null || _state is not (TcpState.Established or TcpState.CloseWait))
+
+        // The closing states pump too. The server's EOF arrives right behind its last data, and
+        // the transition to FinWait happens below in the same visit - so a guard that only admits
+        // the established states strands everything still buffered at that moment, up to the whole
+        // channel buffer. A fast download's buffer is megabytes deep when the server finishes, and
+        // the symptom is exact: the transfer sits at "a few seconds left" forever, with the last
+        // couple of megabytes never delivered and the FIN never sent.
+        if (channel is null ||
+            _state is not (TcpState.Established or TcpState.CloseWait or TcpState.FinWait or TcpState.LastAck))
         {
             return false;
         }
