@@ -173,6 +173,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
             // TerminateConnection, not SetErrorMessage: the latter is documented as not supported.
             channel.TerminateConnection(ex.Message);
+
+            // A failed connect leaves the same never-completing activation behind as a disconnect
+            // does - the 90-second fuse was measured after failed connects too - and the user's
+            // immediate retry is exactly the reconnect that must not share this host.
+            RetireHost();
         }
     }
 
@@ -744,6 +749,36 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         }
 
         ResetState();
+        RetireHost();
+    }
+
+    /// <summary>
+    /// Exits the host process once its connection is over, so no later session moves in.
+    /// </summary>
+    /// <remarks>
+    /// The activation that carried the connection never completes, even after the channel stops:
+    /// it stays parked inside the platform's <c>ProcessEventAsync</c>, and measured three times,
+    /// the platform cancels it exactly 90 seconds after the disconnect and then kills the host for
+    /// not completing - which nothing in this process can prevent, because only the platform can
+    /// return from its own blocked call. The host is disposable by design at that point; the only
+    /// real damage is collateral, a <em>new</em> connection made inside the 90-second window dying
+    /// with the old host - observed when a reconnect 18 seconds after a disconnect died 72 seconds
+    /// later. Exiting now means the next connect gets a fresh host with no fuse burning. Skipped
+    /// if a new connection has already moved in; that one stays exposed, and there is nothing to
+    /// do about it beyond having made the window as small as this makes it.
+    /// </remarks>
+    private void RetireHost()
+    {
+        lock (_stateGate)
+        {
+            if (_connection is not null)
+            {
+                return;
+            }
+        }
+
+        PluginLog.Info("Retiring the host process: its connection is over, and the platform kills spent hosts 90 seconds after disconnect - a fresh connect gets a fresh host instead of sharing this one's fate.");
+        Environment.Exit(0);
     }
 
     /// <summary>
