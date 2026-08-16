@@ -37,6 +37,13 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         ArgumentNullException.ThrowIfNull(taskInstance);
 
         var deferral = taskInstance.GetDeferral();
+
+        // A task that ignores this is terminated with its whole host: at line rate a decapsulate
+        // event is always in flight, the platform cancels it to make room for its periodic
+        // scheduling activation, and "did not complete in response to a cancel notification" is
+        // the epitaph. The handlers poll the yield window and return promptly.
+        taskInstance.Canceled += OnCanceled;
+
         try
         {
             LogActivation(taskInstance);
@@ -50,8 +57,15 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         }
         finally
         {
+            taskInstance.Canceled -= OnCanceled;
             deferral.Complete();
         }
+    }
+
+    private static void OnCanceled(IBackgroundTaskInstance sender, BackgroundTaskCancellationReason reason)
+    {
+        ActivationYield.Request();
+        PluginLog.Info($"The platform asked an activation to cancel ({reason}); in-flight handlers will yield");
     }
 
     /// <summary>

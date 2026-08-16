@@ -385,6 +385,13 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
             for (uint i = 0; i < count; i++)
             {
+                if (ActivationYield.Requested)
+                {
+                    // The platform cancelled this task instance to make room for another
+                    // activation. Packets not yet taken stay in the list and are offered again.
+                    break;
+                }
+
                 hr = VpnChannelAbi.ListRemoveAtBegin(list, out var packet);
                 if (hr < 0 || packet == default)
                 {
@@ -533,10 +540,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
                     appended++;
 
-                    if (appended >= MaximumAppendsPerDecapsulate)
+                    if (appended >= MaximumAppendsPerDecapsulate || ActivationYield.Requested)
                     {
-                        // The thread goes back to the platform before its hung-task patience runs
-                        // out; the ring asks for the next call, which continues from here.
+                        // The thread goes back to the platform - before its patience runs out, or
+                        // because it asked; the ring requests the next call, which continues from
+                        // here.
                         GetTransport()?.RingDoorbell();
                         return;
                     }
