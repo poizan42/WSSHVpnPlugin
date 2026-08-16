@@ -1,8 +1,8 @@
 using System;
-using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Threading;
 using Windows.Networking;
-using Windows.Networking.Sockets;
 using Windows.Networking.Vpn;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
@@ -21,11 +21,15 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// CLAUDE.md.
 /// </para>
 /// <para>
-/// The pair is two cross-connected <see cref="DatagramSocket"/>s on loopback, never a listener. A
-/// listener is what the Windows 8-era documentation warns receives nothing inside an app container,
-/// and the cross-connected shape avoids the question entirely. The loopback traffic itself needs no
+/// The pair is two cross-connected datagram sockets on loopback, never a listener. A listener is
+/// what the Windows 8-era documentation warns receives nothing inside an app container, and the
+/// cross-connected shape avoids the question entirely. The loopback traffic itself needs no
 /// exemption — the app container loopback check passes when both endpoints belong to the same
-/// package, which two sockets in one process necessarily do.
+/// package, which two sockets in one process necessarily do. The platform's side must be a
+/// <see cref="Windows.Networking.Sockets.DatagramSocket"/> because that is what
+/// <c>AssociateTransport</c> takes; our side is a classic <see cref="Socket"/>, because it only
+/// ever sends and the WinRT stream adapter charged an async-operation RCW — plus, sampled live, a
+/// reflection-computed interface GUID — for every single ring.
 /// </para>
 /// <para>
 /// Writing to <see cref="RingDoorbell"/> puts a byte on the socket the platform reads, which is
@@ -38,18 +42,16 @@ internal sealed class LoopbackTransport : IOuterTransport
 {
     private static readonly byte[] DoorbellPayload = new byte[] { 1 };
 
-    private readonly DatagramSocket _transport;
-    private readonly DatagramSocket _back;
-    private readonly Stream _doorbell;
+    private readonly Windows.Networking.Sockets.DatagramSocket _transport;
+    private readonly Socket _back;
     private readonly object _doorbellGate = new();
 
     private int _disposed;
 
-    private LoopbackTransport(DatagramSocket transport, DatagramSocket back, Stream doorbell)
+    private LoopbackTransport(Windows.Networking.Sockets.DatagramSocket transport, Socket back)
     {
         _transport = transport;
         _back = back;
-        _doorbell = doorbell;
     }
 
     /// <summary>
@@ -82,30 +84,28 @@ internal sealed class LoopbackTransport : IOuterTransport
         ArgumentNullException.ThrowIfNull(channel);
 
         var localhost = new HostName("127.0.0.1");
-        var transport = new DatagramSocket();
-        DatagramSocket? back = null;
+        var transport = new Windows.Networking.Sockets.DatagramSocket();
+        Socket? back = null;
 
         try
         {
             channel.AssociateTransport(transport, null);
 
-            back = new DatagramSocket();
+            back = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            back.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            var backPort = ((IPEndPoint)back.LocalEndPoint!).Port;
 
-            // Empty service names: bind to ephemeral ports and read back what we got.
+            // Empty service name: bind to an ephemeral port and read back what we got.
             Wait(transport.BindEndpointAsync(localhost, string.Empty));
-            Wait(back.BindEndpointAsync(localhost, string.Empty));
 
-            Wait(transport.ConnectAsync(localhost, back.Information.LocalPort));
-            Wait(back.ConnectAsync(localhost, transport.Information.LocalPort));
-
-            // Unbuffered: a doorbell that sits in a buffer is not a doorbell.
-            var doorbell = back.OutputStream.AsStreamForWrite(bufferSize: 0);
+            Wait(transport.ConnectAsync(localhost, backPort.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            back.Connect(IPAddress.Loopback, int.Parse(transport.Information.LocalPort, System.Globalization.CultureInfo.InvariantCulture));
 
             PluginLog.Info(
                 $"Loopback transport ready: platform on port {transport.Information.LocalPort}, " +
-                $"doorbell on port {back.Information.LocalPort}");
+                $"doorbell on port {backPort}");
 
-            return new LoopbackTransport(transport, back, doorbell);
+            return new LoopbackTransport(transport, back);
         }
         catch
         {
@@ -141,11 +141,12 @@ internal sealed class LoopbackTransport : IOuterTransport
         try
         {
             // One writer at a time: the stack rings from its own thread and teardown rings from
-            // whichever thread is tearing down.
+            // whichever thread is tearing down. The send itself is one synchronous syscall on a
+            // connected datagram socket - the WinRT stream adapter this replaces was sampled
+            // creating an async-operation RCW and reflecting out an interface GUID per ring.
             lock (_doorbellGate)
             {
-                _doorbell.Write(DoorbellPayload, 0, DoorbellPayload.Length);
-                _doorbell.Flush();
+                _ = _back.Send(DoorbellPayload);
             }
         }
         catch (Exception ex)
@@ -168,10 +169,9 @@ internal sealed class LoopbackTransport : IOuterTransport
         {
             lock (_doorbellGate)
             {
-                _doorbell.Dispose();
+                _back.Dispose();
             }
 
-            _back.Dispose();
             _transport.Dispose();
         }
         catch (Exception ex)
