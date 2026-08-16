@@ -74,6 +74,8 @@ internal sealed class TcpFlow
     private bool _channelEofSent;
     private bool _ackDue;
     private TimeSpan _ackDueAt;
+    private TimeSpan _lastAdvanceAt;
+    private TimeSpan _lastSendAt;
 
     public TcpFlow(TcpFlowKey key, IPacketSink sink, IStackClock clock)
     {
@@ -81,6 +83,8 @@ internal sealed class TcpFlow
         _sink = sink;
         _clock = clock;
         _state = TcpState.Listen;
+        _lastAdvanceAt = clock.Now;
+        _lastSendAt = clock.Now;
     }
 
     /// <summary>Gets the flow's current state.</summary>
@@ -91,6 +95,30 @@ internal sealed class TcpFlow
 
     /// <summary>Gets the maximum segment size the peer advertised.</summary>
     public ushort PeerMaximumSegmentSize => _peerMaximumSegmentSize;
+
+    /// <summary>Gets how many times the retransmission timeout has fired on this flow.</summary>
+    public int Retransmissions { get; private set; }
+
+    /// <summary>
+    /// Describes the sender's state, for the post-mortem when the peer resets a live flow.
+    /// </summary>
+    /// <remarks>
+    /// A wedged flow dies silently: the peer's application gives up, resets, and the log shows
+    /// nothing but the flow disappearing. What the sender looked like at that moment - how much was
+    /// in flight, whether the peer's window had closed, and how long since anything moved - is the
+    /// only evidence of which side stopped and why.
+    /// </remarks>
+    public string Describe()
+    {
+        var inFlight = (int)(_sendNext - _sendUnacknowledged);
+        var buffered = _channel is { } channel && channel.TryRead(out var data) ? data.Count : 0;
+        var now = _clock.Now;
+
+        return $"state {_state}, {inFlight} in flight, {Math.Max(0, buffered - inFlight)} unsent, " +
+               $"peer window {_peerWindow}, {Retransmissions} retransmission(s), " +
+               $"last advance {(now - _lastAdvanceAt).TotalSeconds:F1} s ago, " +
+               $"last send {(now - _lastSendAt).TotalSeconds:F1} s ago";
+    }
 
     /// <summary>
     /// Takes a segment addressed to this flow.
@@ -180,6 +208,7 @@ internal sealed class TcpFlow
                 // Progress resets the clock and the backoff.
                 _retransmitInterval = InitialRetransmitTimeout;
                 _retransmitAt = _clock.Now + _retransmitInterval;
+                _lastAdvanceAt = _clock.Now;
             }
 
             _peerWindow = tcp.WindowSize;
@@ -326,6 +355,7 @@ internal sealed class TcpFlow
                 ? MaximumRetransmitTimeout
                 : _retransmitInterval + _retransmitInterval;
             _retransmitAt = _clock.Now + _retransmitInterval;
+            Retransmissions++;
 
             if (_finSent)
             {
@@ -381,6 +411,7 @@ internal sealed class TcpFlow
             }
 
             _sendNext += (uint)take;
+            _lastSendAt = _clock.Now;
 
             sent++;
             progressed = true;
@@ -536,6 +567,35 @@ internal sealed class TcpFlow
 
         var total = Ipv4Packet.Write(_scratch, IpProtocol.Tcp, _key.RemoteAddress, _key.LocalAddress, tcpLength);
         return _sink.TryWrite(_scratch.AsSpan(0, total));
+    }
+
+    /// <summary>
+    /// Answers a segment on a connection nothing holds any more, without creating a flow to do it.
+    /// </summary>
+    /// <remarks>
+    /// The stragglers of a dead connection arrive in bursts - everything that was in flight when it
+    /// died - and creating a flow per packet just to reset it put a phantom flow-started line in
+    /// the log for each one. The reply is byte-identical to what such a flow would have sent.
+    /// </remarks>
+    public static void Reset(IPacketSink sink, in TcpFlowKey key, in TcpSegment tcp)
+    {
+        var buffer = new byte[Ipv4Packet.MinimumHeaderLength + TcpSegment.MinimumHeaderLength];
+
+        // Reversed: what the operating system sent to the far end now comes back from it.
+        var tcpLength = TcpSegment.Write(
+            buffer.AsSpan(Ipv4Packet.MinimumHeaderLength),
+            key.RemoteAddress,
+            key.LocalAddress,
+            key.RemotePort,
+            key.LocalPort,
+            tcp.AcknowledgementNumber,
+            tcp.SequenceNumber + (uint)tcp.Payload.Length,
+            TcpFlags.Rst | TcpFlags.Ack,
+            ReceiveWindow,
+            0);
+
+        var total = Ipv4Packet.Write(buffer, IpProtocol.Tcp, key.RemoteAddress, key.LocalAddress, tcpLength);
+        _ = sink.TryWrite(buffer.AsSpan(0, total));
     }
 
     /// <summary>

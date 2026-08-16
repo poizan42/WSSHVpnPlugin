@@ -89,6 +89,12 @@ internal sealed class PacketPath : IDisposable
             FlowStarted = key => PluginLog.Info(
                 $"flow {Ipv4Packet.Format(key.LocalAddress)}:{key.LocalPort} -> " +
                 $"{Ipv4Packet.Format(key.RemoteAddress)}:{key.RemotePort}"),
+
+            // The client resetting a live flow is its application giving up, and the sender's
+            // post-mortem is the only evidence of why: a wedge is silent everywhere else.
+            FlowReset = (key, description) => PluginLog.Info(
+                $"flow {Ipv4Packet.Format(key.LocalAddress)}:{key.LocalPort} -> " +
+                $"{Ipv4Packet.Format(key.RemoteAddress)}:{key.RemotePort} reset by the client — {description}"),
         };
 
         _thread = new Thread(Run)
@@ -257,6 +263,7 @@ internal sealed class PacketPath : IDisposable
                $"({_sink.Stalls} platform stall(s), {Interlocked.Read(ref Counters.WindowFull)} window-full); " +
                $"credit {deltaAdjusts / seconds:F1} adjust/s worth {creditRate:F1} Mbit/s; " +
                $"transport {deltaReads / seconds:F0} read/s avg {averageRead:F0} B in {microsPerRead:F0} us; " +
+               $"{_stack.Retransmissions} retransmission(s); " +
                $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
                $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +
                $"over {dns.Channels} channel(s)";

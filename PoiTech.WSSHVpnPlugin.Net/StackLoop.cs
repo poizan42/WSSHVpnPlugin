@@ -25,6 +25,9 @@ internal sealed class StackLoop
     private readonly IStackClock _clock;
     private readonly Dictionary<TcpFlowKey, TcpFlow> _flows = new();
     private readonly List<TcpFlowKey> _finished = new();
+
+    /// <summary>Retransmissions carried out by flows that have since been forgotten.</summary>
+    private long _retiredRetransmissions;
     private readonly DnsRelay _dns;
 
     /// <summary>
@@ -84,6 +87,35 @@ internal sealed class StackLoop
     public Action<TcpFlowKey>? FlowStarted { get; set; }
 
     /// <summary>
+    /// Called when the peer resets a flow the stack still holds, with the sender's post-mortem.
+    /// </summary>
+    /// <remarks>
+    /// A reset from the peer is the application on the other side giving up, and it is the only
+    /// visible symptom of a flow that wedged: everything else about a wedge is silence. The
+    /// description says what the sender looked like at that moment - see
+    /// <see cref="TcpFlow.Describe"/>.
+    /// </remarks>
+    public Action<TcpFlowKey, string>? FlowReset { get; set; }
+
+    /// <summary>
+    /// Gets how many times a retransmission timeout has fired across every flow, living and dead.
+    /// </summary>
+    public long Retransmissions
+    {
+        get
+        {
+            var total = _retiredRetransmissions;
+
+            foreach (var flow in _flows.Values)
+            {
+                total += flow.Retransmissions;
+            }
+
+            return total;
+        }
+    }
+
+    /// <summary>
     /// Offers an outbound packet to the stack.
     /// </summary>
     /// <param name="packet">The packet the operating system wants sent.</param>
@@ -138,9 +170,31 @@ internal sealed class StackLoop
 
         if (!_flows.TryGetValue(key, out var flow))
         {
+            if ((tcp.Flags & TcpFlags.Rst) != 0)
+            {
+                // A reset for a connection nothing holds answers nothing: replying to a reset is
+                // how two stacks chase each other in circles.
+                Dropped++;
+                return false;
+            }
+
+            if ((tcp.Flags & TcpFlags.Syn) == 0)
+            {
+                // The in-flight stragglers of a connection whose flow is already gone, which arrive
+                // in a burst when a peer gives up. Each gets its reset without a flow being created
+                // to send it, so the flow-started log stays a log of connections.
+                TcpFlow.Reset(_sink, key, tcp);
+                return true;
+            }
+
             flow = new TcpFlow(key, _sink, _clock);
             _flows[key] = flow;
             FlowStarted?.Invoke(key);
+        }
+        else if ((tcp.Flags & TcpFlags.Rst) != 0)
+        {
+            // Described before Accept aborts it, while the sender's state still exists.
+            FlowReset?.Invoke(key, flow.Describe());
         }
 
         var wantsChannel = flow.Accept(tcp);
@@ -153,6 +207,7 @@ internal sealed class StackLoop
 
         if (flow.IsFinished)
         {
+            _retiredRetransmissions += flow.Retransmissions;
             _ = _flows.Remove(key);
         }
 
@@ -189,6 +244,7 @@ internal sealed class StackLoop
 
             if (pair.Value.IsFinished)
             {
+                _retiredRetransmissions += pair.Value.Retransmissions;
                 _finished.Add(pair.Key);
             }
         }

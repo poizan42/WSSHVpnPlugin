@@ -408,6 +408,58 @@ public class StackLoopTests
         Assert.AreEqual(0, _stack.FlowCount);
     }
 
+    /// <summary>
+    /// The stragglers of a dead connection arrive in a burst - everything in flight when the peer
+    /// gave up - and none of them is the start of anything. Creating a flow per packet just to
+    /// reset it logged a phantom connection for each one.
+    /// </summary>
+    [TestMethod]
+    public void DataForAnUnknownFlow_DoesNotAnnounceAFlow()
+    {
+        var started = 0;
+        _stack.FlowStarted = _ => started++;
+
+        Send(5000, "stray");
+
+        Assert.AreEqual(0, started);
+    }
+
+    /// <summary>
+    /// A reset for a connection nothing holds is answered with nothing: replying to a reset is how
+    /// two stacks chase each other in circles.
+    /// </summary>
+    [TestMethod]
+    public void ResetForAnUnknownFlow_IsIgnored()
+    {
+        var started = 0;
+        _stack.FlowStarted = _ => started++;
+
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, 0, TcpFlags.Rst));
+
+        Assert.AreEqual(0, started);
+        Assert.AreEqual(0, _sink.Packets.Count);
+        Assert.AreEqual(0, _stack.FlowCount);
+    }
+
+    /// <summary>
+    /// The client resetting a live flow is its application giving up, and the flow's state at that
+    /// moment is the only evidence of why. See <see cref="TcpFlow.Describe"/>.
+    /// </summary>
+    [TestMethod]
+    public void ResetOfALiveFlow_ReportsTheSenderPostMortem()
+    {
+        string? postMortem = null;
+        _stack.FlowReset = (_, description) => postMortem = description;
+
+        Syn();
+
+        _ = _stack.Offer(Packets.Tcp(Client, Server, ClientPort, ServerPort, 1001, 0, TcpFlags.Rst));
+
+        Assert.IsNotNull(postMortem);
+        Assert.IsTrue(postMortem.Contains("state Established", StringComparison.Ordinal), postMortem);
+        Assert.IsTrue(postMortem.Contains("peer window", StringComparison.Ordinal), postMortem);
+    }
+
     [TestMethod]
     public void OutOfOrderSegment_IsDroppedAndReAcknowledged()
     {
