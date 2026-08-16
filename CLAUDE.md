@@ -324,13 +324,18 @@ failed experiment, so check here before re-deriving any of it:
   a 250 ms `ActivationYield` window; `Decapsulate` returns (ringing if work remains) and
   `Encapsulate` stops taking. This cannot save an activation stuck inside the platform's own
   prolog, but it makes legitimate cancels graceful.
-- **A spent host must exit.** The activation that carried a connection never completes even after a
-  clean stop, and the platform cancels it 90 s after disconnect and kills the host — harmless,
-  except that a reconnect made inside that window moved into the condemned host and died with it
-  (observed: reconnect at +18 s, dead at +90 s). `RetireHost` exits the process as soon as its
-  connection is fully torn down, after a clean stop or a failed connect, so a fresh connect always
-  gets a fresh host. `Decapsulate` events are bounded (512 appends per call) for the same reason —
-  no single event may approach the watchdog.
+- **A spent host must exit — and mostly cannot.** The activation that carried a connection never
+  completes even after a clean stop, and the platform cancels it 90 s after disconnect and kills
+  the host — harmless, except that a reconnect made inside that window moves into the condemned
+  host and dies with it (observed: reconnect at +18 s, dead at +90 s). `RetireHost` exits the
+  process once teardown finishes — but on the clean-disconnect path it is gated behind
+  `channel.Stop()`, which post-disconnect **never returns even from a worker thread** (verified:
+  "Stopping the channel" with no "Channel stopped", then the +90 s cancel), most plausibly because
+  Stop waits on the very activation that cannot complete. So retirement currently fires only after
+  a *failed connect*; after a clean disconnect the platform's own +90 s execution is what recycles
+  the host, and the reconnect-inside-90-s hazard still stands. Known fix, not yet built: bound the
+  wait on Stop and retire regardless — the host is condemned either way. `Decapsulate` events are
+  bounded (512 appends per call) for the same reason — no single event may approach the watchdog.
 - **Worker-thread injection without the doorbell does not work.** The M0'(5) probe
   (`RequestVpnPacketBuffer` + `AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers` from a
   worker) appends without error and the packet is never delivered — every probe line in every log
