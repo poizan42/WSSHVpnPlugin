@@ -268,21 +268,30 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   enqueue is a transition"); that deadlock is closed by `Decapsulate`'s exit ring (a drain that
   leaves work behind rings on its way out), which makes a non-empty queue always owed a visit by
   induction, and a 250 ms safety re-ring in the stack loop covers an actually lost datagram.
-- **Nothing may call `channel.Stop()` after a disconnect — it can never return, and the deadlock is
-  the platform's own.** Named from a dump taken inside the block (public symbols, disassembly
-  verified): `VpnChannelImpl::DisconnectInternal` acquires the channel's SRW lock (`this+0xE8`) and
-  then, whenever a transport was associated, virtually calls `VpnChannelImpl::Stop`, whose first act
-  is to acquire the same non-reentrant lock — the disconnect activation self-deadlocks inside
-  `ProcessEventAsync` on every clean disconnect. A `Stop()` of ours just queues a second victim
-  behind that deadlock (both were on-stack in the same dump, blocked at `Stop+0x5b`,
-  `LockExclusive`). Nothing in-process can complete the disconnect; the platform resolves it by
-  killing the host, which is why `DisconnectProfileAsync` completes exactly when the host exits.
-  So `StopChannel` stops nothing: it releases our state and retires the host, and the disconnect
-  completes as fast as the final drain. The teardown choreography stays: close the queue, ring once
-  more, let `Decapsulate` schedule the retirement when it finds the queue drained;
-  `OnStopWatchdog` reports whether that last call arrived. (Curiosity from the same disassembly:
-  `Stop` checks a WIL flag literally named `Feature_VPN_BugFixes_25A` right after taking the lock —
-  Microsoft may have a staged fix for this family of bugs.)
+- **`channel.Stop()` must be called synchronously inside the `Disconnect` callback — and only
+  there.** The docs mean it: `IVpnPlugIn.Disconnect` "instructs the VPN plug-in to ... destroy the
+  VPN channel", and `Stop` is the destroy call. Called in that window it returns in ~0 ms, the
+  disconnect activation completes in half a second, and — the payoff — **the connection-long
+  activation finally completes too** (`VpnExeWaitForTaskToIdle` was waiting for exactly this), so
+  the host is never condemned and no `ExecutionTimeExceeded` cancellations appear at all.
+  Everywhere else `Stop` can never return, and the deadlock is the platform's own, named from a
+  dump taken inside the block (public symbols, disassembly verified):
+  `VpnChannelImpl::DisconnectInternal` runs on the same thread *after* the callback returns,
+  acquires the channel's SRW lock (`this+0xE8`) and then — only when the transport vector is still
+  populated, i.e. only when the plug-in did not stop first — virtually calls
+  `VpnChannelImpl::Stop`, whose first act is to acquire the same non-reentrant lock. That fallback
+  self-deadlocks the disconnect activation inside `ProcessEventAsync` forever; a late `Stop()` of
+  ours just queues a second victim behind it (both were on-stack in the same dump, blocked at
+  `Stop+0x5b`, `LockExclusive`), and only host death resolves the disconnect — which is why, in
+  the non-conforming era, `DisconnectProfileAsync` completed exactly when the host exited. The
+  in-callback `Stop` is safe only with no platform buffers in our hands (`IsFinished`), which a
+  clean disconnect satisfies because the stack thread is joined first; otherwise the old
+  choreography still runs — close the queue, ring once more, let `Decapsulate` finish the teardown,
+  `OnStopWatchdog` reporting whether that call arrived. The bounded wait around the in-callback
+  `Stop` (8 s, then retire) is armor, not expectation: it has measured 0 ms every time.
+  (Curiosity from the same disassembly: `Stop` checks a WIL flag literally named
+  `Feature_VPN_BugFixes_25A` right after taking the lock — Microsoft may have a staged fix for
+  this family of bugs.)
 - **Never a literal `0.0.0.0/0` inclusion route** — recorded in the reference implementation as looping
   back through the tunnel even from a bound socket. Use `0.0.0.0/1` + `128.0.0.0/1`. And only add
   routes for a family that has an assigned address, or the platform hangs.
@@ -341,16 +350,16 @@ failed experiment, so check here before re-deriving any of it:
   a 250 ms `ActivationYield` window; `Decapsulate` returns (ringing if work remains) and
   `Encapsulate` stops taking. This cannot save an activation stuck inside the platform's own
   prolog, but it makes legitimate cancels graceful.
-- **A spent host must exit.** The activation that carried a connection never completes (parked in
-  `VpnExeProcessTask → VpnExeWaitForTaskToIdle`, seen on-stack in the stop-block dump), and the
-  platform cancels it 90 s after disconnect and kills the host — harmless, except that a reconnect
-  made inside that window moves into the condemned host and dies with it (observed: reconnect at
-  +18 s, dead at +90 s). `RetireHost` exits the process once teardown finishes, after a clean
-  disconnect or a failed connect, so a fresh connect always gets a fresh host. Teardown calls no
-  `channel.Stop()` at all — see the DisconnectInternal self-deadlock above; the earlier 5-second
-  bounded wait around Stop existed only while the block was unexplained, and host exit is what
-  actually completes the system-side disconnect. `Decapsulate` events are bounded (512 appends per
-  call) for the same reason as the yield window — no single event may approach the watchdog.
+- **Spent hosts no longer exist on the clean path.** The whole pathology — the connection-carrying
+  activation parked forever in `VpnExeProcessTask → VpnExeWaitForTaskToIdle`, the +90 s cancel and
+  host kill, the reconnect-into-a-condemned-host hazard (observed once: reconnect at +18 s, dead at
+  +90 s) — was downstream of not calling `Stop` inside `Disconnect`. With the conforming disconnect
+  (see the `Stop` bullet in the loopback-transport section) every activation completes and the host
+  survives, unremarkable and reusable. `RetireHost` remains only on the failure paths — a failed
+  connect, and the armor timeout around the in-callback `Stop` — where the platform-side state is
+  wedged or unknown and a fresh host is the only safe successor. `Decapsulate` events are bounded
+  (512 appends per call) for the same reason as the yield window — no single event may approach
+  the watchdog.
 - **Worker-thread injection without the doorbell does not work.** The M0'(5) probe
   (`RequestVpnPacketBuffer` + `AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers` from a
   worker) appends without error and the packet is never delivered — every probe line in every log

@@ -259,15 +259,21 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// <inheritdoc/>
     /// <remarks>
     /// <para>
-    /// Deliberately does not call <see cref="VpnChannel.Stop"/>. Buffers the platform has lent us
-    /// and not had back block the VPN background task, and the platform kills the whole host process
-    /// when it stops responding. Instead the inbound queue is closed and the doorbell rung once
-    /// more, so that <see cref="Decapsulate"/> returns what is outstanding and stops the channel
-    /// itself once there is nothing left.
+    /// The documented contract is that this method "instructs the VPN plug-in to disconnect from
+    /// the VPN server and destroy the VPN channel", and <see cref="VpnChannel.Stop"/> is the
+    /// destroy call — so when nothing of the platform's is left in our hands, Stop is called from
+    /// right here. The window matters: the platform's own <c>DisconnectInternal</c> runs on this
+    /// same thread after this callback returns, takes the channel's SRW lock, and — only when the
+    /// transport vector is still populated, i.e. only when the plug-in did not stop first — calls
+    /// Stop itself and self-deadlocks on its own non-reentrant lock. Inside this callback the lock
+    /// is still free (proved by dump: <c>DisconnectInternal</c> acquired it after we returned), so
+    /// this is the one place a Stop of ours can ever work.
     /// </para>
     /// <para>
-    /// Whether the platform actually delivers that last call is exactly what M0′ is meant to find
-    /// out, so the watchdog reports which way it went rather than papering over it.
+    /// If the inbound queue still holds platform buffers they must go back first: the queue is
+    /// closed and the doorbell rung once more, so that <see cref="Decapsulate"/> returns what is
+    /// outstanding and finishes the teardown once there is nothing left; the watchdog reports
+    /// whether that last call arrived.
     /// </para>
     /// </remarks>
     public void Disconnect(VpnChannel channel)
@@ -291,8 +297,14 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             inbound?.Close();
             CloseSession();
 
+            if (inbound is null || inbound.IsFinished)
+            {
+                StopChannelSynchronously(channel);
+                return;
+            }
+
             // One last ring, after closing: this is what gets us the call in which the queue is
-            // observed drained and the channel is stopped.
+            // observed drained and the teardown finishes.
             transport?.RingDoorbell();
             ArmStopWatchdog(channel);
         }
@@ -300,6 +312,50 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         {
             PluginLog.Error("Disconnect failed", ex);
         }
+    }
+
+    /// <summary>
+    /// Destroys the channel from inside the <see cref="Disconnect"/> callback, per the documented
+    /// contract — the one window where <see cref="VpnChannel.Stop"/> can complete.
+    /// </summary>
+    /// <remarks>
+    /// Run on a worker with a bounded wait so a wrong guess costs seconds rather than the
+    /// platform's 90-second execution: on timeout the host retires around the stuck call exactly
+    /// as the fallback path does. The wait itself is what keeps the window open — the deadlocking
+    /// <c>DisconnectInternal</c> only runs once this callback returns. On success the host is
+    /// deliberately not retired, to observe whether the activations now complete on their own;
+    /// whether they do decides if hosts still need retiring at all.
+    /// </remarks>
+    private void StopChannelSynchronously(VpnChannel channel)
+    {
+        if (Interlocked.Exchange(ref _channelStopped, 1) != 0)
+        {
+            return;
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var stop = System.Threading.Tasks.Task.Run(() =>
+        {
+            try
+            {
+                channel.Stop();
+                PluginLog.Info($"Channel stopped synchronously in {stopwatch.ElapsedMilliseconds} ms");
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Error("Synchronous Stop failed", ex);
+            }
+        });
+
+        if (stop.Wait(TimeSpan.FromSeconds(8)))
+        {
+            ResetState();
+            return;
+        }
+
+        PluginLog.Error("Synchronous Stop did not return within 8 s; retiring the host around it");
+        ResetState();
+        RetireHost();
     }
 
     /// <summary>
