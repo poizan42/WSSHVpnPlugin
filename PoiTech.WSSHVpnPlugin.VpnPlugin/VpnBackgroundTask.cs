@@ -65,7 +65,9 @@ public sealed class VpnBackgroundTask : IBackgroundTask
     private static void OnCanceled(IBackgroundTaskInstance sender, BackgroundTaskCancellationReason reason)
     {
         ActivationYield.Request();
-        PluginLog.Info($"The platform asked an activation to cancel ({reason}); in-flight handlers will yield");
+        PluginLog.Info(
+            $"The platform asked an activation to cancel ({reason}), instance {sender?.InstanceId.ToString() ?? "?"}; "
+            + "in-flight handlers will yield");
     }
 
     /// <summary>
