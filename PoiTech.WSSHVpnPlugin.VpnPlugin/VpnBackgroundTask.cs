@@ -44,9 +44,11 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         // the epitaph. The handlers poll the yield window and return promptly.
         taskInstance.Canceled += OnCanceled;
 
+        var activation = 0;
+
         try
         {
-            LogActivation(taskInstance);
+            activation = LogActivation(taskInstance);
             VpnChannel.ProcessEventAsync(GetOrCreatePlugIn(), taskInstance.TriggerDetails);
         }
         catch (Exception ex)
@@ -59,6 +61,14 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         {
             taskInstance.Canceled -= OnCanceled;
             deferral.Complete();
+
+            // The completion is the other half of the activation log: the platform kills hosts
+            // over activations that never complete, and which ones those are is exactly what the
+            // start lines alone cannot say.
+            if (activation is > 0 and <= ActivationLogBudget)
+            {
+                PluginLog.Info($"Activation #{activation} completed ({taskInstance.InstanceId})");
+            }
         }
     }
 
@@ -77,18 +87,20 @@ public sealed class VpnBackgroundTask : IBackgroundTask
     /// Without this there is no way to tell "the platform never raised the event" from "it raised it
     /// and the plug-in returned early", which is exactly the question when no packet ever arrives.
     /// </remarks>
-    private static void LogActivation(IBackgroundTaskInstance taskInstance)
+    private static int LogActivation(IBackgroundTaskInstance taskInstance)
     {
         var count = Interlocked.Increment(ref _activations);
         if (count > ActivationLogBudget)
         {
-            return;
+            return count;
         }
 
         var details = taskInstance.TriggerDetails;
         PluginLog.Info(
-            $"Activation #{count}: trigger={taskInstance.Task?.Name ?? "?"}, "
+            $"Activation #{count} ({taskInstance.InstanceId}): trigger={taskInstance.Task?.Name ?? "?"}, "
             + $"details={details?.GetType().FullName ?? "null"}");
+
+        return count;
     }
 
     private static IVpnPlugIn GetOrCreatePlugIn()

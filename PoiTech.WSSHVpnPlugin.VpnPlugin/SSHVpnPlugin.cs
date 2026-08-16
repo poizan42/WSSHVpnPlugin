@@ -740,6 +740,10 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         try
         {
+            // Logged on entry as well as on return, because Stop has been observed to block: the
+            // sessions where "Channel stopped" never appeared are the sessions where the 90-second
+            // fuse then fired, so whether Stop returns is a fact worth having in the log.
+            PluginLog.Info($"Stopping the channel: {reason}");
             channel.Stop();
             PluginLog.Info($"Channel stopped: {reason}");
         }
