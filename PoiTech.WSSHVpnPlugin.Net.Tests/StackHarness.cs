@@ -97,13 +97,16 @@ internal sealed class FakeChannelFactory : IByteChannelFactory
     /// Deferred opens, oldest first. A queue rather than a single slot because more than one can be
     /// outstanding at once - which is the case a leaked channel hides in.
     /// </summary>
-    private readonly Queue<(Action<IByteChannel> OnOpened, Action OnFailed)> _pending = new();
+    private readonly Queue<(Action<IByteChannel> OnOpened, Action<ByteChannelOpenFailure> OnFailed)> _pending = new();
 
     /// <summary>Set to open channels as soon as they are asked for.</summary>
     public bool OpenImmediately { get; set; } = true;
 
     /// <summary>Set to fail every open.</summary>
     public bool FailOpens { get; set; }
+
+    /// <summary>What a failed open reports as its reason.</summary>
+    public ByteChannelOpenFailure FailureReason { get; set; } = ByteChannelOpenFailure.Refused;
 
     public FakeChannel? Last { get; private set; }
 
@@ -113,7 +116,7 @@ internal sealed class FakeChannelFactory : IByteChannelFactory
 
     public ushort LastPort { get; private set; }
 
-    public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed)
+    public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
     {
         OpenRequests++;
         LastAddress = address;
@@ -121,7 +124,7 @@ internal sealed class FakeChannelFactory : IByteChannelFactory
 
         if (FailOpens)
         {
-            onFailed();
+            onFailed(FailureReason);
             return;
         }
 
@@ -156,7 +159,7 @@ internal sealed class FakeChannelFactory : IByteChannelFactory
             throw new InvalidOperationException("No open is pending.");
         }
 
-        pending.OnFailed();
+        pending.OnFailed(FailureReason);
     }
 
     private FakeChannel Complete(Action<IByteChannel> onOpened)

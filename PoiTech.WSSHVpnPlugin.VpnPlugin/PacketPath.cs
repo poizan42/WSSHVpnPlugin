@@ -62,6 +62,7 @@ internal sealed class PacketPath : IDisposable
     private readonly StackLoop _stack;
     private readonly InboundPacketSink _sink;
     private readonly SshByteChannelFactory _factory;
+    private readonly RefusalCachingChannelFactory _refusals;
     private readonly Queue<byte[]> _outbound = new();
     private readonly object _gate = new();
     private readonly AutoResetEvent _wake = new(initialState: false);
@@ -82,9 +83,15 @@ internal sealed class PacketPath : IDisposable
 
     public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport, TimeSpan openTimeout)
     {
+        var clock = new MonotonicClock();
+
         _sink = new InboundPacketSink(queue, transport);
         _factory = new SshByteChannelFactory(client, Wake, openTimeout);
-        _stack = new StackLoop(_factory, _sink, new MonotonicClock())
+
+        // Between the stack and the real opens: destinations the server just refused are refused
+        // again from memory, so a peer that retries steadily does not cost a round trip per retry.
+        _refusals = new RefusalCachingChannelFactory(_factory, clock);
+        _stack = new StackLoop(_refusals, _sink, clock)
         {
             FlowStarted = key => PluginLog.Info(
                 $"flow {Ipv4Packet.Format(key.LocalAddress)}:{key.LocalPort} -> " +
@@ -263,7 +270,7 @@ internal sealed class PacketPath : IDisposable
                $"({_sink.Stalls} platform stall(s), {Interlocked.Read(ref Counters.WindowFull)} window-full); " +
                $"credit {deltaAdjusts / seconds:F1} adjust/s worth {creditRate:F1} Mbit/s; " +
                $"transport {deltaReads / seconds:F0} read/s avg {averageRead:F0} B in {microsPerRead:F0} us; " +
-               $"{_stack.Retransmissions} retransmission(s); " +
+               $"{_stack.Retransmissions} retransmission(s), {_refusals.RefusedFromCache} refused from cache; " +
                $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
                $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +
                $"over {dns.Channels} channel(s)";

@@ -18,6 +18,6 @@ internal interface IByteChannelFactory
     /// <param name="address">The destination address, in host byte order.</param>
     /// <param name="port">The destination port.</param>
     /// <param name="onOpened">Called with the channel once it is open.</param>
-    /// <param name="onFailed">Called if it could not be opened.</param>
-    void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed);
+    /// <param name="onFailed">Called with why, if it could not be opened.</param>
+    void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed);
 }

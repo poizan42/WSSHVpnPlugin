@@ -263,11 +263,13 @@ internal sealed class StackLoop
     /// </summary>
     private void OpenChannel(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed)
     {
+        // The reason stops here: a flow answers every failure the same way (a refusal to the
+        // peer), so only the factory layers below - the negative cache among them - care why.
         _channels.BeginOpen(
             address,
             port,
             channel => _arrivals.Enqueue(() => onOpened(channel)),
-            () => _arrivals.Enqueue(onFailed));
+            _ => _arrivals.Enqueue(onFailed));
     }
 
     /// <summary>

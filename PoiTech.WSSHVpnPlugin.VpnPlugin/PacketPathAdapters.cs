@@ -385,7 +385,7 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
     /// for the length of a rekey — and the stack's own thread must never wait on either. The worker
     /// is released at the first await rather than held for the server's answer.
     /// </remarks>
-    public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed)
+    public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
     {
         var host = Ipv4Format(address);
 
@@ -394,9 +394,10 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
             _ = Interlocked.Decrement(ref _live);
 
             // Refused rather than queued. The peer is told at once and can retry, which is far
-            // better than holding its SYN while a queue of doomed opens drains.
+            // better than holding its SYN while a queue of doomed opens drains. Local, not
+            // Refused: the cap says nothing about the destination.
             PluginLog.Error($"Refusing a channel to {host}:{port}: {MaximumLiveChannels} channels already live");
-            onFailed();
+            onFailed(ByteChannelOpenFailure.Local);
             _wake();
             return;
         }
@@ -413,7 +414,7 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
     /// slot is held for that whole time, because until the answer comes the server may be holding
     /// the channel too.
     /// </remarks>
-    private async Task OpenAsync(string host, ushort port, Action<IByteChannel> onOpened, Action onFailed)
+    private async Task OpenAsync(string host, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
     {
         DirectTcpipStream? stream = null;
 
@@ -433,9 +434,16 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
                 : ex.Message;
             PluginLog.Error($"Could not open a channel to {host}:{port}: {reason}");
 
+            // Only the server's own verdict about the destination is reported as a refusal - it is
+            // what the negative cache may remember. A timeout, a dead session, or a server that is
+            // merely out of resources says nothing about the address.
+            var failure = ex is Renci.SshNet.Common.SshChannelOpenException { IsAboutTheDestination: true }
+                ? ByteChannelOpenFailure.Refused
+                : ByteChannelOpenFailure.Local;
+
             // The peer is refused before the reap, not after: the reap can take as long as the
             // server needs to answer, and the flow should not wait on it.
-            onFailed();
+            onFailed(failure);
             _wake();
 
             if (stream is not null)
@@ -479,7 +487,7 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
         catch (Exception ex)
         {
             PluginLog.Error($"Could not hand the stack its channel to {host}:{port}", ex);
-            onFailed();
+            onFailed(ByteChannelOpenFailure.Local);
             _wake();
 
             if (channel is not null)
