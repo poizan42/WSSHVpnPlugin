@@ -142,23 +142,14 @@ public sealed partial class MainPage : Page
     {
         try
         {
+            // Plain RequestAccessAsync only. AlwaysAllowed was requested here for a while when the
+            // 90-second activation watchdog was suspected of being an energy quota; it made no
+            // difference - the real cause was the doorbell flooding the platform's delivery prolog
+            // (see CLAUDE.md) - so the request and the extendedBackgroundTaskTime capability were
+            // removed again.
             var before = BackgroundExecutionManager.GetAccessStatus();
             var after = await BackgroundExecutionManager.RequestAccessAsync();
             Log($"Background access: {before} -> {after}");
-
-            // AllowedSubjectToSystemPolicy is not enough: with the app "Managed by Windows" an
-            // energy quota still applies even with the extendedBackgroundTaskTime capability, and
-            // the platform cancelled the connection-long activation with ExecutionTimeExceeded
-            // mid-download once the tunnel's own CPU drained the quota. AlwaysAllowed is the level
-            // that switches the quota off; the user can also set it by hand under Settings > Apps >
-            // SSH VPN > background permissions.
-            if (after != BackgroundAccessStatus.AlwaysAllowed)
-            {
-                var kind = await BackgroundExecutionManager.RequestAccessKindAsync(
-                    BackgroundAccessRequestKind.AlwaysAllowed,
-                    "The VPN tunnel must keep running, and moving its traffic, for as long as it is connected.");
-                Log($"Background access (AlwaysAllowed requested): granted={kind}, now {BackgroundExecutionManager.GetAccessStatus()}");
-            }
         }
         catch (Exception ex)
         {

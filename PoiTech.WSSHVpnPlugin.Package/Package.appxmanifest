@@ -102,16 +102,6 @@
       certificate via RequestCredentials, this can go.
     -->
     <rescap:Capability Name="broadFileSystemAccess" />
-    <!--
-      Restricted capability: lifts background task execution time limits. The activation that
-      carries a connection lives as long as the connection, and its execution allowance is consumed
-      by the tunnel's own CPU: measured twice, the platform cancelled it with ExecutionTimeExceeded
-      after 2-3 minutes of 140 Mbit/s or ~13 minutes of lighter traffic, could not get the
-      connection-long task to complete in response, and executed the host mid-download - the
-      "dead replacement host" pattern. A cancel of that instance is unanswerable by design, so the
-      only fix is for the limit not to apply.
-    -->
-    <rescap:Capability Name="extendedBackgroundTaskTime" />
   </Capabilities>
 
   <Extensions>
