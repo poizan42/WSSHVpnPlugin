@@ -183,7 +183,9 @@ by experiment; each attempt costs a deploy, and the channel is **single-shot** (
   over RPC" — **`WaitForPushEnabled` returns `S_OK`**, observed under `cdbX64`, so the whole control
   channel trigger path including slot allocation works. `TakeTransportOwnership` also returns 0.
   The transport shape is irrelevant: a loopback datagram pair and a real remote TCP connection fail
-  and succeed identically.
+  and succeed identically. The CCT-broker theory's last artifact, a `<Task Type="controlChannel" />`
+  manifest declaration, was removed and verified unnecessary: connect and full-speed traffic work
+  with `vpnClient` as the only declared task type.
 - **Debugging `Start` is practical.** `Windows.Networking.Vpn.dll` has public PDB symbols
   (`VpnChannelImpl::StartInternal`, `TakeTransportOwnership`). The host is created per activation and
   exits on failure, so `<StartDelaySeconds>` in the profile makes it wait long enough to attach
