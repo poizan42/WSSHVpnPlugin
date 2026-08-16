@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using Windows.Networking.Vpn;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
@@ -74,6 +75,7 @@ internal sealed class InboundPacketQueue
     private IntPtr _channel2;
 
     private int _outstanding;
+    private int _draining;
 
     /// <summary>How many threads are inside the platform's acquire call right now.</summary>
     /// <remarks>
@@ -290,6 +292,44 @@ internal sealed class InboundPacketQueue
             packet = queued;
             return true;
         }
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether anything is queued right now.
+    /// </summary>
+    public bool HasQueued
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _queue.Count > 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether a decapsulate call is draining the queue right now.
+    /// </summary>
+    /// <remarks>
+    /// The producer skips its doorbell ring while this is set: the platform is already here, and
+    /// every ring becomes pending work its event pump has to clear before the activation that runs
+    /// the pump can complete - which, at line rate, it otherwise never does, and the platform
+    /// kills any activation that runs past 90 seconds. The drain's exit ring covers whatever was
+    /// queued while it ran, so a skipped ring is deferred, never lost.
+    /// </remarks>
+    public bool IsDraining => Volatile.Read(ref _draining) != 0;
+
+    /// <summary>Marks the start of a decapsulate drain.</summary>
+    public void BeginDrain()
+    {
+        Volatile.Write(ref _draining, 1);
+    }
+
+    /// <summary>Marks the end of a decapsulate drain.</summary>
+    public void EndDrain()
+    {
+        Volatile.Write(ref _draining, 0);
     }
 
     /// <summary>

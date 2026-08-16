@@ -635,6 +635,16 @@ internal sealed class InboundPacketSink : IPacketSink
             return;
         }
 
+        if (_queue.IsDraining)
+        {
+            // The platform is already draining, and its event pump has to clear every ring before
+            // the activation running it can complete - at line rate the per-batch rings kept it
+            // from ever finishing, and the platform kills activations at 90 seconds. The pending
+            // flag stays set, so the ring happens on a later pass unless the drain's own exit ring
+            // has made it unnecessary.
+            return;
+        }
+
         _pending = false;
         _transport.RingDoorbell();
     }

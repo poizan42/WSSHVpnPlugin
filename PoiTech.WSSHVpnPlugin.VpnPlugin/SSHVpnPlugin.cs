@@ -522,6 +522,8 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             return;
         }
 
+        inbound.BeginDrain();
+
         try
         {
             var spins = 0;
@@ -573,6 +575,16 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         }
         finally
         {
+            // The flag drops before the exit ring, so a producer that reads it as clear rings for
+            // itself and nothing can fall between the two: whatever was queued while this drain
+            // ran is covered either by its exit ring or by the producer's own.
+            inbound.EndDrain();
+
+            if (inbound.HasQueued)
+            {
+                GetTransport()?.RingDoorbell();
+            }
+
             VpnChannelAbi.Release(list);
         }
     }
@@ -738,22 +750,27 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             return;
         }
 
-        try
+        // Off this thread, always: StopChannel is reached from inside the platform's own callbacks
+        // (the final Decapsulate drain above), and Stop called from within a channel callback
+        // blocks - measured as "Stopping the channel" with no "Channel stopped" ever following,
+        // the disconnect activation then dying at the platform's 90-second watchdog. On a worker
+        // the callback returns, the activation completes, and Stop proceeds unobstructed.
+        _ = System.Threading.Tasks.Task.Run(() =>
         {
-            // Logged on entry as well as on return, because Stop has been observed to block: the
-            // sessions where "Channel stopped" never appeared are the sessions where the 90-second
-            // fuse then fired, so whether Stop returns is a fact worth having in the log.
-            PluginLog.Info($"Stopping the channel: {reason}");
-            channel.Stop();
-            PluginLog.Info($"Channel stopped: {reason}");
-        }
-        catch (Exception ex)
-        {
-            PluginLog.Error($"Stopping the channel failed ({reason})", ex);
-        }
+            try
+            {
+                PluginLog.Info($"Stopping the channel: {reason}");
+                channel.Stop();
+                PluginLog.Info($"Channel stopped: {reason}");
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Error($"Stopping the channel failed ({reason})", ex);
+            }
 
-        ResetState();
-        RetireHost();
+            ResetState();
+            RetireHost();
+        });
     }
 
     /// <summary>
