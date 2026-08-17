@@ -1,8 +1,8 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **not started** — design sketch and open questions, written down before the context that
-produced it evaporates. Nothing here is committed to; the current loopback-dummy architecture works
-(165 Mbit/s peak, clean lifecycle) and stays until every unknown below is answered cheaply.
+Status: **probe 1 answered (send path works, 2026-08-17); not otherwise started.** Nothing here is
+committed to; the current loopback-dummy architecture works (165 Mbit/s peak, clean lifecycle) and
+stays until the remaining unknowns below are answered cheaply.
 
 ## The idea
 
@@ -46,21 +46,22 @@ and the 90-second activation watchdog both still apply).
 
 ## What it stands or falls on — probe in this order
 
-1. **Does the plug-in-initiated send path actually transmit?** `AppendVpnSendPacketBuffer` +
-   `FlushVpnSendPacketBuffers` are the documented way to send outside any callback, but their
+1. **Does the plug-in-initiated send path actually transmit? ANSWERED YES — 2026-08-17.**
+   `AppendVpnSendPacketBuffer` + `FlushVpnSendPacketBuffers` transmit, immediately. Probed on the
+   live loopback build, which makes the verdict binary: the platform's side of the main transport
+   is cross-connected to our own back socket, so anything it transmits arrives there and nothing
+   else can. Three rounds from a timer worker thread outside any callback, alternating
+   `RequestVpnPacketBuffer(VpnDataPathType.Send, …)` and `GetVpnSendPacketBuffer`: every payload
+   arrived on the back socket **in the same millisecond as the flush**. The asymmetry with the
+   receive side is therefore real and proven in both directions on healthy channels: the
    receive-side twins (`AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers` from a
-   worker thread) **return success and silently deliver nothing** — the M0′(5) result, whose
-   provenance was challenged once (could it have been a pre-IPv6 session whose `Start` had
-   failed?) and then settled from the preserved session logs: every probe run was on a healthy
-   started channel (`StartWithMainTransport accepted (ipv6 1)`), and on the loopback builds
-   (2026-08-15/16) the doorbell path's ICMP echo landed milliseconds before each silent worker
-   append. Until the send side is proven different, the whole design is speculative. Cheapest
-   probe: during an established session on the *current* architecture, fill a send buffer with
-   bytes the SSH server will ignore, flush, and watch a packet capture for whether it hits the
-   wire of the (dummy) transport at all; then repeat with the real socket associated. Also probe:
-   does it work before `Start`? (The SSH handshake must transmit before any `Encapsulate` ever
-   fires. If not: `Start` first — the addresses are static, from the profile — then handshake
-   through the started channel.)
+   worker) return success and silently deliver nothing — the M0′(5) result, whose provenance was
+   challenged once (could it have been a pre-IPv6 session whose `Start` had failed?) and then
+   settled from the preserved session logs: every probe run was on a healthy started channel, and
+   on the loopback builds (2026-08-15/16) the doorbell path's ICMP echo landed milliseconds before
+   each silent worker append. Still untested: sending before `Start` (the probe armed after it).
+   Not load-bearing — the addresses are static, from the profile, so the fallback ordering
+   (`Start` first, then the SSH handshake through the started channel) is always available.
 2. **Ordering under concurrency**: SSH.NET serializes its writes, but confirm the platform
    preserves append order across flushes from different threads, and across the boundary with
    whatever the keep-alive path sends.
