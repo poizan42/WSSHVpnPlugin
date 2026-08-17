@@ -1,8 +1,9 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **probe 1 answered (send path works, 2026-08-17); not otherwise started.** Nothing here is
-committed to; the current loopback-dummy architecture works (165 Mbit/s peak, clean lifecycle) and
-stays until the remaining unknowns below are answered cheaply.
+Status: **probe 1 fully answered (2026-08-17): the send path works after `Start` and deadlocks
+before it; not otherwise started.** Nothing here is committed to; the current loopback-dummy
+architecture works (165 Mbit/s peak, clean lifecycle) and stays until the remaining unknowns below
+are answered cheaply.
 
 ## The idea
 
@@ -59,9 +60,18 @@ and the 90-second activation watchdog both still apply).
    challenged once (could it have been a pre-IPv6 session whose `Start` had failed?) and then
    settled from the preserved session logs: every probe run was on a healthy started channel, and
    on the loopback builds (2026-08-15/16) the doorbell path's ICMP echo landed milliseconds before
-   each silent worker append. Still untested: sending before `Start` (the probe armed after it).
-   Not load-bearing — the addresses are static, from the profile, so the fallback ordering
-   (`Start` first, then the SSH handshake through the started channel) is always available.
+   each silent worker append. The pre-`Start` half is also answered — **NO, and worse than a
+   refusal (2026-08-17)**: `RequestVpnPacketBuffer(VpnDataPathType.Send, …)` called after
+   `AssociateTransport` but before `Start*` **blocks indefinitely** — no return, no exception —
+   presumably waiting on buffer pools that only `VpnExeChannelCreate` (inside `Start*`) creates.
+   The blocked connect activation was cancelled by the platform (`Terminating`) ~5 s in, the host
+   killed, and the platform's automatic connect retries hit the same wedge in a **fresh host each
+   time** (a once-per-process latch contains nothing) until `ConnectProfileAsync` failed with
+   `ServerConnection` after three attempts. Two consequences: the design's connect ordering is
+   fixed as associate → `Start` (the addresses are static, from the profile) → SSH handshake
+   through the started channel; and probe hygiene — any probe touching the channel pre-`Start`
+   must run on a worker with a bounded wait, because an inline block burns the entire connect,
+   platform retries included.
 2. **Ordering under concurrency**: SSH.NET serializes its writes, but confirm the platform
    preserves append order across flushes from different threads, and across the boundary with
    whatever the keep-alive path sends.
