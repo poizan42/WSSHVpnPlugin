@@ -142,25 +142,6 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
-    /// Drives the control channel trigger directly, without a VPN channel.
-    /// </summary>
-    /// <remarks>
-    /// The trigger is the part that actually fails, and unlike a VPN channel it can be created and
-    /// discarded repeatedly — so this is where the failure can be narrowed down without a deploy and
-    /// an activation per attempt.
-    /// </remarks>
-    private async void OnTestCctClick(object sender, RoutedEventArgs e)
-    {
-        await RunAsync("Test CCT", async () =>
-        {
-            // The socket IOCTL first: that is the call the VPN platform actually fails on, and
-            // unlike the trigger it is a plain socket operation we can issue directly.
-            Log(TransportSettingProbe.Run());
-            Log(await CctProbe.RunAsync());
-        });
-    }
-
-    /// <summary>
     /// Dumps what the VPN platform actually has registered.
     /// </summary>
     /// <remarks>
@@ -345,7 +326,6 @@ public sealed partial class MainPage : Page
         DisconnectButton.IsEnabled = !busy;
         DeleteButton.IsEnabled = !busy;
         LoopbackButton.IsEnabled = !busy;
-        CctButton.IsEnabled = !busy;
         ListButton.IsEnabled = !busy;
     }
 
