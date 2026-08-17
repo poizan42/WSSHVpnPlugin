@@ -371,10 +371,15 @@ failed experiment, so check here before re-deriving any of it:
   wedged or unknown and a fresh host is the only safe successor. `Decapsulate` events are bounded
   (512 appends per call) for the same reason as the yield window — no single event may approach
   the watchdog.
-- **Worker-thread injection without the doorbell does not work.** The M0'(5) probe
-  (`RequestVpnPacketBuffer` + `AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers` from a
-  worker) appends without error and the packet is never delivered — every probe line in every log
-  lacks the echo that the doorbell path produces seconds earlier. The doorbell is load-bearing.
+- **Worker-thread injection without the doorbell did not work when tried — but the finding is
+  M0-era and suspect.** The M0'(5) probe (`RequestVpnPacketBuffer` + `AppendVpnReceivePacketBuffer`
+  + `FlushVpnReceivePacketBuffers` from a worker) appended without error and the packet was never
+  delivered. Provenance caveat: much of the M0 era ran before the empty-IPv6-address-list
+  requirement was discovered, in sessions where `Start*` may have failed — and a channel whose
+  `Start` was rejected is single-shot dead and would swallow injections silently. The logs are
+  gone, so this is **unverified on a healthy channel**, not disproven; re-test before building on
+  it in either direction. The doorbell is load-bearing in the current architecture regardless,
+  because nothing else has ever been shown to provoke a delivery.
 - **Forensics that worked**: activation start/completion logging with instance IDs (matches the ID
   in the cancel notification); a background watcher that tails `wsshvpn.log` and dumps the host
   when an activation is 55 s old and uncompleted; `.dump /ma` needs no symbols at capture time.
@@ -485,8 +490,9 @@ Deliberate, documented, and not to be silently papered over:
 - A designed-but-not-started alternative — SSH over the platform-owned transport via a pipe-backed
   `SshTransport`, killing the source-binding requirement — lives in
   `docs\experiments\platform-owned-transport.md`, including the ordered list of unknowns any
-  attempt must probe first (chief among them: the plug-in-initiated send path's receive-side twin
-  provably returns success while delivering nothing).
+  attempt must probe first (chief among them: whether the plug-in-initiated send path actually
+  transmits, and a re-test of its receive-side twin, whose M0-era "silent drop" result may be an
+  artifact of pre-IPv6 sessions where `Start*` had failed).
 
 ### The fork's transport seam
 

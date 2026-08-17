@@ -47,16 +47,21 @@ and the 90-second activation watchdog both still apply).
 ## What it stands or falls on — probe in this order
 
 1. **Does the plug-in-initiated send path actually transmit?** `AppendVpnSendPacketBuffer` +
-   `FlushVpnSendPacketBuffers` are the documented way to send outside any callback, but their
-   receive-side twins (`AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers` from a
-   worker thread) **return success and silently deliver nothing** — the M0′(5) result. Until the
-   send side is proven different, the whole design is speculative. Cheapest probe: during an
-   established session on the *current* architecture, associate nothing new — just fill a send
-   buffer with bytes the SSH server will ignore, flush, and watch a packet capture on the physical
-   NIC for whether it hits the wire of the (dummy) transport at all; then repeat with the real
-   socket associated. Also probe: does it work before `Start`? (The SSH handshake must transmit
-   before any `Encapsulate` ever fires. If not: `Start` first — the addresses are static, from the
-   profile — then handshake through the started channel.)
+   `FlushVpnSendPacketBuffers` are the documented way to send outside any callback. The caution
+   here used to be their receive-side twins (`AppendVpnReceivePacketBuffer` +
+   `FlushVpnReceivePacketBuffers` from a worker), which in the M0′(5) probe returned success and
+   silently delivered nothing — but that finding carries a provenance caveat: much of the M0 era
+   predates the discovery that `Start*` fails outright on an empty IPv6 address list, and a
+   channel whose `Start` was rejected is single-shot dead and would swallow injections silently.
+   The logs are gone. So probe **both directions on a healthy channel**: the send side because the
+   design stands on it, the receive side because if it works after all, the doorbell machinery
+   (and the second-transport question below) may dissolve too. Cheapest probe: during an
+   established session on the *current* architecture, fill a send buffer with bytes the SSH server
+   will ignore, flush, and watch a packet capture for whether it hits the wire of the (dummy)
+   transport at all; then repeat with the real socket associated. Also probe: does it work before
+   `Start`? (The SSH handshake must transmit before any `Encapsulate` ever fires. If not: `Start`
+   first — the addresses are static, from the profile — then handshake through the started
+   channel.)
 2. **Ordering under concurrency**: SSH.NET serializes its writes, but confirm the platform
    preserves append order across flushes from different threads, and across the boundary with
    whatever the keep-alive path sends.
@@ -72,11 +77,14 @@ and the 90-second activation watchdog both still apply).
 
 ## What survives even if everything works
 
-- **A doorbell, probably.** Timer-driven *inbound* injections still need a `Decapsulate` visit
-  with no inbound SSH data to provoke one — the clean case is the stack retransmitting a segment
-  to the client precisely because no ACK arrived: server idle, client silent, packet waiting,
-  no visit. Either accept that such packets wait for the next real inbound byte, or keep a
-  loopback `DatagramSocket` as the **second** transport (the API allows TCP + UDP;
+- **A doorbell, unless the receive-side re-test in probe 1 clears worker injection.** Timer-driven
+  *inbound* injections need a `Decapsulate` visit with no inbound SSH data to provoke one — the
+  clean case is the stack retransmitting a segment to the client precisely because no ACK arrived:
+  server idle, client silent, packet waiting, no visit. If `AppendVpnReceivePacketBuffer` +
+  `FlushVpnReceivePacketBuffers` turn out to work on a healthy channel (the M0-era silent-drop
+  result is suspect — see probe 1), injection needs no visit at all and the doorbell dies
+  entirely. Otherwise: either accept that such packets wait for the next real inbound byte, or
+  keep a loopback `DatagramSocket` as the **second** transport (the API allows TCP + UDP;
   `VpnPacketBuffer.TransportAffinity` steers buffers between them) purely as a doorbell.
 - The transition-ring discipline, the per-visit append bound, and the buffer-rotation invariant
   in `Encapsulate` — all of it is about the watchdog and buffer ownership, not about which socket
