@@ -482,6 +482,11 @@ Deliberate, documented, and not to be silently papered over:
   `<LargeFrameSize>` and the `<AssignIPv6>` switch were all removed once their questions were
   answered — the IPv6 address assignment is now unconditional, because there is no working value of
   "off". `<StartDelaySeconds>` stays; attaching a debugger to a per-activation host needs it.
+- A designed-but-not-started alternative — SSH over the platform-owned transport via a pipe-backed
+  `SshTransport`, killing the source-binding requirement — lives in
+  `docs\experiments\platform-owned-transport.md`, including the ordered list of unknowns any
+  attempt must probe first (chief among them: the plug-in-initiated send path's receive-side twin
+  provably returns success while delivering nothing).
 
 ### The fork's transport seam
 
