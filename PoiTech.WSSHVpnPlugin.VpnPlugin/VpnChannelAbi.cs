@@ -17,14 +17,15 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// cached interface pointer, and the inbound queue carries the pointers themselves.
 /// </para>
 /// <para>
-/// Every IID and slot index below was transcribed from the MIDL-generated headers in
+/// Each vtable below is a sequential struct whose fields are the function pointers in slot order,
+/// transcribed member-for-member from the MIDL-generated headers in
 /// <c>C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\winrt\</c> — not from memory or
 /// intuition, because this family has traps: <c>GetVpnReceivePacketBuffer</c> is on
 /// <c>IVpnChannel2</c>, not <c>IVpnChannel</c> (whose same-numbered slot is
 /// <c>LogDiagnosticMessage</c>); <c>put_Status</c> precedes <c>get_Status</c> on
 /// <c>IVpnPacketBuffer</c>; and <c>RemoveAtEnd</c> precedes <c>RemoveAtBegin</c> on
 /// <c>IVpnPacketBufferList</c>. A wrong slot with the same signature cannot be caught at runtime,
-/// so the header citation next to each constant is the review surface.
+/// so the struct layouts and their header citations are the review surface.
 /// </para>
 /// <para>
 /// Ownership contract, uniform across these helpers: every interface pointer returned through an
@@ -50,21 +51,196 @@ internal static unsafe class VpnChannelAbi
     // robuffer.h:27
     internal static readonly Guid IID_IBufferByteAccess = new("905a0fef-bc53-11df-8c49-001e4fc686da");
 
-    /// <summary>IUnknown slot 0.</summary>
-    internal static int QueryInterface(IntPtr ptr, in Guid iid, out IntPtr result)
+    /// <summary>
+    /// The three <c>IUnknown</c> slots that prefix every COM vtable. The interface-specific vtables
+    /// below embed this (via <see cref="InspectableVtable"/> for WinRT interfaces, directly for
+    /// <see cref="BufferByteAccessVtable"/>), so the inheritance chain is visible as layout.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct IUnknownVtable
     {
-        var value = default(IntPtr);
-        int hr;
+        private readonly IntPtr QueryInterfacePtr; // slot 0
+        private readonly IntPtr AddRefPtr;         // slot 1
+        private readonly IntPtr ReleasePtr;        // slot 2
 
-        fixed (Guid* riid = &iid)
+        public int QueryInterface(IntPtr thisPtr, in Guid iid, out IntPtr result)
         {
-            hr = ((delegate* unmanaged[Stdcall]<void*, Guid*, void**, int>)(*(void***)ptr)[0])(
-                (void*)ptr, riid, (void**)&value);
+            var value = default(IntPtr);
+            int hr;
+
+            fixed (Guid* riid = &iid)
+            {
+                hr = ((delegate* unmanaged[Stdcall]<void*, Guid*, void**, int>)QueryInterfacePtr)(
+                    (void*)thisPtr, riid, (void**)&value);
+            }
+
+            result = value;
+            return hr;
         }
 
-        result = value;
-        return hr;
+        public uint Release(IntPtr thisPtr)
+        {
+            return ((delegate* unmanaged[Stdcall]<void*, uint>)ReleasePtr)((void*)thisPtr);
+        }
     }
+
+    /// <summary>The six slots that prefix every WinRT (IInspectable-derived) vtable.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct InspectableVtable
+    {
+        private readonly IUnknownVtable IUnknown;       // slots 0-2
+        private readonly IntPtr GetIidsPtr;             // slot 3
+        private readonly IntPtr GetRuntimeClassNamePtr; // slot 4
+        private readonly IntPtr GetTrustLevelPtr;       // slot 5
+    }
+
+    /// <summary>IVpnChannel2 — windows.networking.vpn.h:12095.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct VpnChannel2Vtable
+    {
+        private readonly InspectableVtable IInspectable;      // slots 0-5
+        private readonly IntPtr StartWithMainTransportPtr;    // slot 6
+        private readonly IntPtr StartExistingTransportsPtr;   // slot 7
+        private readonly IntPtr AddActivityStateChangePtr;    // slot 8, add_ActivityStateChange
+        private readonly IntPtr RemoveActivityStateChangePtr; // slot 9, remove_ActivityStateChange
+        private readonly IntPtr GetVpnSendPacketBufferPtr;    // slot 10
+        private readonly IntPtr GetVpnReceivePacketBufferPtr; // slot 11
+
+        public int GetVpnReceivePacketBuffer(IntPtr thisPtr, out IntPtr packetBuffer)
+        {
+            var value = default(IntPtr);
+            var hr = ((delegate* unmanaged[Stdcall]<void*, void**, int>)GetVpnReceivePacketBufferPtr)(
+                (void*)thisPtr, (void**)&value);
+
+            packetBuffer = value;
+            return hr;
+        }
+    }
+
+    /// <summary>IVpnPacketBuffer — windows.networking.vpn.h:15001. put_Status precedes get_Status.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct VpnPacketBufferVtable
+    {
+        private readonly InspectableVtable IInspectable;    // slots 0-5
+        private readonly IntPtr GetBufferPtr;               // slot 6, get_Buffer
+        private readonly IntPtr PutStatusPtr;               // slot 7, put_Status
+        private readonly IntPtr GetStatusPtr;               // slot 8, get_Status
+        private readonly IntPtr PutTransportAffinityPtr;    // slot 9, put_TransportAffinity
+        private readonly IntPtr GetTransportAffinityPtr;    // slot 10, get_TransportAffinity
+
+        public int GetBuffer(IntPtr thisPtr, out IntPtr buffer)
+        {
+            var value = default(IntPtr);
+            var hr = ((delegate* unmanaged[Stdcall]<void*, void**, int>)GetBufferPtr)(
+                (void*)thisPtr, (void**)&value);
+
+            buffer = value;
+            return hr;
+        }
+    }
+
+    /// <summary>IVpnPacketBufferList — windows.networking.vpn.h:15306. RemoveAtEnd precedes RemoveAtBegin.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct VpnPacketBufferListVtable
+    {
+        private readonly InspectableVtable IInspectable; // slots 0-5
+        private readonly IntPtr AppendPtr;               // slot 6
+        private readonly IntPtr AddAtBeginPtr;           // slot 7
+        private readonly IntPtr RemoveAtEndPtr;          // slot 8
+        private readonly IntPtr RemoveAtBeginPtr;        // slot 9
+        private readonly IntPtr ClearPtr;                // slot 10
+        private readonly IntPtr PutStatusPtr;            // slot 11, put_Status
+        private readonly IntPtr GetStatusPtr;            // slot 12, get_Status
+        private readonly IntPtr GetSizePtr;              // slot 13, get_Size
+
+        public int Append(IntPtr thisPtr, IntPtr packetBuffer)
+        {
+            return ((delegate* unmanaged[Stdcall]<void*, void*, int>)AppendPtr)(
+                (void*)thisPtr, (void*)packetBuffer);
+        }
+
+        public int RemoveAtBegin(IntPtr thisPtr, out IntPtr packetBuffer)
+        {
+            var value = default(IntPtr);
+            var hr = ((delegate* unmanaged[Stdcall]<void*, void**, int>)RemoveAtBeginPtr)(
+                (void*)thisPtr, (void**)&value);
+
+            packetBuffer = value;
+            return hr;
+        }
+
+        public int GetSize(IntPtr thisPtr, out uint size)
+        {
+            uint value = 0;
+            var hr = ((delegate* unmanaged[Stdcall]<void*, uint*, int>)GetSizePtr)(
+                (void*)thisPtr, &value);
+
+            size = value;
+            return hr;
+        }
+    }
+
+    /// <summary>IBuffer — windows.storage.streams.h:4140.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct BufferVtable
+    {
+        private readonly InspectableVtable IInspectable; // slots 0-5
+        private readonly IntPtr GetCapacityPtr;          // slot 6, get_Capacity
+        private readonly IntPtr GetLengthPtr;            // slot 7, get_Length
+        private readonly IntPtr PutLengthPtr;            // slot 8, put_Length
+
+        public int GetCapacity(IntPtr thisPtr, out uint capacity)
+        {
+            uint value = 0;
+            var hr = ((delegate* unmanaged[Stdcall]<void*, uint*, int>)GetCapacityPtr)(
+                (void*)thisPtr, &value);
+
+            capacity = value;
+            return hr;
+        }
+
+        public int GetLength(IntPtr thisPtr, out uint length)
+        {
+            uint value = 0;
+            var hr = ((delegate* unmanaged[Stdcall]<void*, uint*, int>)GetLengthPtr)(
+                (void*)thisPtr, &value);
+
+            length = value;
+            return hr;
+        }
+
+        public int PutLength(IntPtr thisPtr, uint length)
+        {
+            return ((delegate* unmanaged[Stdcall]<void*, uint, int>)PutLengthPtr)(
+                (void*)thisPtr, length);
+        }
+    }
+
+    /// <summary>
+    /// IBufferByteAccess — robuffer.h:27. Derives from IUnknown, not IInspectable — the embedded
+    /// three-slot head (where every other vtable here embeds the six-slot one) is why its first
+    /// method is slot 3, not 6.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct BufferByteAccessVtable
+    {
+        private readonly IUnknownVtable IUnknown; // slots 0-2
+        private readonly IntPtr BufferPtr;        // slot 3, Buffer
+
+        public int Buffer(IntPtr thisPtr, out byte* data)
+        {
+            byte* value = null;
+            var hr = ((delegate* unmanaged[Stdcall]<void*, byte**, int>)BufferPtr)(
+                (void*)thisPtr, &value);
+
+            data = value;
+            return hr;
+        }
+    }
+
+    /// <summary>IUnknown slot 0.</summary>
+    internal static int QueryInterface(IntPtr ptr, in Guid iid, out IntPtr result)
+        => (*(IUnknownVtable**)ptr)->QueryInterface(ptr, in iid, out result);
 
     /// <summary>IUnknown slot 2. Tolerates zero so cleanup paths need no guards.</summary>
     internal static void Release(IntPtr ptr)
@@ -74,102 +250,44 @@ internal static unsafe class VpnChannelAbi
             return;
         }
 
-        _ = ((delegate* unmanaged[Stdcall]<void*, uint>)(*(void***)ptr)[2])((void*)ptr);
+        _ = (*(IUnknownVtable**)ptr)->Release(ptr);
     }
 
-    /// <summary>IVpnChannel2 slot 11 — windows.networking.vpn.h:12095. Slot 10 is GetVpnSendPacketBuffer.</summary>
+    /// <summary>IVpnChannel2 slot 11. Slot 10 is GetVpnSendPacketBuffer.</summary>
     internal static int GetReceiveBuffer(IntPtr channel2, out IntPtr packetBuffer)
-    {
-        var value = default(IntPtr);
-        var hr = ((delegate* unmanaged[Stdcall]<void*, void**, int>)(*(void***)channel2)[11])(
-            (void*)channel2, (void**)&value);
+        => (*(VpnChannel2Vtable**)channel2)->GetVpnReceivePacketBuffer(channel2, out packetBuffer);
 
-        packetBuffer = value;
-        return hr;
-    }
-
-    /// <summary>IVpnPacketBuffer slot 6, get_Buffer — windows.networking.vpn.h:15001.</summary>
+    /// <summary>IVpnPacketBuffer slot 6, get_Buffer.</summary>
     internal static int GetBuffer(IntPtr packetBuffer, out IntPtr buffer)
-    {
-        var value = default(IntPtr);
-        var hr = ((delegate* unmanaged[Stdcall]<void*, void**, int>)(*(void***)packetBuffer)[6])(
-            (void*)packetBuffer, (void**)&value);
+        => (*(VpnPacketBufferVtable**)packetBuffer)->GetBuffer(packetBuffer, out buffer);
 
-        buffer = value;
-        return hr;
-    }
-
-    /// <summary>IBuffer slot 6, get_Capacity — windows.storage.streams.h:4140.</summary>
+    /// <summary>IBuffer slot 6, get_Capacity.</summary>
     internal static int GetCapacity(IntPtr buffer, out uint capacity)
-    {
-        uint value = 0;
-        var hr = ((delegate* unmanaged[Stdcall]<void*, uint*, int>)(*(void***)buffer)[6])(
-            (void*)buffer, &value);
+        => (*(BufferVtable**)buffer)->GetCapacity(buffer, out capacity);
 
-        capacity = value;
-        return hr;
-    }
-
-    /// <summary>IBuffer slot 7, get_Length — windows.storage.streams.h:4142.</summary>
+    /// <summary>IBuffer slot 7, get_Length.</summary>
     internal static int GetLength(IntPtr buffer, out uint length)
-    {
-        uint value = 0;
-        var hr = ((delegate* unmanaged[Stdcall]<void*, uint*, int>)(*(void***)buffer)[7])(
-            (void*)buffer, &value);
+        => (*(BufferVtable**)buffer)->GetLength(buffer, out length);
 
-        length = value;
-        return hr;
-    }
-
-    /// <summary>IBuffer slot 8, put_Length — windows.storage.streams.h:4144.</summary>
+    /// <summary>IBuffer slot 8, put_Length.</summary>
     internal static int SetLength(IntPtr buffer, uint length)
-    {
-        return ((delegate* unmanaged[Stdcall]<void*, uint, int>)(*(void***)buffer)[8])(
-            (void*)buffer, length);
-    }
+        => (*(BufferVtable**)buffer)->PutLength(buffer, length);
 
-    /// <summary>
-    /// IBufferByteAccess slot 3, Buffer — robuffer.h:30. Derives from IUnknown, not IInspectable,
-    /// so there are no IInspectable slots and the first method is slot 3, not 6.
-    /// </summary>
+    /// <summary>IBufferByteAccess slot 3, Buffer.</summary>
     internal static int GetBytes(IntPtr byteAccess, out byte* data)
-    {
-        byte* value = null;
-        var hr = ((delegate* unmanaged[Stdcall]<void*, byte**, int>)(*(void***)byteAccess)[3])(
-            (void*)byteAccess, &value);
+        => (*(BufferByteAccessVtable**)byteAccess)->Buffer(byteAccess, out data);
 
-        data = value;
-        return hr;
-    }
-
-    /// <summary>IVpnPacketBufferList slot 6, Append — windows.networking.vpn.h:15306. The list takes its own reference.</summary>
+    /// <summary>IVpnPacketBufferList slot 6, Append. The list takes its own reference.</summary>
     internal static int ListAppend(IntPtr list, IntPtr packetBuffer)
-    {
-        return ((delegate* unmanaged[Stdcall]<void*, void*, int>)(*(void***)list)[6])(
-            (void*)list, (void*)packetBuffer);
-    }
+        => (*(VpnPacketBufferListVtable**)list)->Append(list, packetBuffer);
 
-    /// <summary>IVpnPacketBufferList slot 9, RemoveAtBegin — windows.networking.vpn.h:15312. Slot 8 is RemoveAtEnd.</summary>
+    /// <summary>IVpnPacketBufferList slot 9, RemoveAtBegin. Slot 8 is RemoveAtEnd.</summary>
     internal static int ListRemoveAtBegin(IntPtr list, out IntPtr packetBuffer)
-    {
-        var value = default(IntPtr);
-        var hr = ((delegate* unmanaged[Stdcall]<void*, void**, int>)(*(void***)list)[9])(
-            (void*)list, (void**)&value);
+        => (*(VpnPacketBufferListVtable**)list)->RemoveAtBegin(list, out packetBuffer);
 
-        packetBuffer = value;
-        return hr;
-    }
-
-    /// <summary>IVpnPacketBufferList slot 13, get_Size — windows.networking.vpn.h:15322.</summary>
+    /// <summary>IVpnPacketBufferList slot 13, get_Size.</summary>
     internal static int ListSize(IntPtr list, out uint size)
-    {
-        uint value = 0;
-        var hr = ((delegate* unmanaged[Stdcall]<void*, uint*, int>)(*(void***)list)[13])(
-            (void*)list, &value);
-
-        size = value;
-        return hr;
-    }
+        => (*(VpnPacketBufferListVtable**)list)->GetSize(list, out size);
 
     /// <summary>
     /// Gets an owned <c>IVpnChannel2</c> pointer from the projected channel.
@@ -270,7 +388,7 @@ internal static unsafe class VpnChannelAbi
     /// <remarks>
     /// Catches a wrong slot whose return is not an interface pointer at all — an uninitialized
     /// out-value, a property value misread as a pointer. What it cannot catch is a same-signature
-    /// neighbor slot; only the header citations guard those.
+    /// neighbor slot; only the vtable structs and their header citations guard those.
     /// </remarks>
     internal static bool VerifyPacketShape(IntPtr packetBuffer, IntPtr buffer, uint capacity, out string why)
     {
