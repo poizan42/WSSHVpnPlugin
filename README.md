@@ -53,10 +53,16 @@ Three pieces have to agree, and each was a separate build failure to get there:
 2. The same manifest declares a package-level `windows.activatableClass.inProcessServer` naming
    `VpnBackgroundTask`. Packaging fails without it ("not allowed to have EntryPoint=... without
    ActivatableClassId").
-3. `<Path>` in that registration points at the app's native executable, which must export
-   `DllGetActivationFactory`. CsWinRT's source generator emits one in the component assembly, but
-   Native AOT links the component into the app's exe, so the app project carries
-   `UnmanagedEntryPointsAssembly` and `/EXPORT:DllGetActivationFactory` to keep and re-export it.
+3. `<Path>` in that registration points at the plug-in's own native executable, which must export
+   `DllGetActivationFactory`. CsWinRT's source generator emits one in the component assembly, and
+   the plug-in project carries `UnmanagedEntryPointsAssembly` and `/EXPORT:DllGetActivationFactory`
+   to keep Native AOT from trimming it and to export it.
+
+The plug-in is deliberately its own executable and process, separate from the XAML app: hosting the
+tunnel inside a XAML application's process meant PLM's suspend path ran `GC.Collect()` in the VPN
+host, which deadlocked it and got it killed as hung 45–75 seconds after every connect. The host's
+`Main` is `CoreApplication.RunWithActivationFactories(...)` — what `Application.Start` does, minus
+XAML — and the app project must not reference the plug-in project.
 
 `networkingVpnProvider` is a restricted capability: fine for sideloading, needs Microsoft approval
 for Store submission.

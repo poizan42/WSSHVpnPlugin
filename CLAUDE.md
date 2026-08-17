@@ -29,6 +29,17 @@ Add-AppxPackage -Register PoiTech.WSSHVpnPlugin.Package\bin\x64\Debug\AppxManife
 Get-AppxPackage *3703e6b2-f1f9-447d-b506-da47be3094ff* | Remove-AppxPackage
 ```
 
+Deploy-loop practicalities, each learned by hitting it:
+
+- The package registers the **loose build output**, so a running host or app locks the files and
+  fails the build's copy step. Run a kill loop for `PoiTech.WSSHVpnPlugin.VpnPlugin` and
+  `PoiTech.WSSHVpnPlugin.App` for the build's duration. A deploy also tears down the user's live
+  tunnel — coordinate before building when a session is up.
+- Re-registering in place is enough for code changes. A **manifest change** fails it with
+  `0x80073CFB`; that needs `Remove-AppxPackage` + register, which resets the
+  `broadFileSystemAccess` consent (see below) **and wipes `wsshvpn.log`** — copy the log out first
+  if anything in it still matters.
+
 ## Tests
 
 `PoiTech.WSSHVpnPlugin.Net.Tests` covers the stack, and is the only fast loop in the repo — plain
@@ -527,5 +538,14 @@ been removed in .NET 5+. Import the namespace before concluding it's missing.
   writes by default — so expect a mix until they are touched.
 - The plug-in runs in the background task host with no debugger attached; `PluginLog` appends to
   `wsshvpn.log` in the package local folder. Prefer adding to that over `Debug.WriteLine` alone.
+  **Log timestamps are UTC**; the app's status pane and the Windows event log are local time —
+  correlate accordingly before concluding two events don't line up.
 - Host keys are pinned from the profile, and an unpinned key is **refused** rather than trusted on
   first use — a background task has no UI to prompt from. Don't relax this to make testing easier.
+- **This repo and the fork are public.** Machine-specific configuration (server address, user name,
+  key path, LAN ranges, adapter names) lives in the app's local settings and the log, deliberately —
+  keep it out of commits, including commit messages and comments quoting log lines.
+- `dumps\` is gitignored and holds crash/hang dumps, log backups and the forensic watcher scripts.
+  Dump analysis works offline: `cdbX64 -z <dump> -y "srv*<local symcache>*https://msdl.microsoft.com/download/symbols"`
+  — capture needs no symbols, and PDBs fetched once are cached, which matters because a wedged
+  tunnel blocks new connections including the symbol server's.
