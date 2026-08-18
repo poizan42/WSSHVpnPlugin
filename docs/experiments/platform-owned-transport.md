@@ -32,7 +32,23 @@ CCW.** Everything below the line was the probe era; the build's measured results
   **introduced in Build 26100**, so any implementation must remain strictly optional: older
   platforms never QI for it, and nothing may depend on its callbacks arriving.
 
-Remaining: the full throughput-ladder rerun (the 6.1 GB ISO) against master's 165 Mbit/s peak.
+**The true caps, measured (2026-08-18)** — every earlier number, master's 165 Mbit/s included,
+had Canonical's servers as an uncontrolled variable; the honest measurement is iperf3 against a
+loopback alias on the SSH server (`sudo ip addr add 198.51.100.1/32 dev lo`), because the
+server's own address is excluded from the tunnel: **the platform's pinning is a host route**
+(`212.71.253.111/32 → physical NIC`, observed) — a first iperf against the server's real address
+bypassed the tunnel entirely and measured the raw line instead (~500–630 Mbit/s down, ~110 up,
+nominally 1000/100).
+
+- Tunnel: **136 Mbit/s down single-stream, 151–158 down with 4 parallel, 38.8 up.**
+- The cap is CPU in our own single-threaded pipeline, not the platform path (deliveries ran at
+  ~5% of the serial ceiling): `wsshvpn-stack` at ~74% of a core (sampled mid
+  channel-dispose churn on top of packetization) and the SSH `MessageListener` at ~50%, caught
+  inside `HMACSHA256.TransformBlock → BCryptHashData` — the negotiated suite is CTR+HMAC, not
+  AES-GCM, so every packet pays a separate BCrypt MAC pass. This also explains why master and
+  this branch land in the same band: they share both threads.
+- Next optimization territory (beyond this experiment): cipher negotiation (AES-GCM would delete
+  the HMAC pass), the upload path (38.8 vs the line's ~110), and T-Stack's per-packet costs.
 
 ---
 
