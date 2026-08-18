@@ -71,6 +71,22 @@ architecture never was the bottleneck at these rates.
    channel-teardown churn; the iperf parallel runs open and close channels far less than a browser
    does, so the 74% under a single long-lived flow is mostly steady-state cost.
 
+## Addendum (2026-08-19): the dispose frame, resolved
+
+The teardown churn was chased and fixed. The snapshot's dispose frame turned out to be a defeated
+deferral: `DirectTcpipByteChannel.Dispose` fire-and-forgot `DisposeStreamAsync()`, but the
+zero-timeout close awaits `Task.WaitAsync(TimeSpan.Zero, …)` whose fast path returns an
+already-faulted task — the await completed synchronously and the whole teardown ran inline on
+T-Stack: the EOF+CLOSE sends (encrypt+MAC under the session's write lock, blockable by rekey),
+twelve session-event unsubscriptions (each an O(live-channels) delegate-array copy), and the
+kernel-handle closes (one of which, `_channelData`, was dead and is deleted).
+`Task.Run(DisposeStreamAsync)` moved it to workers, and new permanent instrumentation priced it:
+**700–1,950 µs per reap**. The steady-state single-flow ceiling did not move (126–127 Mbit/s with
+concurrent browsing vs the 136 clean baseline; T-Stack still ~72% of a core mid-download) —
+confirming this section's caveat that a long-lived flow barely churns channels. The win is churn
+smoothness and the removal of a rekey-length block hazard from the hot thread; the ceiling still
+belongs to the cipher work above.
+
 ## Caveats
 
 - Thread attribution rests on per-second CPU deltas (robust) plus a single stack snapshot per
