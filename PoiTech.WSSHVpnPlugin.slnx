@@ -17,7 +17,9 @@
   <Project Path="PoiTech.WSSHVpnPlugin.Package/PoiTech.WSSHVpnPlugin.Package.wapproj" Type="c7167f0d-bc9f-4e6e-afe1-012c56b48db5" Id="c333db51-8f1d-47e7-9cd1-5f8912209199">
     <Deploy />
   </Project>
-  <Project Path="PoiTech.WSSHVpnPlugin.VpnPlugin/PoiTech.WSSHVpnPlugin.VpnPlugin.csproj" />
+  <Project Path="PoiTech.WSSHVpnPlugin.VpnPlugin/PoiTech.WSSHVpnPlugin.VpnPlugin.csproj">
+    <Platform Solution="*|Any CPU" Project="x64" />
+  </Project>
   <Project Path="PoiTech.WSSHVpnPlugin.Net/PoiTech.WSSHVpnPlugin.Net.csproj" />
   <Project Path="PoiTech.WSSHVpnPlugin.Net.Tests/PoiTech.WSSHVpnPlugin.Net.Tests.csproj" />
   <Project Path="SSH.NET/src/Renci.SshNet/Renci.SshNet.csproj" />
