@@ -70,6 +70,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private SshVpnConnection? _connection;
     private IOuterTransport? _transport;
     private InboundPacketQueue? _inbound;
+    private Renci.SshNet.Connection.PipeSshTransport? _pipe;
     private Timer? _stopWatchdog;
     private int _channelStopped;
     private int _decapsulateCalls;
@@ -120,23 +121,21 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 throw new InvalidOperationException("No SSH user name was configured or supplied.");
             }
 
-            // SSH runs on a socket of its own, bound to a physical interface so that it does not
-            // route into the tunnel it is about to carry.
-            var connection = SshVpnConnection.Establish(
-                configuration,
-                userName,
-                credential?.PasskeyCredential?.Password ?? string.Empty,
-                OutboundInterface.Select(configuration.NetworkAdapter));
-
-            IOuterTransport transport = LoopbackTransport.Create(channel);
+            // The platform-owned-transport ordering, forced at both ends: sends through the
+            // channel deadlock before Start (the acquire waits on pools only Start creates), and
+            // deliveries flow from AssociateTransport - so the socket is associated and connected
+            // first, the channel started second, and SSH established through it last. The SSH
+            // socket is deliberately unbound: pinning the outer flow is the platform's job now.
+            var transport = PlatformOwnedTransport.Create(channel, configuration);
 
             var inbound = new InboundPacketQueue(channel);
+            var pipe = new Renci.SshNet.Connection.PipeSshTransport(transport.Send);
 
             lock (_stateGate)
             {
-                _connection = connection;
                 _transport = transport;
                 _inbound = inbound;
+                _pipe = pipe;
                 _channelStopped = 0;
             }
 
@@ -152,8 +151,24 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             // ask for packets as soon as the channel starts.
             StartChannel(channel, configuration, transport);
 
-            // The packet path needs the queue and the doorbell, neither of which exists until the
-            // channel has started.
+            // The handshake rides the started channel: Decapsulate feeds the pipe on the
+            // platform's threads while Session.Connect blocks here, on the activation thread.
+            var handshake = System.Diagnostics.Stopwatch.StartNew();
+            var connection = SshVpnConnection.EstablishOverChannel(
+                configuration,
+                userName,
+                credential?.PasskeyCredential?.Password ?? string.Empty,
+                new Renci.SshNet.Connection.PipeSshTransportFactory(pipe));
+
+            PluginLog.Info($"SSH over the platform-owned transport in {handshake.ElapsedMilliseconds} ms");
+
+            lock (_stateGate)
+            {
+                _connection = connection;
+            }
+
+            // The packet path needs the queue, which exists; the doorbell is a no-op on this
+            // transport, so injection rides the data-driven decapsulate visits.
             connection.AttachPacketPath(inbound, transport);
         }
         catch (Exception ex)
@@ -172,7 +187,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     }
 
     /// <summary>
-    /// Starts the channel over the loopback dummy transport.
+    /// Starts the channel over the platform-owned transport.
     /// </summary>
     /// <remarks>
     /// Exactly one attempt: the channel is single-shot, and a second call after a rejected one
@@ -189,7 +204,13 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         var ipv6 = new List<HostName> { new HostName("fd00::2") };
 
         var mtu = configuration.Mtu;
-        var frameSize = GetMaxFrameSize(configuration.Mtu);
+
+        // The gamble this branch tests: the frame size may cap both directions' buffers, and
+        // 1500-byte deliveries at line rate is the serial-cost death scenario (~8,300/s against a
+        // measured ~8,500/s ceiling). The docs' 1500 ceiling applied to mtu+encapsulation on the
+        // old architecture; here the wire is an SSH byte stream and the buffers carry stream
+        // chunks, not frames. If Start rejects this, one redeploy falls back to 1500.
+        const uint frameSize = 65536;
 
         try
         {
@@ -211,23 +232,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             PluginLog.Error($"StartWithMainTransport rejected: 0x{ex.HResult:X8}", ex);
             throw;
         }
-    }
-
-    /// <summary>
-    /// Gets the frame size to advertise for the given MTU.
-    /// </summary>
-    /// <remarks>
-    /// The platform sizes the send buffer pool from this and documents a hard ceiling of 1500,
-    /// reducing either the MTU or the encapsulation overhead if the sum would exceed it. We add no
-    /// encapsulation of our own — the SSH session owns the wire — so the MTU alone would do; the
-    /// clamp exists so that a profile configuring a larger MTU degrades rather than being rejected.
-    /// </remarks>
-    private static uint GetMaxFrameSize(uint mtu)
-    {
-        const uint PlatformMaxFrameSize = 1500;
-        const uint HeaderRoom = 128;
-
-        return Math.Min(mtu + HeaderRoom, PlatformMaxFrameSize);
     }
 
     /// <summary>
@@ -554,6 +558,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             return;
         }
 
+        // The platform-owned transport's inbound half: whatever the platform read from the wire
+        // arrives here, and the pipe carries it to the SSH session's listener thread. Raw reads,
+        // zero WinRT objects; DeliveryStats is the architecture's go/no-go instrumentation.
+        FeedPipe(encapBuffer);
+
         LogFirstDecapsulateCalls(encapBuffer);
 
         var hrList = VpnChannelAbi.GetList(decapsulatedPackets, out var list);
@@ -627,6 +636,62 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             }
 
             VpnChannelAbi.Release(list);
+        }
+    }
+
+    /// <summary>
+    /// Hands the wire bytes a decapsulate visit delivered to the SSH session's pipe.
+    /// </summary>
+    /// <remarks>
+    /// Every visit is counted — the delivery rate is half the go/no-go number — and the bytes are
+    /// read raw: <c>get_Buffer</c>, the <c>IBufferByteAccess</c> QI, <c>get_Length</c>, one copy
+    /// into the pipe, everything released before returning. The buffer stays the platform's; only
+    /// its content leaves.
+    /// </remarks>
+    private unsafe void FeedPipe(VpnPacketBuffer? encapBuffer)
+    {
+        Renci.SshNet.Connection.PipeSshTransport? pipe;
+        lock (_stateGate)
+        {
+            pipe = _pipe;
+        }
+
+        if (pipe is null)
+        {
+            return;
+        }
+
+        if (encapBuffer is null)
+        {
+            DeliveryStats.Record(0);
+            return;
+        }
+
+        var packet = ((WinRT.IWinRTObject)encapBuffer).NativeObject.ThisPtr;
+        var hr = VpnChannelAbi.AcquireReadSpan(packet, out var buffer, out var byteAccess, out var data, out var length);
+
+        if (hr < 0)
+        {
+            PluginLog.Error($"Reading a transport delivery failed (0x{hr:X8})");
+            GC.KeepAlive(encapBuffer);
+            return;
+        }
+
+        try
+        {
+            DeliveryStats.Record(length);
+
+            if (length > 0)
+            {
+                pipe.Deliver(new ReadOnlySpan<byte>(data, (int)length));
+            }
+        }
+        finally
+        {
+            VpnChannelAbi.ReleaseSpan(buffer, byteAccess);
+
+            // ThisPtr is borrowed from the projected parameter; it must outlive the raw calls.
+            GC.KeepAlive(encapBuffer);
         }
     }
 
@@ -752,6 +817,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         IOuterTransport? transport;
         InboundPacketQueue? inbound;
+        Renci.SshNet.Connection.PipeSshTransport? pipe;
         Timer? watchdog;
 
         lock (_stateGate)
@@ -760,11 +826,17 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             _transport = null;
             inbound = _inbound;
             _inbound = null;
+            pipe = _pipe;
+            _pipe = null;
             watchdog = _stopWatchdog;
             _stopWatchdog = null;
         }
 
         watchdog?.Dispose();
+
+        // Session teardown disposes the transport it was handed; this covers the paths where the
+        // session never existed (a failed connect) or never took it. Dispose is idempotent.
+        pipe?.Dispose();
         transport?.Dispose();
 
         // The queue holds raw references now - to still-queued packet buffers and to the channel

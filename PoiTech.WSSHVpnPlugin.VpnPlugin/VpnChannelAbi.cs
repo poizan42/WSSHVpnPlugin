@@ -39,6 +39,10 @@ internal static unsafe class VpnChannelAbi
     // windows.networking.vpn.h:3496
     internal static readonly Guid IID_IVpnChannel2 = new("2255d165-993b-4629-ad60-f1c3f3537f50");
 
+    // windows.networking.vpn.h:3663 — the interface carrying the out-of-band Append/Flush send
+    // lane (UniversalApiContract 12.0).
+    internal static readonly Guid IID_IVpnChannel5 = new("de7a0992-8384-4fbc-882c-1fd23124cd3b");
+
     // windows.networking.vpn.h:5097
     internal static readonly Guid IID_IVpnPacketBuffer = new("c2f891fc-4d5c-4a63-b70d-4e307eacce55");
 
@@ -114,6 +118,39 @@ internal static unsafe class VpnChannelAbi
 
             packetBuffer = value;
             return hr;
+        }
+
+        public int GetVpnSendPacketBuffer(IntPtr thisPtr, out IntPtr packetBuffer)
+        {
+            var value = default(IntPtr);
+            var hr = ((delegate* unmanaged[Stdcall]<void*, void**, int>)GetVpnSendPacketBufferPtr)(
+                (void*)thisPtr, (void**)&value);
+
+            packetBuffer = value;
+            return hr;
+        }
+    }
+
+    /// <summary>IVpnChannel5 — windows.networking.vpn.h:12317, the out-of-band Append/Flush lane.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct VpnChannel5Vtable
+    {
+        private readonly InspectableVtable IInspectable;         // slots 0-5
+        private readonly IntPtr AppendVpnReceivePacketBufferPtr; // slot 6, h:12333
+        private readonly IntPtr AppendVpnSendPacketBufferPtr;    // slot 7, h:12335
+        private readonly IntPtr FlushVpnReceivePacketBuffersPtr; // slot 8, h:12337
+        private readonly IntPtr FlushVpnSendPacketBuffersPtr;    // slot 9, h:12338
+
+        public int AppendVpnSendPacketBuffer(IntPtr thisPtr, IntPtr packetBuffer)
+        {
+            return ((delegate* unmanaged[Stdcall]<void*, void*, int>)AppendVpnSendPacketBufferPtr)(
+                (void*)thisPtr, (void*)packetBuffer);
+        }
+
+        public int FlushVpnSendPacketBuffers(IntPtr thisPtr)
+        {
+            return ((delegate* unmanaged[Stdcall]<void*, int>)FlushVpnSendPacketBuffersPtr)(
+                (void*)thisPtr);
         }
     }
 
@@ -257,6 +294,22 @@ internal static unsafe class VpnChannelAbi
     internal static int GetReceiveBuffer(IntPtr channel2, out IntPtr packetBuffer)
         => (*(VpnChannel2Vtable**)channel2)->GetVpnReceivePacketBuffer(channel2, out packetBuffer);
 
+    /// <summary>
+    /// IVpnChannel2 slot 10. Same-index trap, both directions load-bearing: IVpnChannel's slots
+    /// 10/11 are RequestVpnPacketBuffer/LogDiagnosticMessage, IVpnChannel2's are the
+    /// GetVpnSendPacketBuffer/GetVpnReceivePacketBuffer pair.
+    /// </summary>
+    internal static int GetSendBuffer(IntPtr channel2, out IntPtr packetBuffer)
+        => (*(VpnChannel2Vtable**)channel2)->GetVpnSendPacketBuffer(channel2, out packetBuffer);
+
+    /// <summary>IVpnChannel5 slot 7. The channel takes its own reference; the caller's must still be released.</summary>
+    internal static int AppendSendBuffer(IntPtr channel5, IntPtr packetBuffer)
+        => (*(VpnChannel5Vtable**)channel5)->AppendVpnSendPacketBuffer(channel5, packetBuffer);
+
+    /// <summary>IVpnChannel5 slot 9. Transmits everything appended since the last flush, in append order.</summary>
+    internal static int FlushSendBuffers(IntPtr channel5)
+        => (*(VpnChannel5Vtable**)channel5)->FlushVpnSendPacketBuffers(channel5);
+
     /// <summary>IVpnPacketBuffer slot 6, get_Buffer.</summary>
     internal static int GetBuffer(IntPtr packetBuffer, out IntPtr buffer)
         => (*(VpnPacketBufferVtable**)packetBuffer)->GetBuffer(packetBuffer, out buffer);
@@ -303,6 +356,17 @@ internal static unsafe class VpnChannelAbi
 
         // ThisPtr is borrowed from the projected object's reference; the object must stay alive
         // until the QI has taken its own.
+        GC.KeepAlive(channel);
+        return hr;
+    }
+
+    /// <summary>
+    /// Gets an owned <c>IVpnChannel5</c> pointer from the projected channel — the out-of-band
+    /// send lane the platform-owned transport writes through.
+    /// </summary>
+    internal static int GetChannel5(VpnChannel channel, out IntPtr channel5)
+    {
+        var hr = QueryInterface(((IWinRTObject)channel).NativeObject.ThisPtr, in IID_IVpnChannel5, out channel5);
         GC.KeepAlive(channel);
         return hr;
     }
@@ -379,6 +443,51 @@ internal static unsafe class VpnChannelAbi
     {
         Release(byteAccess);
         Release(buffer);
+    }
+
+    /// <summary>
+    /// Resolves a packet buffer to its readable bytes: like <see cref="AcquireSpan"/> but with the
+    /// buffer's <c>Length</c> — the bytes actually carried — instead of its capacity. All or
+    /// nothing; release with <see cref="ReleaseSpan"/>.
+    /// </summary>
+    internal static int AcquireReadSpan(IntPtr packetBuffer, out IntPtr buffer, out IntPtr byteAccess, out byte* data, out uint length)
+    {
+        byteAccess = default;
+        data = null;
+        length = 0;
+
+        var hr = GetBuffer(packetBuffer, out buffer);
+        if (hr < 0)
+        {
+            buffer = default;
+            return hr;
+        }
+
+        hr = QueryInterface(buffer, in IID_IBufferByteAccess, out byteAccess);
+        if (hr < 0)
+        {
+            Release(buffer);
+            buffer = default;
+            byteAccess = default;
+            return hr;
+        }
+
+        hr = GetBytes(byteAccess, out data);
+        if (hr >= 0)
+        {
+            hr = GetLength(buffer, out length);
+        }
+
+        if (hr < 0)
+        {
+            ReleaseSpan(buffer, byteAccess);
+            buffer = default;
+            byteAccess = default;
+            data = null;
+            length = 0;
+        }
+
+        return hr;
     }
 
     /// <summary>
