@@ -23,6 +23,17 @@ internal static class Counters
 
     /// <summary>How often a channel's remote window had no room.</summary>
     public static long WindowFull;
+
+    /// <summary>Channels whose teardown the reaper has completed.</summary>
+    public static long ChannelsReaped;
+
+    /// <summary>
+    /// Stopwatch ticks the reaper spent inside channel teardown — close-sequence sends, session
+    /// event unsubscription, kernel-handle closes. Worker time now; it used to be stack time,
+    /// because the zero-timeout close's await completed synchronously and the "deferred" disposal
+    /// never left the caller.
+    /// </summary>
+    public static long ReapTicks;
 }
 
 /// <summary>
@@ -229,9 +240,16 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
     /// <inheritdoc/>
     /// <remarks>
     /// The unsubscription is synchronous, so a dead stream cannot keep raising
-    /// <see cref="Signalled"/> into a flow that no longer exists. Only the stream's own disposal is
-    /// deferred: it sends the close sequence and used to wait a round trip for the server's answer,
-    /// and this runs on the stack's thread, which must never wait on the network.
+    /// <see cref="Signalled"/> into a flow that no longer exists. The stream's own disposal is
+    /// handed to a worker — genuinely, via <see cref="Task.Run(Func{Task})"/>, and the wrapper is
+    /// load-bearing: a bare <c>_ = DisposeStreamAsync()</c> never left this thread, because the
+    /// zero-timeout close awaits <c>Task.WaitAsync(TimeSpan.Zero, …)</c> whose fast path returns
+    /// an already-faulted task, so the await completed synchronously and the whole teardown —
+    /// the EOF+CLOSE sends with their encrypt-and-MAC under the session's write lock (blockable
+    /// for the length of a rekey), twelve session-event unsubscriptions each costing an
+    /// O(live-channels) delegate-array copy, and the kernel-handle closes — ran right here, on
+    /// the thread this method promises not to block. Profiled at ~74% of a core with the dispose
+    /// frame on top; see docs/profiling/2026-08-18-tunnel-cpu-cap.md.
     /// </remarks>
     public void Dispose()
     {
@@ -255,7 +273,7 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
             Fault(ex);
         }
 
-        _ = DisposeStreamAsync();
+        _ = Task.Run(DisposeStreamAsync);
     }
 
     /// <summary>
@@ -264,10 +282,14 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
     /// </summary>
     /// <remarks>
     /// Fire-and-forget, but the exceptions are observed: an unobserved faulted task is a crash
-    /// vector in a background-task host.
+    /// vector in a background-task host. Double disposal from a racing teardown path is the
+    /// stream's problem and solved there (an interlocked gate shared by
+    /// <c>Dispose</c>/<c>DisposeAsync</c>/<c>AbandonAsync</c>).
     /// </remarks>
     private async Task DisposeStreamAsync()
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+
         try
         {
             await _stream.DisposeAsync().ConfigureAwait(false);
@@ -278,6 +300,8 @@ internal sealed class DirectTcpipByteChannel : IByteChannel
         }
         finally
         {
+            Interlocked.Add(ref Counters.ReapTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+            Interlocked.Increment(ref Counters.ChannelsReaped);
             _released?.Invoke();
         }
     }

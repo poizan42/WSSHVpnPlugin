@@ -82,6 +82,8 @@ internal sealed class PacketPath : IDisposable
     private long _lastCredited;
     private long _lastDeliveries;
     private long _lastDeliveryBytes;
+    private long _lastReaps;
+    private long _lastReapTicks;
 
     public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport, TimeSpan openTimeout)
     {
@@ -277,6 +279,15 @@ internal sealed class PacketPath : IDisposable
         _lastDeliveries = deliveries;
         _lastDeliveryBytes = deliveryBytes;
 
+        var reaps = Interlocked.Read(ref Counters.ChannelsReaped);
+        var reapTicks = Interlocked.Read(ref Counters.ReapTicks);
+        var reapDelta = reaps - _lastReaps;
+        var microsPerReap = reapDelta > 0
+            ? (reapTicks - _lastReapTicks) * 1_000_000.0 / Stopwatch.Frequency / reapDelta
+            : 0;
+        _lastReaps = reaps;
+        _lastReapTicks = reapTicks;
+
         return $"{_stack.FlowCount} flow(s) open over {_factory.LiveChannels} live channel(s), down {down:F1} Mbit/s, up {up:F1} Mbit/s " +
                $"({_sink.Stalls} platform stall(s), {Interlocked.Read(ref Counters.WindowFull)} window-full); " +
                $"credit {deltaAdjusts / seconds:F1} adjust/s worth {creditRate:F1} Mbit/s; " +
@@ -286,7 +297,8 @@ internal sealed class PacketPath : IDisposable
                $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
                $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +
                $"over {dns.Channels} channel(s); " +
-               $"deliveries {deliveryRate:F0}/s ({deliveryByteDelta} B; {DeliveryStats.Describe()})";
+               $"deliveries {deliveryRate:F0}/s ({deliveryByteDelta} B; {DeliveryStats.Describe()}); " +
+               $"reaps {reapDelta / seconds:F1}/s in avg {microsPerReap:F0} us on workers";
     }
 
     private bool DrainOutbound()
