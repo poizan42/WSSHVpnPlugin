@@ -85,6 +85,29 @@ internal sealed class SshVpnConnection : IDisposable
         }
     }
 
+    /// <summary>
+    /// Connects and authenticates through a transport the caller already built — the
+    /// platform-owned-transport path, where the wire is the VPN channel itself.
+    /// </summary>
+    /// <remarks>
+    /// No socket, no interface selection, no classic/WinRT fallback: the platform owns the TCP
+    /// connection, the channel is already started, and the handshake's bytes ride decapsulate
+    /// deliveries in and the send-buffer lane out.
+    /// </remarks>
+    public static SshVpnConnection EstablishOverChannel(
+        SshVpnConfiguration configuration,
+        string userName,
+        string password,
+        ISshTransportFactory transportFactory)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(transportFactory);
+
+        var authentication = CreateAuthenticationMethod(configuration, userName, password);
+
+        return Establish(configuration, userName, authentication, transportFactory, "platform-owned channel");
+    }
+
     private static SshVpnConnection Establish(
         SshVpnConfiguration configuration,
         string userName,

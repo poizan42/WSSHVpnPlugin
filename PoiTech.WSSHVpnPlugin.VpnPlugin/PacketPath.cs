@@ -80,6 +80,8 @@ internal sealed class PacketPath : IDisposable
     private long _lastReadTicks;
     private long _lastAdjusts;
     private long _lastCredited;
+    private long _lastDeliveries;
+    private long _lastDeliveryBytes;
 
     public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport, TimeSpan openTimeout)
     {
@@ -268,6 +270,13 @@ internal sealed class PacketPath : IDisposable
         _lastAdjusts = adjusts;
         _lastCredited = credited;
 
+        var deliveries = DeliveryStats.Visits;
+        var deliveryBytes = DeliveryStats.Bytes;
+        var deliveryRate = (deliveries - _lastDeliveries) / seconds;
+        var deliveryByteDelta = deliveryBytes - _lastDeliveryBytes;
+        _lastDeliveries = deliveries;
+        _lastDeliveryBytes = deliveryBytes;
+
         return $"{_stack.FlowCount} flow(s) open over {_factory.LiveChannels} live channel(s), down {down:F1} Mbit/s, up {up:F1} Mbit/s " +
                $"({_sink.Stalls} platform stall(s), {Interlocked.Read(ref Counters.WindowFull)} window-full); " +
                $"credit {deltaAdjusts / seconds:F1} adjust/s worth {creditRate:F1} Mbit/s; " +
@@ -276,7 +285,8 @@ internal sealed class PacketPath : IDisposable
                $"{GC.CollectionCount(0)} gen0 collection(s); " +
                $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
                $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +
-               $"over {dns.Channels} channel(s)";
+               $"over {dns.Channels} channel(s); " +
+               $"deliveries {deliveryRate:F0}/s ({deliveryByteDelta} B; {DeliveryStats.Describe()})";
     }
 
     private bool DrainOutbound()
