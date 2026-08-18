@@ -1,12 +1,13 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **probes 1–2 answered, probe 3 half-answered (2026-08-17/18): the send path works after
-`Start` (deadlocks before it) and preserves order under concurrency; sustained datagram
-deliveries measurably gate activation completion (stalled from ~5,000/s, visits ceiling ~8,500/s
-on this build) — but the blast ran without profiling, so whether that cost is the platform's or
-largely our own CCW boundary is unattributed. A profiled re-run comes before any verdict on the
-datagram transport.** Nothing here is committed to; the current loopback-dummy architecture works
-(165 Mbit/s peak, clean lifecycle) and stays.
+Status: **probes 1–3 answered, 3 with profiled attribution (2026-08-17/18): the send path works
+after `Start` (deadlocks before it) and preserves order under concurrency; inbound deliveries are
+serialized at ~130 µs of CPU each on threadpool callbacks — no pump thread exists — so the
+delivery queue's utilization is what gates activation completion (~85% at 5,000/s, ceiling
+~8,500/s), a real slice of the cost being the projected `IVpnPlugIn` boundary itself. A datagram
+outer transport stays condemned by seriality; the design hinges on TCP delivery granularity plus
+the hand-authored CCW.** Nothing here is committed to; the current loopback-dummy architecture
+works (165 Mbit/s peak, clean lifecycle) and stays.
 
 ## The idea
 
@@ -95,20 +96,28 @@ and the 90-second activation watchdog both still apply).
    the prolog-starvation mechanism caught in the act; **unpaced** (~30,000/s offered) the pump
    ceilings at **~8,500 visits/s** (~100 Mbit/s of 1400-byte deliveries) with the excess dropped
    at the socket buffer. No kills — 45 s of blast stays under the 90-second execution by design.
-   What is solid: activation completion is **gated on the pending-delivery queue draining** (the
-   5 ms-after-pressure-stopped completion is the mechanism caught in the act), and at these rates,
-   on this build, the numbers above are what happened. What is **not established — no profiling
-   ran during the blast**: where the per-visit cost lives. The ceiling could be the platform
-   pump's intrinsic per-delivery work, or one pegged thread anywhere in the chain — including
-   largely on our side (the CsWinRT CCW dispatch and parameter materialization below, WPP
-   tracing), in which case the custom-CCW fix would move both the ceiling and the starvation
-   threshold and the datagram verdict softens. The unpaced blaster also burned a core of its own.
-   Before treating ~5k/s as a property of the platform: **re-run with per-thread CPU sampling**
-   (ProcessThread.TotalProcessorTime deltas each second, no suspension needed) **plus a few
-   `cdbX64 -pv` stack samples mid-blast** with cached symbols, and name the hot thread. Only then
-   does the TCP-granularity question (64 KB chunks would mean ~200 deliveries/s at 100 Mbit/s;
-   unprobeable on the loopback dummy since TCP cannot cross-connect without a
-   `StreamSocketListener`) become the design's remaining hinge.
+   Activation completion is **gated on the pending-delivery queue draining** — the
+   5 ms-after-pressure-stopped completion is the mechanism caught in the act.
+
+   **Attributed by the profiled re-run (probe 3b, 2026-08-18)** — per-thread CPU deltas sampled
+   each second plus two mid-blast `cdbX64 -pv` stack samples: the machine was nowhere near
+   saturated (~2 core-seconds/s total on 8 cores, and the single hottest thread was the probe's
+   own blaster). **There is no pump thread to saturate.** Each socket receive completion fires a
+   threadpool callback that runs the whole chain — `VpnExeSocketRecvCompleteCallbackProcessDecapsulate
+   → VpnExecHlpDecapsulate → IVpnPlugIn.Do_Abi_Decapsulate → FromAbi × 4 parameters → our handler`
+   — then re-arms the receive: deliveries are **serialized, ~130 µs of CPU each** (consumer
+   threads burned ~1.1 core-second/s at ~8,500/s), hopping across pool threads. The ceiling is
+   that serial per-delivery round trip, and the starvation is queue utilization of the serial
+   resource: at 5,000/s offered (~85% utilization) the pending queue rarely empties, so the
+   activation prolog rarely gets its window. One stack sample landed inside
+   `VpnChannel.FromAbi → CreateRcwForComObject` — the per-call parameter materialization already
+   recorded under probe 4 below, confirmed as a slice of the 130 µs; the hand-authored CCW it
+   mandates therefore raises both the ceiling and the starvation threshold. But per-delivery
+   seriality remains the currency, so the decisive question is still the
+   **TCP stream transport's delivery granularity**
+   (64 KB chunks would mean ~200 deliveries/s at 100 Mbit/s, negligible utilization) — unprobeable
+   on the loopback dummy (TCP cannot cross-connect without a `StreamSocketListener`), answerable
+   only by a real TCP transport or a listener experiment.
 4. **Throughput parity**: the pipe adds one copy inbound (encapBuffer → pipe) and the chunked
    append path outbound. Raw ABI from day one (`VpnChannelAbi` gains the send-pool slots, header
    citations mandatory — this API family has two inverted slot orderings already documented) or
