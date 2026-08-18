@@ -590,6 +590,14 @@ been removed in .NET 5+. Import the namespace before concluding it's missing.
   correlate accordingly before concluding two events don't line up.
 - Host keys are pinned from the profile, and an unpinned key is **refused** rather than trusted on
   first use — a background task has no UI to prompt from. Don't relax this to make testing easier.
+- **Never write that something is "undocumented" without having downloaded and read the
+  documentation for that specific thing** — the class, method, property, or behavior in question,
+  not just its neighbourhood. Under no circumstances is "I didn't find it while working" a basis
+  for the claim; it hardens a guess into a recorded fact that others build on. Precedent:
+  `VpnPacketBuffer.TransportAffinity`'s 0/1 encoding was recorded as undocumented in three places
+  and grew runtime-learning scaffolding to compensate, while the property page states the encoding
+  outright. If the documentation genuinely wasn't consulted, write what actually happened
+  ("established at runtime", "not checked against the docs") instead.
 - **This repo and the fork are public.** Machine-specific configuration (server address, user name,
   key path, LAN ranges, adapter names) lives in the app's local settings and the log, deliberately —
   keep it out of commits, including commit messages and comments quoting log lines.
