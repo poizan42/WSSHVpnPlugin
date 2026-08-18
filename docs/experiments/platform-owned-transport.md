@@ -1,9 +1,12 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **probes 1 and 2 answered (2026-08-17/18): the send path works after `Start` (deadlocks
-before it) and preserves order under concurrency; not otherwise started.** Nothing here is
-committed to; the current loopback-dummy architecture works (165 Mbit/s peak, clean lifecycle) and
-stays until the remaining unknowns below are answered cheaply.
+Status: **probes 1–3 answered (2026-08-17/18): the send path works after `Start` (deadlocks
+before it) and preserves order under concurrency, but sustained datagram deliveries starve
+activations from ~5,000/s (~56 Mbit/s) and ceiling at ~8,500/s — a datagram outer transport is
+not viable at line rate, so the design now hinges on the TCP stream transport's delivery
+granularity, which only a real attempt (or a `StreamSocketListener` experiment) can answer.**
+Nothing here is committed to; the current loopback-dummy architecture works (165 Mbit/s peak,
+clean lifecycle) and stays.
 
 ## The idea
 
@@ -82,15 +85,37 @@ and the 90-second activation watchdog both still apply).
    during the probe: ~1000 append+flush cycles in ~90 ms on a live tunnel. (The keep-alive
    boundary is untestable and moot: `GetKeepAlivePayload` is never called, and the design sends
    SSH's own keepalives through the same single lane as everything else.)
-3. **The delivery prolog at line rate**: `VpnChannelImpl::CompleteDelivery` — the machinery that
-   starved activations when the doorbell flooded it — would now process every inbound chunk of a
-   150+ Mbit/s stream. Shipping SSL-VPN plug-ins live on this path, so it is presumably engineered
-   for real traffic, but our only data point is that it *can* starve activations. Measure
-   activation completion latency during a full-speed download before trusting it.
+3. **The delivery prolog at line rate — ANSWERED for datagrams, and it is the design's boundary
+   (2026-08-18).** Probed by blasting 1400-byte datagrams from the back socket into the platform's
+   front socket in stepped phases while watching activation completions (their log budget
+   temporarily raised): at **1,000/s** (~11 Mbit/s) `Decapsulate` keeps pace exactly but the
+   rolling scheduling activation stretched from its 2–8 s baseline to **26 s**; at **5,000/s**
+   (~56 Mbit/s) delivery saturates near 4,000/s and the in-flight activation **could not complete
+   at all while the blast lasted** — it completed five milliseconds after the pressure stopped,
+   the prolog-starvation mechanism caught in the act; **unpaced** (~30,000/s offered) the pump
+   ceilings at **~8,500 visits/s** (~100 Mbit/s of 1400-byte deliveries) with the excess dropped
+   at the socket buffer. No kills — 45 s of blast stays under the 90-second execution by design.
+   Consequence: **a datagram outer transport is not viable at sustained line rate** — anything
+   above ~56 Mbit/s sustained for 90 s gets the host killed, and ~100 Mbit/s is the delivery
+   ceiling regardless. The cost is per-delivery, not per-byte, so the design now hinges on the
+   **TCP stream transport's delivery granularity** — 64 KB chunks would mean ~200 deliveries/s at
+   100 Mbit/s, trivially survivable — which the loopback dummy cannot probe (TCP cannot
+   cross-connect without a `StreamSocketListener`, the one app-container loopback shape with
+   doubted behaviour). That question is only answerable with a real TCP transport — i.e. by the
+   first end-to-end attempt, or a listener experiment first.
 4. **Throughput parity**: the pipe adds one copy inbound (encapBuffer → pipe) and the chunked
    append path outbound. Raw ABI from day one (`VpnChannelAbi` gains the send-pool slots, header
    citations mandatory — this API family has two inverted slot orderings already documented) or
-   the RCW-per-packet ceiling returns.
+   the RCW-per-packet ceiling returns. **This includes the `IVpnPlugIn` boundary itself**: every
+   `Decapsulate` dispatch through the CsWinRT-authored CCW materializes projected wrappers for its
+   four parameters, and probe 3's session measured the cost directly — 38 gen0 collections across
+   ~203k visits versus ~zero when idle, i.e. a subset of the parameters (most plausibly the two
+   lists) allocates a fresh RCW per call while the channel and the pool-recycled `encapBuffer`
+   ride CsWinRT's identity cache. Per-batch today that is noise; at delivery granularity it is
+   packet-path allocation, so the design requires the authoring twin of `VpnChannelAbi`: a
+   hand-rolled CCW whose `IVpnPlugIn` vtable is `[UnmanagedCallersOnly]` stubs receiving the raw
+   interface pointers, handed to `ProcessEventAsync` through its own raw ABI slot — which also
+   dissolves the per-batch QI-back dance (`GetList` re-deriving the raw pointer from the wrapper).
 
 ## What survives even if everything works
 
