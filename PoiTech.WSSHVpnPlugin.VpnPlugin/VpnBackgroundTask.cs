@@ -52,7 +52,7 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         try
         {
             activation = LogActivation(taskInstance);
-            VpnChannel.ProcessEventAsync(GetOrCreatePlugIn(), taskInstance.TriggerDetails);
+            ProcessEventRaw(taskInstance.TriggerDetails);
         }
         catch (Exception ex)
         {
@@ -106,12 +106,99 @@ public sealed class VpnBackgroundTask : IBackgroundTask
         return count;
     }
 
-    private static IVpnPlugIn GetOrCreatePlugIn()
+    /// <summary>
+    /// Dispatches the event through the raw <c>IVpnChannelStatics.ProcessEventAsync</c> slot,
+    /// handing the platform the hand-rolled <see cref="VpnPlugInCcw"/> instead of a
+    /// CsWinRT-authored wrapper.
+    /// </summary>
+    /// <remarks>
+    /// The CsWinRT CCW materialized projected wrappers for every event's parameters — packet-path
+    /// allocation at delivery granularity. The raw CCW's stubs receive the interface pointers and
+    /// pass them, borrowed, to the plug-in's raw cores. The statics pointer is fetched once via
+    /// <c>RoGetActivationFactory</c> and cached for the host's life.
+    /// </remarks>
+    private static unsafe void ProcessEventRaw(object? triggerDetails)
+    {
+        var statics = GetChannelStatics();
+        var ccw = VpnPlugInCcw.GetOrCreate(GetOrCreatePlugIn());
+
+        var details = triggerDetails is null
+            ? default
+            : ((WinRT.IWinRTObject)triggerDetails).NativeObject.ThisPtr;
+
+        var hr = VpnChannelAbi.ProcessEvent(statics, ccw, details);
+        GC.KeepAlive(triggerDetails);
+
+        if (hr < 0)
+        {
+            throw VpnChannelAbi.FailureFor(hr, "ProcessEventAsync");
+        }
+    }
+
+    private static IntPtr GetChannelStatics()
+    {
+        var cached = Volatile.Read(ref _channelStatics);
+        if (cached != default)
+        {
+            return cached;
+        }
+
+        const string ClassName = "Windows.Networking.Vpn.VpnChannel";
+        int hr;
+        IntPtr statics;
+
+        unsafe
+        {
+            fixed (char* chars = ClassName)
+            {
+                var hstring = default(IntPtr);
+                hr = WindowsCreateString((ushort*)chars, (uint)ClassName.Length, &hstring);
+                if (hr < 0)
+                {
+                    throw VpnChannelAbi.FailureFor(hr, "WindowsCreateString");
+                }
+
+                var iid = VpnChannelAbi.IID_IVpnChannelStatics;
+                var factory = default(IntPtr);
+                hr = RoGetActivationFactory(hstring, &iid, &factory);
+                statics = factory;
+                _ = WindowsDeleteString(hstring);
+            }
+        }
+
+        if (hr < 0)
+        {
+            throw VpnChannelAbi.FailureFor(hr, "RoGetActivationFactory(VpnChannel, IVpnChannelStatics)");
+        }
+
+        // Owned for the host's life; a losing racer releases its copy.
+        if (Interlocked.CompareExchange(ref _channelStatics, statics, default) != default)
+        {
+            VpnChannelAbi.Release(statics);
+        }
+
+        return Volatile.Read(ref _channelStatics);
+    }
+
+    private static IntPtr _channelStatics;
+
+    // Pointer-form signatures throughout: DisableRuntimeMarshalling forbids by-ref parameters in
+    // DllImports, and the MarshalDirectiveException it throws otherwise arrives at runtime.
+    [System.Runtime.InteropServices.DllImport("combase.dll")]
+    private static extern unsafe int WindowsCreateString(ushort* sourceString, uint length, IntPtr* hstring);
+
+    [System.Runtime.InteropServices.DllImport("combase.dll")]
+    private static extern int WindowsDeleteString(IntPtr hstring);
+
+    [System.Runtime.InteropServices.DllImport("combase.dll")]
+    private static extern unsafe int RoGetActivationFactory(IntPtr activatableClassId, Guid* iid, IntPtr* factory);
+
+    private static SSHVpnPlugin GetOrCreatePlugIn()
     {
         var properties = CoreApplication.Properties;
         lock (properties)
         {
-            if (properties.TryGetValue(PlugInPropertyKey, out var existing) && existing is IVpnPlugIn plugIn)
+            if (properties.TryGetValue(PlugInPropertyKey, out var existing) && existing is SSHVpnPlugin plugIn)
             {
                 return plugIn;
             }

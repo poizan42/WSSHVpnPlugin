@@ -55,6 +55,13 @@ internal static unsafe class VpnChannelAbi
     // robuffer.h:27
     internal static readonly Guid IID_IBufferByteAccess = new("905a0fef-bc53-11df-8c49-001e4fc686da");
 
+    // windows.networking.vpn.h:15557 (vtable) — the interface the hand-rolled CCW implements.
+    // One-transposition sibling of IVpnChannel's 4ac78d07-d1a8-4303-a091-c8d2e0915bc3; do not mix.
+    internal static readonly Guid IID_IVpnPlugIn = new("ceb78d07-d0a8-4703-a091-c8c2c0915bc4");
+
+    // windows.networking.vpn.h:12754 (vtable) — the statics factory carrying ProcessEventAsync.
+    internal static readonly Guid IID_IVpnChannelStatics = new("88eb062d-e818-4ffd-98a6-363e3736c95d");
+
     /// <summary>
     /// The three <c>IUnknown</c> slots that prefix every COM vtable. The interface-specific vtables
     /// below embed this (via <see cref="InspectableVtable"/> for WinRT interfaces, directly for
@@ -284,6 +291,24 @@ internal static unsafe class VpnChannelAbi
             return hr;
         }
     }
+
+    /// <summary>IVpnChannelStatics — windows.networking.vpn.h:12754.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct VpnChannelStaticsVtable
+    {
+        private readonly InspectableVtable IInspectable; // slots 0-5
+        private readonly IntPtr ProcessEventAsyncPtr;    // slot 6, ProcessEventAsync(IInspectable* thirdPartyPlugIn, IInspectable* event)
+
+        public int ProcessEventAsync(IntPtr thisPtr, IntPtr plugIn, IntPtr thirdPartyEvent)
+        {
+            return ((delegate* unmanaged[Stdcall]<void*, void*, void*, int>)ProcessEventAsyncPtr)(
+                (void*)thisPtr, (void*)plugIn, (void*)thirdPartyEvent);
+        }
+    }
+
+    /// <summary>IVpnChannelStatics slot 6 — dispatches one activation's event to the plug-in.</summary>
+    internal static int ProcessEvent(IntPtr statics, IntPtr plugIn, IntPtr thirdPartyEvent)
+        => (*(VpnChannelStaticsVtable**)statics)->ProcessEventAsync(statics, plugIn, thirdPartyEvent);
 
     /// <summary>IUnknown slot 0.</summary>
     internal static int QueryInterface(IntPtr ptr, in Guid iid, out IntPtr result)

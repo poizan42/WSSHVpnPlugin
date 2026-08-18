@@ -73,10 +73,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private Renci.SshNet.Connection.PipeSshTransport? _pipe;
     private Timer? _stopWatchdog;
     private int _channelStopped;
-    private int _decapsulateCalls;
-
-    /// <summary>0 until the first batch, 1 once the raw list size matched the projection, -1 if it did not.</summary>
-    private int _abiListChecked;
 
     /// <summary>0 until the first outbound packet, 1 once its shape check passed, -1 if it failed.</summary>
     private int _abiPacketChecked;
@@ -91,6 +87,28 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private long _encapsulateFailureCount;
     private long _lastFailureReportTicks;
     private Exception? _lastEncapsulateFailure;
+
+    /// <summary>CCW entry: wraps the raw channel pointer for the cold connect path.</summary>
+    internal void ConnectRaw(IntPtr channel)
+    {
+        Connect(VpnChannel.FromAbi(channel));
+    }
+
+    /// <summary>CCW entry: wraps the raw channel pointer for the cold disconnect path.</summary>
+    internal void DisconnectRaw(IntPtr channel)
+    {
+        Disconnect(VpnChannel.FromAbi(channel));
+    }
+
+    /// <summary>CCW entry for GetKeepAlivePayload's budgeted logging; the payload is always null.</summary>
+    internal void NoteKeepAliveAsked()
+    {
+        var count = Interlocked.Increment(ref _keepAliveCalls);
+        if (count <= 25)
+        {
+            PluginLog.Info($"GetKeepAlivePayload called (#{count})");
+        }
+    }
 
     /// <inheritdoc/>
     public void Connect(VpnChannel channel)
@@ -314,7 +332,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             // One last ring, after closing: this is what gets us the call in which the queue is
             // observed drained and the teardown finishes.
             transport?.RingDoorbell();
-            ArmStopWatchdog(channel);
+            ArmStopWatchdog();
         }
         catch (Exception ex)
         {
@@ -389,27 +407,37 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     {
         ArgumentNullException.ThrowIfNull(packets);
 
+        // The projected shape survives for the interface contract; the CCW path below is what the
+        // platform actually dispatches through. Borrowed pointers, alive until the keepalives.
+        EncapsulateRaw(
+            ((WinRT.IWinRTObject)channel).NativeObject.ThisPtr,
+            ((WinRT.IWinRTObject)packets).NativeObject.ThisPtr);
+
+        GC.KeepAlive(channel);
+        GC.KeepAlive(packets);
+    }
+
+    /// <summary>
+    /// The outbound core: consumes a batch of L3 packets through raw interface pointers.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="packets"/> is the <c>IVpnPacketBufferList</c> pointer itself — the ABI
+    /// parameter type, borrowed for the call — so the per-batch QI the projected path needed is
+    /// gone along with the per-call wrappers. <paramref name="channel"/> is only touched on the
+    /// cold self-check-failure path, where a projected wrapper is created to terminate.
+    /// </remarks>
+    internal unsafe void EncapsulateRaw(IntPtr channel, IntPtr packets)
+    {
         var connection = GetConnection();
-        LogFirstEncapsulateCalls(packets, connection);
 
         if (connection is null)
         {
             return;
         }
 
-        // One QI per batch buys raw vtable calls per packet: the projected path cost an RCW per
-        // RemoveAtBegin and two more per .Buffer get. The pointer is owned, so the cleanup calls
-        // below stay valid whatever the garbage collector thinks of the projected wrapper.
-        var hrList = VpnChannelAbi.GetList(packets, out var list);
-        if (hrList < 0)
-        {
-            PluginLog.Error($"The packet list does not expose IVpnPacketBufferList (0x{hrList:X8})");
-            return;
-        }
-
+        var list = packets;
         var failures = 0;
 
-        try
         {
             // Size is captured first: the list is rotated, not drained, so re-reading it would loop.
             var hr = VpnChannelAbi.ListSize(list, out var count);
@@ -419,26 +447,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 return;
             }
 
-            if (Volatile.Read(ref _abiListChecked) == 0)
-            {
-                // One-time crosscheck of the raw slot table against the projection, before the
-                // per-packet slots are trusted. A wrong get_Size would show as a mismatch here
-                // rather than as a corrupted dereference below.
-                if (count != packets.Size)
-                {
-                    Volatile.Write(ref _abiListChecked, -1);
-                    PluginLog.Error($"ABI self-check failed: raw list size {count} != projected {packets.Size}; terminating rather than corrupting");
-                    channel.TerminateConnection("The VPN plug-in's ABI self-check failed.");
-                    return;
-                }
-
-                Volatile.Write(ref _abiListChecked, 1);
-            }
-
-            if (Volatile.Read(ref _abiListChecked) < 0)
-            {
-                return;
-            }
+            LogFirstEncapsulateCalls(count, connection);
 
             for (uint i = 0; i < count; i++)
             {
@@ -474,7 +483,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                         {
                             Volatile.Write(ref _abiPacketChecked, -1);
                             PluginLog.Error($"ABI self-check failed on the first outbound packet: {why}; terminating rather than corrupting");
-                            channel.TerminateConnection("The VPN plug-in's ABI self-check failed.");
+
+                            // Cold path: one projected wrapper to terminate is fine.
+                            VpnChannel.FromAbi(channel).TerminateConnection("The VPN plug-in's ABI self-check failed.");
                             return;
                         }
 
@@ -525,10 +536,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 }
             }
         }
-        finally
-        {
-            VpnChannelAbi.Release(list);
-        }
 
         if (failures > 0)
         {
@@ -556,8 +563,32 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         VpnPacketBufferList decapsulatedPackets,
         VpnPacketBufferList controlPacketsToSend)
     {
+        if (decapsulatedPackets is null)
+        {
+            return;
+        }
+
+        DecapsulateRaw(
+            encapBuffer is null ? default : ((WinRT.IWinRTObject)encapBuffer).NativeObject.ThisPtr,
+            ((WinRT.IWinRTObject)decapsulatedPackets).NativeObject.ThisPtr);
+
+        GC.KeepAlive(encapBuffer);
+        GC.KeepAlive(decapsulatedPackets);
+    }
+
+    /// <summary>
+    /// The inbound core: feeds the wire bytes to the SSH pipe, then hands the platform the
+    /// packets waiting to be injected.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="decapsulatedPackets"/> is the <c>IVpnPacketBufferList</c> pointer itself,
+    /// borrowed for the call. The packets appended are already written into the platform's own
+    /// buffers by whoever produced them; appending a buffer is what returns it.
+    /// </remarks>
+    internal unsafe void DecapsulateRaw(IntPtr encapBuffer, IntPtr decapsulatedPackets)
+    {
         var inbound = GetInbound();
-        if (inbound is null || decapsulatedPackets is null)
+        if (inbound is null || decapsulatedPackets == default)
         {
             return;
         }
@@ -567,14 +598,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         // zero WinRT objects; DeliveryStats is the architecture's go/no-go instrumentation.
         FeedPipe(encapBuffer);
 
-        LogFirstDecapsulateCalls(encapBuffer);
-
-        var hrList = VpnChannelAbi.GetList(decapsulatedPackets, out var list);
-        if (hrList < 0)
-        {
-            PluginLog.Error($"The decapsulated-packet list does not expose IVpnPacketBufferList (0x{hrList:X8})");
-            return;
-        }
+        var list = decapsulatedPackets;
 
         inbound.BeginDrain();
 
@@ -617,7 +641,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 // Nothing left, and nothing more coming: this is the call Disconnect asked for.
                 if (inbound.IsFinished)
                 {
-                    StopChannel(channel, $"the inbound queue drained after disconnect, {appended} returned");
+                    StopChannel($"the inbound queue drained after disconnect, {appended} returned");
                     return;
                 }
 
@@ -638,8 +662,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             {
                 GetTransport()?.RingDoorbell();
             }
-
-            VpnChannelAbi.Release(list);
         }
     }
 
@@ -652,7 +674,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// into the pipe, everything released before returning. The buffer stays the platform's; only
     /// its content leaves.
     /// </remarks>
-    private unsafe void FeedPipe(VpnPacketBuffer? encapBuffer)
+    private unsafe void FeedPipe(IntPtr packet)
     {
         Renci.SshNet.Connection.PipeSshTransport? pipe;
         lock (_stateGate)
@@ -665,13 +687,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             return;
         }
 
-        if (encapBuffer is null)
+        if (packet == default)
         {
             DeliveryStats.Record(0);
             return;
         }
-
-        var packet = ((WinRT.IWinRTObject)encapBuffer).NativeObject.ThisPtr;
 
         // Two transports deliver here: the main TCP socket carries the SSH stream and the
         // optional loopback pair carries one-byte doorbell rings, which must never reach the
@@ -692,7 +712,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         if (hr < 0)
         {
             PluginLog.Error($"Reading a transport delivery failed (0x{hr:X8})");
-            GC.KeepAlive(encapBuffer);
             return;
         }
 
@@ -730,9 +749,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         finally
         {
             VpnChannelAbi.ReleaseSpan(buffer, byteAccess);
-
-            // ThisPtr is borrowed from the projected parameter; it must outlive the raw calls.
-            GC.KeepAlive(encapBuffer);
         }
     }
 
@@ -744,7 +760,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// it, no encapsulate call at all means the platform is not offering us the send path, which is a
     /// different problem from us dropping what it offers.
     /// </remarks>
-    private void LogFirstEncapsulateCalls(VpnPacketBufferList packets, SshVpnConnection? connection)
+    private void LogFirstEncapsulateCalls(uint count, SshVpnConnection? connection)
     {
         const int LogBudget = 5;
 
@@ -759,53 +775,20 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 CultureInfo.InvariantCulture,
                 "Encapsulate called (#{0}), {1} packet(s), connection {2}",
                 call,
-                packets.Size,
+                count,
                 connection is null ? "MISSING" : "present"));
-    }
-
-    /// <summary>
-    /// Logs the first few decapsulate calls, which is how we find out whether the doorbell works at
-    /// all and what the platform hands us when it rings.
-    /// </summary>
-    private void LogFirstDecapsulateCalls(VpnPacketBuffer? encapBuffer)
-    {
-        const int LogBudget = 5;
-
-        var call = Interlocked.Increment(ref _decapsulateCalls);
-        if (call > LogBudget)
-        {
-            return;
-        }
-
-        var length = encapBuffer?.Buffer?.Length;
-        PluginLog.Info(
-            string.Format(
-                CultureInfo.InvariantCulture,
-                "Decapsulate called (#{0}), encapBuffer {1}",
-                call,
-                length is null ? "absent" : $"{length} bytes"));
     }
 
     /// <summary>
     /// Supplies a keep-alive payload for the platform to send on an idle tunnel.
     /// </summary>
     /// <remarks>
-    /// SSH runs its own keep-alive (<see cref="Renci.SshNet.BaseClient.KeepAliveInterval"/>), and
-    /// the transport the platform would send this on is a dummy that carries nothing, so no
+    /// SSH runs its own keep-alive (<see cref="Renci.SshNet.BaseClient.KeepAliveInterval"/>), so no
     /// platform-level keep-alive packet is produced.
     /// </remarks>
     public void GetKeepAlivePayload(VpnChannel channel, out VpnPacketBuffer keepAlivePacket)
     {
-        // Budgeted, like the activation logs: at idle the scheduling activations complete on the
-        // keep-alive cadence, so whether this call precedes each completion - and whether it stops
-        // arriving under load, starving the activation into the 90-second watchdog - is the
-        // question the log has to answer.
-        var count = Interlocked.Increment(ref _keepAliveCalls);
-        if (count <= 25)
-        {
-            PluginLog.Info($"GetKeepAlivePayload called (#{count})");
-        }
-
+        NoteKeepAliveAsked();
         keepAlivePacket = null!;
     }
 
@@ -886,8 +869,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         // deliberately or never.
         inbound?.ReleaseAll();
 
-        Volatile.Write(ref _decapsulateCalls, 0);
-        Volatile.Write(ref _abiListChecked, 0);
         Volatile.Write(ref _abiPacketChecked, 0);
         Volatile.Write(ref _mainAffinity, -1);
         Volatile.Write(ref _affinityLogCalls, 0);
@@ -908,9 +889,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// <c>DisconnectProfileAsync</c> completes exactly when the host exits. The fastest correct
     /// teardown is therefore: release our own state and exit now.
     /// </remarks>
-    private void StopChannel(VpnChannel? channel, string reason)
+    private void StopChannel(string reason)
     {
-        if (channel is null || Interlocked.Exchange(ref _channelStopped, 1) != 0)
+        if (Interlocked.Exchange(ref _channelStopped, 1) != 0)
         {
             return;
         }
@@ -964,15 +945,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// stall for yanking them out from under it. The queue state is logged either way, because
     /// which branch happens is a fact about the platform worth having.
     /// </remarks>
-    private void ArmStopWatchdog(VpnChannel channel)
+    private void ArmStopWatchdog()
     {
         var watchdog = new Timer(
-            static state =>
-            {
-                var (plugin, watched) = ((SSHVpnPlugin, VpnChannel))state!;
-                plugin.OnStopWatchdog(watched);
-            },
-            (this, channel),
+            static state => ((SSHVpnPlugin)state!).OnStopWatchdog(),
+            this,
             StopWatchdogDelay,
             Timeout.InfiniteTimeSpan);
 
@@ -986,7 +963,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         previous?.Dispose();
     }
 
-    private void OnStopWatchdog(VpnChannel channel)
+    private void OnStopWatchdog()
     {
         if (Volatile.Read(ref _channelStopped) != 0)
         {
@@ -1001,7 +978,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             PluginLog.Error(
                 "The platform did not call Decapsulate again after Disconnect; retiring directly, " +
                 "which is safe only because the inbound queue is empty.");
-            StopChannel(channel, "watchdog, queue empty");
+            StopChannel("watchdog, queue empty");
             return;
         }
 
