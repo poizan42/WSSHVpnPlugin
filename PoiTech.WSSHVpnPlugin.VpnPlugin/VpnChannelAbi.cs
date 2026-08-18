@@ -174,6 +174,16 @@ internal static unsafe class VpnChannelAbi
             buffer = value;
             return hr;
         }
+
+        public int GetTransportAffinity(IntPtr thisPtr, out uint affinity)
+        {
+            uint value = 0;
+            var hr = ((delegate* unmanaged[Stdcall]<void*, uint*, int>)GetTransportAffinityPtr)(
+                (void*)thisPtr, &value);
+
+            affinity = value;
+            return hr;
+        }
     }
 
     /// <summary>IVpnPacketBufferList — windows.networking.vpn.h:15306. RemoveAtEnd precedes RemoveAtBegin.</summary>
@@ -313,6 +323,14 @@ internal static unsafe class VpnChannelAbi
     /// <summary>IVpnPacketBuffer slot 6, get_Buffer.</summary>
     internal static int GetBuffer(IntPtr packetBuffer, out IntPtr buffer)
         => (*(VpnPacketBufferVtable**)packetBuffer)->GetBuffer(packetBuffer, out buffer);
+
+    /// <summary>
+    /// IVpnPacketBuffer slot 10, get_TransportAffinity — which of the two associated transports a
+    /// delivered buffer arrived on, and the discriminator between SSH wire bytes (main) and
+    /// doorbell datagrams (optional).
+    /// </summary>
+    internal static int GetTransportAffinity(IntPtr packetBuffer, out uint affinity)
+        => (*(VpnPacketBufferVtable**)packetBuffer)->GetTransportAffinity(packetBuffer, out affinity);
 
     /// <summary>IBuffer slot 6, get_Capacity.</summary>
     internal static int GetCapacity(IntPtr buffer, out uint capacity)

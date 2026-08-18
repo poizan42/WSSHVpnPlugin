@@ -26,15 +26,22 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// invalid-state throw).
 /// </para>
 /// <para>
-/// No doorbell yet: <see cref="RingDoorbell"/> is a no-op, so inbound injection rides the
-/// data-driven decapsulate visits, which are continuous during any actual traffic. The second
-/// transport that restores the doorbell is the next phase.
+/// The doorbell is the <b>optional</b> transport: a loopback datagram pair (the proven shape from
+/// the loopback-dummy architecture), so a one-byte send provokes a decapsulate visit when there
+/// is no wire data to ride — timer-driven retransmits toward a silent client were what crawled
+/// without it. Deliveries from the two transports are told apart by the packet buffer's
+/// <c>TransportAffinity</c>; doorbell datagrams must never reach the SSH stream.
 /// </para>
 /// </remarks>
 internal sealed class PlatformOwnedTransport : IOuterTransport
 {
+    private static readonly byte[] DoorbellPayload = new byte[] { 1 };
+
     private readonly StreamSocket _front;
+    private readonly Windows.Networking.Sockets.DatagramSocket _doorbellFront;
+    private readonly System.Net.Sockets.Socket _doorbellBack;
     private readonly object _sendGate = new();
+    private readonly object _doorbellGate = new();
 
     /// <summary>Owned <c>IVpnChannel2</c> — the send-buffer pool.</summary>
     private IntPtr _channel2;
@@ -44,9 +51,16 @@ internal sealed class PlatformOwnedTransport : IOuterTransport
 
     private int _disposed;
 
-    private PlatformOwnedTransport(StreamSocket front, IntPtr channel2, IntPtr channel5)
+    private PlatformOwnedTransport(
+        StreamSocket front,
+        Windows.Networking.Sockets.DatagramSocket doorbellFront,
+        System.Net.Sockets.Socket doorbellBack,
+        IntPtr channel2,
+        IntPtr channel5)
     {
         _front = front;
+        _doorbellFront = doorbellFront;
+        _doorbellBack = doorbellBack;
         _channel2 = channel2;
         _channel5 = channel5;
     }
@@ -60,7 +74,7 @@ internal sealed class PlatformOwnedTransport : IOuterTransport
     /// <inheritdoc/>
     public bool CanRingDoorbell
     {
-        get { return false; }
+        get { return true; }
     }
 
     /// <summary>
@@ -90,12 +104,33 @@ internal sealed class PlatformOwnedTransport : IOuterTransport
         }
 
         var front = new StreamSocket();
+        var doorbellFront = new Windows.Networking.Sockets.DatagramSocket();
+        System.Net.Sockets.Socket? doorbellBack = null;
 
         try
         {
             front.Control.NoDelay = true;
 
-            channel.AssociateTransport(front, null);
+            // The docs' TCP+UDP combination: the remote TCP socket is the wire, and the loopback
+            // datagram pair - the proven shape from the old architecture - exists purely so a
+            // one-byte send can provoke a decapsulate visit for inbound injection with no wire
+            // data to ride. Both sockets must be unconnected here.
+            channel.AssociateTransport(front, doorbellFront);
+
+            var localhost = new HostName("127.0.0.1");
+            doorbellBack = new System.Net.Sockets.Socket(
+                System.Net.Sockets.AddressFamily.InterNetwork,
+                System.Net.Sockets.SocketType.Dgram,
+                System.Net.Sockets.ProtocolType.Udp);
+            doorbellBack.Bind(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+            var backPort = ((System.Net.IPEndPoint)doorbellBack.LocalEndPoint!).Port;
+
+            doorbellFront.BindEndpointAsync(localhost, string.Empty).AsTask().GetAwaiter().GetResult();
+            doorbellFront.ConnectAsync(localhost, backPort.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                .AsTask().GetAwaiter().GetResult();
+            doorbellBack.Connect(
+                System.Net.IPAddress.Loopback,
+                int.Parse(doorbellFront.Information.LocalPort, System.Globalization.CultureInfo.InvariantCulture));
 
             front.ConnectAsync(
                     new HostName(configuration.Host),
@@ -103,14 +138,16 @@ internal sealed class PlatformOwnedTransport : IOuterTransport
                 .AsTask().GetAwaiter().GetResult();
 
             PluginLog.Info(
-                $"Platform-owned transport connected to {configuration.Host}:{configuration.Port}; "
-                + "the platform takes ownership at Start.");
+                $"Platform-owned transport connected to {configuration.Host}:{configuration.Port} "
+                + $"with a loopback doorbell on port {backPort}; the platform takes ownership at Start.");
 
-            return new PlatformOwnedTransport(front, channel2, channel5);
+            return new PlatformOwnedTransport(front, doorbellFront, doorbellBack, channel2, channel5);
         }
         catch
         {
             front.Dispose();
+            doorbellFront.Dispose();
+            doorbellBack?.Dispose();
             VpnChannelAbi.Release(channel5);
             VpnChannelAbi.Release(channel2);
             throw;
@@ -193,7 +230,22 @@ internal sealed class PlatformOwnedTransport : IOuterTransport
     /// <inheritdoc/>
     public void RingDoorbell()
     {
-        // No doorbell on this transport yet; injection rides data-driven decapsulate visits.
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            lock (_doorbellGate)
+            {
+                _ = _doorbellBack.Send(DoorbellPayload);
+            }
+        }
+        catch (Exception ex)
+        {
+            PluginLog.Error("Could not ring the decapsulate doorbell", ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -212,8 +264,14 @@ internal sealed class PlatformOwnedTransport : IOuterTransport
                 VpnChannelAbi.Release(Interlocked.Exchange(ref _channel2, default));
             }
 
-            // The socket belongs to the platform once the channel started; disposing our
-            // reference is all we can do about it either way.
+            lock (_doorbellGate)
+            {
+                _doorbellBack.Dispose();
+            }
+
+            // The sockets belong to the platform once the channel started; disposing our
+            // references is all we can do about them either way.
+            _doorbellFront.Dispose();
             _front.Dispose();
         }
         catch (Exception ex)
