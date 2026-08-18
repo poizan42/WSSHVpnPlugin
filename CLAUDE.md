@@ -248,7 +248,48 @@ host and port, so there is no packet-for-packet encapsulation and the usual `Enc
   come back truncated with `TC` set, which makes the client retry over TCP — carried natively. Other
   UDP and all ICMP are still dropped.
 
-### The outer tunnel transport is a loopback dummy
+### THIS BRANCH: the platform-owned transport
+
+This branch (`platform-owned-transport`) replaces the loopback-dummy architecture below: the real
+SSH TCP socket **is** the outer tunnel transport, and the platform owns it. Full results in
+`docs\experiments\platform-owned-transport.md`; the load-bearing facts:
+
+- **Ordering is forced**: associate the unconnected front `StreamSocket` (with `NoDelay` set
+  BEFORE `AssociateTransport` — associate locks the socket's control interface), connect it to
+  the SSH server, `Start`, then establish SSH *through* the channel — sends deadlock before
+  `Start` (the buffer acquire waits on pools only `Start` creates), and deliveries flow from
+  associate time. The handshake takes ~2 s: `Decapsulate` feeds wire bytes to the fork's
+  `PipeSshTransport` on the platform's threads while `Session.Connect` blocks the activation.
+- **`Start` accepts `maxFrameSize 65536`** here — the 1500 ceiling was a loopback-era artifact —
+  and stream deliveries average ~40 KB (max 256 KB), ~300–420/s at 130 Mbit/s, far under the
+  ~8,500/s serial delivery ceiling. **Loopback TCP is rejected** (`WSAEOPNOTSUPP`); TCP
+  transports need a real interface.
+- **No source binding**: the platform pins its own transport across the route flip
+  (`OutboundInterface` is not consulted on this path). Verified by 130 Mbit/s downloads.
+- **The doorbell is the optional transport**: `AssociateTransport(tcp, loopback-udp)` — without
+  it, timer-driven inbound injection waits for wire data and downloads crawl at 5–13 Mbit/s with
+  retransmissions; with it, 113–131 Mbit/s and zero. Deliveries are discriminated by
+  `VpnPacketBuffer.TransportAffinity` (main = 0, doorbell = 1 — learned at runtime from the first
+  multi-byte delivery, the banner, because the encoding is undocumented). A doorbell byte
+  reaching the SSH stream is a MAC failure; the discrimination is correctness.
+- **Outbound wire bytes take exactly one lane**: `GetVpnSendPacketBuffer` (IVpnChannel2 slot 10)
+  → `AppendVpnSendPacketBuffer`/`FlushVpnSendPacketBuffers` (IVpnChannel5 slots 7/9, IID
+  `de7a0992-…`, h:12317). Probes established transmit-in-append-order, immediate, thread-safe.
+- **Dispatch is a hand-rolled CCW** (`VpnPlugInCcw`): raw `IVpnChannelStatics.ProcessEventAsync`
+  (slot 6) receives a static agile vtable of `[UnmanagedCallersOnly]` stubs; `Encapsulate`/
+  `Decapsulate` raw cores take the `IVpnPacketBufferList` pointers as parameters. Gen0 fell ~5×
+  at full rate. `DisableRuntimeMarshalling` forbids by-ref DllImport parameters — pointer-form
+  signatures only, or a **runtime** `MarshalDirectiveException` under Native AOT.
+- The platform QIs the plug-in for `IVpnPlugInReconnectTransport` (h:5551) per scheduling
+  activation and tolerates `E_NOINTERFACE`. Introduced in Build 26100 — a future implementation
+  must stay optional; older platforms never ask.
+- Teardown conformance carried over: in-callback `Stop` 0 ms, activations complete, host
+  survives, and the platform closes the remote TCP connection at `Stop`.
+
+The loopback-dummy section below describes **master's architecture**; its route/exclusion bullets
+and the `Stop`-in-`Disconnect` mechanism are architecture-independent and still load-bearing.
+
+### The outer tunnel transport is a loopback dummy (master's architecture)
 
 The platform takes **exclusive ownership** of whatever is passed to `AssociateTransport`: it registers
 the socket as a ControlChannelTrigger, then `Start*` calls `WaitForPushEnabled`,

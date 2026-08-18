@@ -1,13 +1,47 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **probes 1–3 answered, 3 with profiled attribution (2026-08-17/18): the send path works
-after `Start` (deadlocks before it) and preserves order under concurrency; inbound deliveries are
-serialized at ~130 µs of CPU each on threadpool callbacks — no pump thread exists — so the
-delivery queue's utilization is what gates activation completion (~85% at 5,000/s, ceiling
-~8,500/s), a real slice of the cost being the projected `IVpnPlugIn` boundary itself. A datagram
-outer transport stays condemned by seriality; the design hinges on TCP delivery granularity plus
-the hand-authored CCW.** Nothing here is committed to; the current loopback-dummy architecture
-works (165 Mbit/s peak, clean lifecycle) and stays.
+Status: **BUILT, on the `platform-owned-transport` branch (2026-08-18), through the hand-rolled
+CCW.** Everything below the line was the probe era; the build's measured results:
+
+- The full chain works: associate the real SSH TCP socket unconnected → connect it → `Start`
+  **accepted `maxFrameSize 65536`** (the 1500 ceiling was a loopback-era artifact) → SSH
+  handshake through the started channel in **1.9–2.5 s** → tunnel up with no source binding —
+  **the platform pins its own transport across the route flip**, the design's payoff assumption,
+  observed working.
+- Stream delivery granularity, the go/no-go number: **~40 KB average chunks, 256 KB max,
+  ~300–420 deliveries/s at 103–131 Mbit/s** — ~5% utilization of the serial delivery resource
+  (ceiling ~8,500/s). The death scenario is buried.
+- Without a doorbell the tunnel crawled (5–13 Mbit/s, 91 retransmissions): timer-driven inbound
+  injection waited for wire data. The loopback datagram pair as the **optional** transport
+  (`AssociateTransport(tcp, udp)` — accepted first try) restored it: **113–131 Mbit/s sustained,
+  zero retransmissions**. Deliveries are discriminated by `VpnPacketBuffer.TransportAffinity`
+  (learned: main = 0, doorbell = 1; the encoding is undocumented, so it is learned from the first
+  multi-byte delivery — the banner — rather than assumed).
+- The hand-rolled `IVpnPlugIn` CCW (raw `ProcessEventAsync` via `IVpnChannelStatics` slot 6,
+  `[UnmanagedCallersOnly]` stubs, raw cores end to end): parity at full rate, **gen0 fell from
+  ~26 to ~5–6 per 30 s** — the projected boundary was the allocation source. Lesson paid for:
+  `DisableRuntimeMarshalling` forbids by-ref DllImport parameters (a byref may point into movable
+  heap memory; the pinning that requires is marshaller work) and the violation surfaces under
+  Native AOT as a **runtime** `MarshalDirectiveException` — pointer-form signatures only.
+- Teardown conformance: in-callback `Stop` returns in 0 ms with both transports associated, all
+  activations complete, the host survives, `DisconnectProfileAsync` is same-second, and the
+  platform **closes the remote TCP connection at `Stop`** (verified: no surviving connection).
+- The platform QIs the plug-in for **`IVpnPlugInReconnectTransport`**
+  (`9d5a1092-bb46-4d34-9d88-f217893076f4`, windows.networking.vpn.h:5551) once per scheduling
+  activation and tolerates `E_NOINTERFACE`. That names the future reconnect feature's interface —
+  **introduced in Build 26100**, so any implementation must remain strictly optional: older
+  platforms never QI for it, and nothing may depend on its callbacks arriving.
+
+Remaining: the full throughput-ladder rerun (the 6.1 GB ISO) against master's 165 Mbit/s peak.
+
+---
+
+Probe-era status (superseded): probes 1–3 answered, 3 with profiled attribution (2026-08-17/18):
+the send path works after `Start` (deadlocks before it) and preserves order under concurrency;
+inbound deliveries are serialized at ~130 µs of CPU each on threadpool callbacks — no pump thread
+exists — so the delivery queue's utilization is what gates activation completion (~85% at
+5,000/s, ceiling ~8,500/s), a real slice of the cost being the projected `IVpnPlugIn` boundary
+itself. A datagram outer transport stays condemned by seriality.
 
 ## The idea
 
