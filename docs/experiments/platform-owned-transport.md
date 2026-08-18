@@ -1,12 +1,12 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **probes 1–3 answered (2026-08-17/18): the send path works after `Start` (deadlocks
-before it) and preserves order under concurrency, but sustained datagram deliveries starve
-activations from ~5,000/s (~56 Mbit/s) and ceiling at ~8,500/s — a datagram outer transport is
-not viable at line rate, so the design now hinges on the TCP stream transport's delivery
-granularity, which only a real attempt (or a `StreamSocketListener` experiment) can answer.**
-Nothing here is committed to; the current loopback-dummy architecture works (165 Mbit/s peak,
-clean lifecycle) and stays.
+Status: **probes 1–2 answered, probe 3 half-answered (2026-08-17/18): the send path works after
+`Start` (deadlocks before it) and preserves order under concurrency; sustained datagram
+deliveries measurably gate activation completion (stalled from ~5,000/s, visits ceiling ~8,500/s
+on this build) — but the blast ran without profiling, so whether that cost is the platform's or
+largely our own CCW boundary is unattributed. A profiled re-run comes before any verdict on the
+datagram transport.** Nothing here is committed to; the current loopback-dummy architecture works
+(165 Mbit/s peak, clean lifecycle) and stays.
 
 ## The idea
 
@@ -95,14 +95,20 @@ and the 90-second activation watchdog both still apply).
    the prolog-starvation mechanism caught in the act; **unpaced** (~30,000/s offered) the pump
    ceilings at **~8,500 visits/s** (~100 Mbit/s of 1400-byte deliveries) with the excess dropped
    at the socket buffer. No kills — 45 s of blast stays under the 90-second execution by design.
-   Consequence: **a datagram outer transport is not viable at sustained line rate** — anything
-   above ~56 Mbit/s sustained for 90 s gets the host killed, and ~100 Mbit/s is the delivery
-   ceiling regardless. The cost is per-delivery, not per-byte, so the design now hinges on the
-   **TCP stream transport's delivery granularity** — 64 KB chunks would mean ~200 deliveries/s at
-   100 Mbit/s, trivially survivable — which the loopback dummy cannot probe (TCP cannot
-   cross-connect without a `StreamSocketListener`, the one app-container loopback shape with
-   doubted behaviour). That question is only answerable with a real TCP transport — i.e. by the
-   first end-to-end attempt, or a listener experiment first.
+   What is solid: activation completion is **gated on the pending-delivery queue draining** (the
+   5 ms-after-pressure-stopped completion is the mechanism caught in the act), and at these rates,
+   on this build, the numbers above are what happened. What is **not established — no profiling
+   ran during the blast**: where the per-visit cost lives. The ceiling could be the platform
+   pump's intrinsic per-delivery work, or one pegged thread anywhere in the chain — including
+   largely on our side (the CsWinRT CCW dispatch and parameter materialization below, WPP
+   tracing), in which case the custom-CCW fix would move both the ceiling and the starvation
+   threshold and the datagram verdict softens. The unpaced blaster also burned a core of its own.
+   Before treating ~5k/s as a property of the platform: **re-run with per-thread CPU sampling**
+   (ProcessThread.TotalProcessorTime deltas each second, no suspension needed) **plus a few
+   `cdbX64 -pv` stack samples mid-blast** with cached symbols, and name the hot thread. Only then
+   does the TCP-granularity question (64 KB chunks would mean ~200 deliveries/s at 100 Mbit/s;
+   unprobeable on the loopback dummy since TCP cannot cross-connect without a
+   `StreamSocketListener`) become the design's remaining hinge.
 4. **Throughput parity**: the pipe adds one copy inbound (encapBuffer → pipe) and the chunked
    append path outbound. Raw ABI from day one (`VpnChannelAbi` gains the send-pool slots, header
    citations mandatory — this API family has two inverted slot orderings already documented) or
