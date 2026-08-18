@@ -55,9 +55,11 @@ internal sealed class InboundPacketQueue
     /// every pass whatever this is set to.
     /// </para>
     /// <para>
-    /// The pool's real size is undocumented, so this may be more than the platform will lend. An
-    /// acquisition that fails is counted and refused, which is the same backpressure as a full
-    /// queue.
+    /// The pool's real size is undocumented (verified against the docs: the
+    /// <c>GetVpnReceivePacketBuffer</c> page names the pool and warns that unreturned buffers may
+    /// make new requests fail, but no page states a size), so this may be more than the platform
+    /// will lend. An acquisition that fails is counted and refused, which is the same backpressure
+    /// as a full queue.
     /// </para>
     /// </remarks>
     public const int Capacity = 512;
@@ -157,10 +159,12 @@ internal sealed class InboundPacketQueue
     /// closed or already holds as many as it may.
     /// </returns>
     /// <remarks>
-    /// Called from the producer's thread, not the platform's. That is undocumented but is what the
-    /// reference implementation does in production; if it turns out not to hold, the fallback is to
-    /// queue plain arrays and copy them into platform buffers inside the decapsulate handler, at the
-    /// cost of a second copy per packet.
+    /// Called from the producer's thread, not the platform's. <c>VpnChannel</c> is documented
+    /// agile with an MTA threading model, so calling from any thread is allowed as far as WinRT is
+    /// concerned; what no page states is whether acquiring a receive buffer <em>outside a platform
+    /// callback</em> is supported. The reference implementation does it in production and so do
+    /// we; if it turns out not to hold, the fallback is to queue plain arrays and copy them into
+    /// platform buffers inside the decapsulate handler, at the cost of a second copy per packet.
     /// </remarks>
     public bool TryAcquire(out IntPtr packet)
     {
