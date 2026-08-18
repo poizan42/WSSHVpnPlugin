@@ -1,9 +1,9 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **probe 1 fully answered (2026-08-17): the send path works after `Start` and deadlocks
-before it; not otherwise started.** Nothing here is committed to; the current loopback-dummy
-architecture works (165 Mbit/s peak, clean lifecycle) and stays until the remaining unknowns below
-are answered cheaply.
+Status: **probes 1 and 2 answered (2026-08-17/18): the send path works after `Start` (deadlocks
+before it) and preserves order under concurrency; not otherwise started.** Nothing here is
+committed to; the current loopback-dummy architecture works (165 Mbit/s peak, clean lifecycle) and
+stays until the remaining unknowns below are answered cheaply.
 
 ## The idea
 
@@ -72,9 +72,16 @@ and the 90-second activation watchdog both still apply).
    through the started channel; and probe hygiene — any probe touching the channel pre-`Start`
    must run on a worker with a bounded wait, because an inline block burns the entire connect,
    platform retries included.
-2. **Ordering under concurrency**: SSH.NET serializes its writes, but confirm the platform
-   preserves append order across flushes from different threads, and across the boundary with
-   whatever the keep-alive path sends.
+2. **Ordering under concurrency — ANSWERED, order holds (2026-08-18).** Probed with numbered
+   payloads counted at the back socket, ~2500 datagrams in three phases: 50 flushes of 20 appends
+   each (the 32 KB-SSH-packet-chunked-at-maxFrameSize shape) arrived 1000/1000 with zero reorders
+   and zero gaps; sequential append+flush turns taken by four threads under a lock — SSH.NET's
+   serialized-writes-hopping-threads pattern, the load-bearing case — arrived 500/500 in exact
+   global order; and four *uncoordinated* concurrently-flushing threads kept all four substreams
+   complete and monotonic with no exceptions, so the API is thread-safe with margin. Throughput
+   during the probe: ~1000 append+flush cycles in ~90 ms on a live tunnel. (The keep-alive
+   boundary is untestable and moot: `GetKeepAlivePayload` is never called, and the design sends
+   SSH's own keepalives through the same single lane as everything else.)
 3. **The delivery prolog at line rate**: `VpnChannelImpl::CompleteDelivery` — the machinery that
    starved activations when the doorbell flooded it — would now process every inbound chunk of a
    150+ Mbit/s stream. Shipping SSL-VPN plug-ins live on this path, so it is presumably engineered
