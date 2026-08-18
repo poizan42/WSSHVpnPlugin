@@ -270,8 +270,7 @@ trail in `docs\experiments\platform-owned-transport.md`; the load-bearing facts:
 - **The doorbell is the optional transport**: `AssociateTransport(tcp, loopback-udp)` — without
   it, timer-driven inbound injection waits for wire data and downloads crawl at 5–13 Mbit/s with
   retransmissions; with it, 113–131 Mbit/s and zero. Deliveries are discriminated by
-  `VpnPacketBuffer.TransportAffinity` (main = 0, doorbell = 1 — learned at runtime from the first
-  multi-byte delivery, the banner, because the encoding is undocumented). A doorbell byte
+  `VpnPacketBuffer.TransportAffinity` (main = 0, doorbell = 1, as documented). A doorbell byte
   reaching the SSH stream is a MAC failure; the discrimination is correctness.
 - **Outbound wire bytes take exactly one lane**: `GetVpnSendPacketBuffer` (IVpnChannel2 slot 10)
   → `AppendVpnSendPacketBuffer`/`FlushVpnSendPacketBuffers` (IVpnChannel5 slots 7/9, IID

@@ -15,8 +15,9 @@ architecture. Everything below the line was the probe era; the build's measured 
   injection waited for wire data. The loopback datagram pair as the **optional** transport
   (`AssociateTransport(tcp, udp)` — accepted first try) restored it: **113–131 Mbit/s sustained,
   zero retransmissions**. Deliveries are discriminated by `VpnPacketBuffer.TransportAffinity`
-  (learned: main = 0, doorbell = 1; the encoding is undocumented, so it is learned from the first
-  multi-byte delivery — the banner — rather than assumed).
+  (main = 0, doorbell = 1, as the property page documents; the experiment learned the values at
+  runtime from the first multi-byte delivery — the banner — before the documentation had been
+  found, and they match).
 - The hand-rolled `IVpnPlugIn` CCW (raw `ProcessEventAsync` via `IVpnChannelStatics` slot 6,
   `[UnmanagedCallersOnly]` stubs, raw cores end to end): parity at full rate, **gen0 fell from
   ~26 to ~5–6 per 30 s** — the projected boundary was the allocation source. Lesson paid for:

@@ -82,10 +82,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     private int _keepAliveCalls;
     private int _encapsulateCalls;
 
-    /// <summary>The main transport's TransportAffinity value, or -1 until learned.</summary>
-    private int _mainAffinity = -1;
-    private int _affinityLogCalls;
-
     private long _encapsulateFailureCount;
     private long _lastFailureReportTicks;
     private Exception? _lastEncapsulateFailure;
@@ -695,18 +691,20 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             return;
         }
 
-        // Two transports deliver here: the main TCP socket carries the SSH stream and the
-        // optional loopback pair carries one-byte doorbell rings, which must never reach the
-        // stream. TransportAffinity is the discriminator; the encoding is undocumented, so the
-        // first few deliveries log affinity and length to pin it, and until proven otherwise the
-        // main transport is taken to be the affinity of the first multi-byte delivery (the SSH
-        // banner arrives before any doorbell can ring).
+        // Two transports deliver here: the main TCP socket (TransportAffinity 0) carries the SSH
+        // stream and the optional loopback pair (TransportAffinity 1) carries one-byte doorbell
+        // rings, which must never reach the stream.
         var hrAffinity = VpnChannelAbi.GetTransportAffinity(packet, out var affinity);
         if (hrAffinity < 0)
         {
             PluginLog.Error($"get_TransportAffinity failed (0x{hrAffinity:X8}); treating the delivery as main");
-            var fallback = Volatile.Read(ref _mainAffinity);
-            affinity = fallback >= 0 ? (uint)fallback : 0;
+            affinity = 0;
+        }
+
+        if (affinity != 0)
+        {
+            // A doorbell ring: the visit itself was the payload.
+            return;
         }
 
         var hr = VpnChannelAbi.AcquireReadSpan(packet, out var buffer, out var byteAccess, out var data, out var length);
@@ -719,28 +717,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         try
         {
-            var learned = Volatile.Read(ref _mainAffinity);
-            if (learned < 0 && length > 1)
-            {
-                // The first multi-byte delivery is the SSH server's banner on the main transport.
-                if (Interlocked.CompareExchange(ref _mainAffinity, (int)affinity, -1) == -1)
-                {
-                    PluginLog.Info($"Main-transport affinity learned: {affinity} ({length}-byte delivery)");
-                    learned = (int)affinity;
-                }
-            }
-
-            if (Interlocked.Increment(ref _affinityLogCalls) <= 10)
-            {
-                PluginLog.Info($"Delivery: affinity {affinity}, {length} byte(s)");
-            }
-
-            if (learned >= 0 && affinity != (uint)learned)
-            {
-                // A doorbell ring: the visit itself was the payload.
-                return;
-            }
-
             DeliveryStats.Record(length);
 
             if (length > 0)
@@ -872,8 +848,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         inbound?.ReleaseAll();
 
         Volatile.Write(ref _abiPacketChecked, 0);
-        Volatile.Write(ref _mainAffinity, -1);
-        Volatile.Write(ref _affinityLogCalls, 0);
     }
 
     /// <summary>
