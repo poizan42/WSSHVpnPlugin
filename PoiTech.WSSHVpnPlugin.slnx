@@ -1,7 +1,6 @@
 <Solution>
   <Configurations>
-    <Platform Name="Any CPU" />
-    <Platform Name="ARM64" />
+    <Platform Name="arm64" />
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
@@ -9,8 +8,7 @@
     <File Path=".editorconfig" />
   </Folder>
   <Project Path="PoiTech.WSSHVpnPlugin.App/PoiTech.WSSHVpnPlugin.App.csproj">
-    <Platform Solution="*|Any CPU" Project="x64" />
-    <Platform Solution="*|ARM64" Project="arm64" />
+    <Platform Solution="*|arm64" Project="arm64" />
     <Platform Solution="*|x64" Project="x64" />
     <Platform Solution="*|x86" Project="x86" />
   </Project>
@@ -18,7 +16,9 @@
     <Deploy />
   </Project>
   <Project Path="PoiTech.WSSHVpnPlugin.VpnPlugin/PoiTech.WSSHVpnPlugin.VpnPlugin.csproj">
-    <Platform Solution="*|Any CPU" Project="x64" />
+    <Platform Solution="*|arm64" Project="arm64" />
+    <Platform Solution="*|x64" Project="x64" />
+    <Platform Solution="*|x86" Project="x86" />
   </Project>
   <Project Path="PoiTech.WSSHVpnPlugin.Net/PoiTech.WSSHVpnPlugin.Net.csproj" />
   <Project Path="PoiTech.WSSHVpnPlugin.Net.Tests/PoiTech.WSSHVpnPlugin.Net.Tests.csproj" />
