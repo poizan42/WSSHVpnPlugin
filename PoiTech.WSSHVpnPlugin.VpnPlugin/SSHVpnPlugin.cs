@@ -20,9 +20,11 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// packets for the return direction.
 /// </para>
 /// <para>
-/// The platform is given a loopback dummy socket as its outer tunnel transport, because it takes
-/// exclusive ownership of whatever it is given; see <see cref="LoopbackTransport"/>. Inbound packets
-/// come back through <see cref="Decapsulate"/>, which the doorbell on that socket is what summons.
+/// The real SSH TCP socket is the outer tunnel transport, and the platform owns it; SSH.NET reads
+/// the wire through a pipe that <see cref="Decapsulate"/> fills and writes through the channel's
+/// send-buffer lane. See <see cref="PlatformOwnedTransport"/>. Inbound packets go back through
+/// <see cref="Decapsulate"/> too, whose visits real wire data — or the doorbell, when there is
+/// none — is what summons.
 /// </para>
 /// <para>
 /// The instance is long-lived: the background task host creates it once and reuses it for every

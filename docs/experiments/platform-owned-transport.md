@@ -1,7 +1,7 @@
 # Future experiment: run SSH over the platform-owned transport
 
-Status: **BUILT, on the `platform-owned-transport` branch (2026-08-18), through the hand-rolled
-CCW.** Everything below the line was the probe era; the build's measured results:
+Status: **BUILT and MERGED to master (2026-08-18)** — the platform-owned transport is the
+architecture. Everything below the line was the probe era; the build's measured results:
 
 - The full chain works: associate the real SSH TCP socket unconnected → connect it → `Start`
   **accepted `maxFrameSize 65536`** (the 1500 ceiling was a loopback-era artifact) → SSH

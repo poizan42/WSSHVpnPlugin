@@ -248,11 +248,12 @@ host and port, so there is no packet-for-packet encapsulation and the usual `Enc
   come back truncated with `TC` set, which makes the client retry over TCP — carried natively. Other
   UDP and all ICMP are still dropped.
 
-### THIS BRANCH: the platform-owned transport
+### The platform-owned transport (the current architecture)
 
-This branch (`platform-owned-transport`) replaces the loopback-dummy architecture below: the real
-SSH TCP socket **is** the outer tunnel transport, and the platform owns it. Full results in
-`docs\experiments\platform-owned-transport.md`; the load-bearing facts:
+Since 2026-08-18 the real SSH TCP socket **is** the outer tunnel transport, and the platform owns
+it — replacing the loopback-dummy architecture below, whose section is kept because several of
+its bullets are architecture-independent and still load-bearing. Full results and the experiment
+trail in `docs\experiments\platform-owned-transport.md`; the load-bearing facts:
 
 - **Ordering is forced**: associate the unconnected front `StreamSocket` (with `NoDelay` set
   BEFORE `AssociateTransport` — associate locks the socket's control interface), connect it to
@@ -286,10 +287,7 @@ SSH TCP socket **is** the outer tunnel transport, and the platform owns it. Full
 - Teardown conformance carried over: in-callback `Stop` 0 ms, activations complete, host
   survives, and the platform closes the remote TCP connection at `Stop`.
 
-The loopback-dummy section below describes **master's architecture**; its route/exclusion bullets
-and the `Stop`-in-`Disconnect` mechanism are architecture-independent and still load-bearing.
-
-### The outer tunnel transport is a loopback dummy (master's architecture)
+### The outer tunnel transport is a loopback dummy (the former architecture)
 
 The platform takes **exclusive ownership** of whatever is passed to `AssociateTransport`: it registers
 the socket as a ControlChannelTrigger, then `Start*` calls `WaitForPushEnabled`,

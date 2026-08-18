@@ -27,10 +27,7 @@ public sealed class VpnBackgroundTask : IBackgroundTask
     /// How many activations to log before going quiet. Encapsulate runs at line rate, so this is a
     /// diagnostic budget rather than a running commentary.
     /// </summary>
-    // TEMPORARY: raised from 25 for the TCP-granularity probe (docs/experiments/
-    // platform-owned-transport.md) - activation completion latency during the blast is a primary
-    // measurement.
-    private const int ActivationLogBudget = 500;
+    private const int ActivationLogBudget = 25;
 
     private static int _activations;
 

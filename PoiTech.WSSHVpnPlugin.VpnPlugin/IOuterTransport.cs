@@ -3,13 +3,13 @@ using System;
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 
 /// <summary>
-/// The socket handed to the platform as the outer tunnel transport, whatever shape it takes.
+/// The sockets handed to the platform as the outer tunnel transports.
 /// </summary>
 /// <remarks>
-/// Two shapes exist because it is not yet known which one the platform will accept. A loopback pair
-/// carries nothing and lets us ring a doorbell to provoke a decapsulate call; a real connection to
-/// the SSH server carries nothing useful either, but looks like what a control channel trigger is
-/// for — a remote connection worth waking the machine for — and cannot be rung.
+/// One implementation remains — <see cref="PlatformOwnedTransport"/>, the real SSH TCP socket as
+/// the main transport plus a loopback datagram pair as the doorbell — but the seam stays: the
+/// packet path only needs "something the platform accepted at Start, with a doorbell to provoke
+/// decapsulate visits", and the loopback-dummy era proved a second shape can live behind it.
 /// </remarks>
 internal interface IOuterTransport : IDisposable
 {
