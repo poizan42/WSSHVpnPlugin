@@ -36,7 +36,8 @@ architecture. Everything below the line was the probe era; the build's measured 
 had Canonical's servers as an uncontrolled variable; the honest measurement is iperf3 against a
 loopback alias on the SSH server (`sudo ip addr add 198.51.100.1/32 dev lo`), because the
 server's own address is excluded from the tunnel: **the platform's pinning is a host route**
-(`212.71.253.111/32 → physical NIC`, observed) — a first iperf against the server's real address
+(a `/32` for the SSH server's address out the physical NIC, observed) — a first iperf against the
+server's real address
 bypassed the tunnel entirely and measured the raw line instead (~500–630 Mbit/s down, ~110 up,
 nominally 1000/100).
 
@@ -49,6 +50,7 @@ nominally 1000/100).
   this branch land in the same band: they share both threads.
 - Next optimization territory (beyond this experiment): cipher negotiation (AES-GCM would delete
   the HMAC pass), the upload path (38.8 vs the line's ~110), and T-Stack's per-packet costs.
+  Full method, numbers and caveats: `docs/profiling/2026-08-18-tunnel-cpu-cap.md`.
 
 ---
 
