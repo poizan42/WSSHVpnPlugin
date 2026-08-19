@@ -365,17 +365,37 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   `Find-NetRoute` picks that NIC. The routing table is right and something above it redirects anyway,
   so a route-table reading will tell you the opposite of what happens. The cost is real: every such
   flow becomes a channel open the SSH server cannot serve, and each one blocks until the SSH timeout.
-- **`Ipv4ExclusionRoutes` *does* work, and is the fix for the above.** Measured across two runs of
-  comparable length with nothing else changed: 11 flows to the client's own subnet before, 0 after,
-  and no other flow affected. The route is accepted without complaint — no `WSAEACCES`, which is what
-  the reference implementation recorded when using this API for a different purpose (keeping the SSH
-  server itself reachable), so that failure does not generalise. Exposed as `<ExcludeRoute>` and kept
-  configurable rather than made a blanket rule about private addresses: routing a *remote* private
-  range in is the whole point of a VPN and uses the same machinery, so the two cases can only be told
-  apart by the person configuring it.
+- **`Ipv4ExclusionRoutes` does not work either — route-based exclusion is inert here.** It is
+  *accepted* (we log `Excluding <range> from the tunnel` only on success, no `WSAEACCES` — so the
+  reference implementation's failure with this API for a different purpose does not generalise), and
+  it changes nothing. Disproved by direct route lookup with the tunnel up and the client's own LAN
+  `/24` excluded: the machine holds a DHCP address on that `/24` via a **connected** interface whose
+  on-link route is both more specific and better-metric than the tunnel's (`/24` at total metric 281
+  against `0.0.0.0/1` at 311), and `Find-NetRoute` still returns the tunnel interface and hands out
+  the *tunnel* source address — which is the source address those flows then carry into
+  `Encapsulate`. A `/24` losing to a `/1` is not a routing decision, so this is the same
+  above-the-table redirection as `ExcludeLocalSubnets`, and the two knobs fail identically.
+  The earlier claim here — "11 flows before, 0 after" across two runs — was too weak to carry the
+  conclusion it was given: those were incidental browser flows, and not recurring in the second run
+  is not the same as being excluded. What survives is that one long-lived retry loop punches straight
+  through: 2,638 flows to a host inside the excluded range in one session, and 2,457 in an earlier
+  one, every one of them logged as excluded.
+- **The documented place this lives is `VpnTrafficFilter.RoutingPolicyType`**, not the route
+  assignment: it "Gets or sets whether the apps allowed by this traffic filter are force tunneled
+  through the VPN interface, or whether they are split tunneled and allowed to talk through other
+  interfaces". So an exclusion is not a deny rule but an *allow* filter matching the range, carrying
+  `SplitRouting` — and it acts at the layer that is actually doing the redirecting. A plug-in can
+  supply one without touching the profile: `VpnTrafficFilterAssignment` is documented for plug-in
+  use, and `StartWithTrafficFilter` has an overload taking the same main and optional transports we
+  already pass plus the assignment. Untried as of 2026-08-19; `AllowInbound`/`AllowOutbound` have no
+  documented defaults, so probe them before trusting an assignment not to deny everything, and keep
+  the `StartWithMainTransport` path reachable, because `Start` is single-shot per activation.
+  `<ExcludeRoute>` stays configuration rather than a blanket rule about private addresses either way:
+  routing a *remote* private range in is the whole point of a VPN and uses the same machinery, so the
+  two cases can only be told apart by the person configuring it.
 - **SSH is source-bound** to a chosen interface (`OutboundInterface`), not kept out with
   `Ipv4ExclusionRoutes` (which returned `WSAEACCES` for that purpose in the reference implementation;
-  ours is untested for it, and the exclusion of ordinary subnets above works fine).
+  ours is untested for it, and route-based exclusion does not work here anyway — see above).
   `GetInternetConnectionProfile` is useless here —
   its "preferred interface" becomes the tunnel. The heuristic cannot tell our tunnel from another
   VPN's TAP adapter, so `<NetworkAdapter>` in the profile is a real requirement when nesting, not a
@@ -547,8 +567,22 @@ Deliberate, documented, and not to be silently papered over:
 - **`MaximumLiveChannels = 128` is now the binding limit for browsing**, not CPU. A 10-minute
   Release-build browsing session logged **578** `Refusing a channel … 128 channels already live`
   with flows reaching 102, while the process used only 7.8 s of CPU across the whole trace. The
-  refusals are not new — the Debug session had 874 — but nothing above them is saturated any more,
-  so raising the cap (or reaping idle channels sooner) is the next thing browsing wants.
+  refusals are not new — the Debug session had 874 — but nothing above them is saturated any more.
+  **Raising the cap is not the first fix, though**: about **35 of the 128 slots are permanently held
+  by opens to unreachable destinations**, and that is arithmetic rather than a guess. Little's law on
+  the same session: 16.7 open timeouts/min (0.278/s) against a steady 26–48 non-flow channels implies
+  a **126 s** hold, which is Linux's default `tcp_syn_retries = 6` — 1+2+4+8+16+32+64 = 127 s — spent
+  in the server's `connect()` to a host that is switched off. Our `<OpenTimeoutSeconds>` abandons the
+  *wait* after 3 s but the slot keeps counting, correctly, because the server really is still holding
+  the channel. Almost all of it is one LAN destination that should never have entered the tunnel at
+  all (see the exclusion bullets above), so fixing the exclusion reclaims those slots; raising the cap
+  first just buys the retry loop more room. The refusals themselves are browsing-driven — they appear
+  only once flows pass ~90, while the retry loop stays flat at ~16/min.
+- **Nobody has measured what the SSH server tolerates in concurrent `direct-tcpip` channels.** 128 was
+  picked when it replaced the 8-slot blocking pool, justified as a bound on memory and server-side
+  channel state, and never validated against a real server. OpenSSH's `MaxSessions` does not apply to
+  port forwards — it caps shell/exec/subsystem multiplexing — so the real ceiling is likely file
+  descriptors at both ends and far higher, but that is recitation, not measurement.
 - The bring-up scaffolding is gone: `M0Spike` (`<SpikeProbe>`), `RemoteDummyTransport`,
   `<LargeFrameSize>` and the `<AssignIPv6>` switch were all removed once their questions were
   answered — the IPv6 address assignment is now unconditional, because there is no working value of
