@@ -34,9 +34,6 @@ internal sealed class SshVpnConfiguration
 {
     public const string RootElementName = "SshVpnConfiguration";
 
-    /// <summary>The default MTU. Sized to leave room for the SSH record overhead over a 1500 byte path.</summary>
-    public const uint DefaultMtu = 1400;
-
     private SshVpnConfiguration(string host)
     {
         Host = host;
@@ -56,17 +53,6 @@ internal sealed class SshVpnConfiguration
     /// to authenticate with a password.
     /// </summary>
     public string? PrivateKeyPath { get; private init; }
-
-    /// <summary>
-    /// Gets a value indicating whether to route IPv6 into the tunnel as well as assigning an address.
-    /// </summary>
-    /// <remarks>
-    /// An IPv6 <em>address</em> is always assigned — <c>Start*</c> fails with <c>E_OUTOFMEMORY</c>
-    /// when the assigned IPv6 address list is empty — but this is off by default and expected to
-    /// stay off until the stack can carry IPv6: routing it in with nothing behind it black-holes
-    /// IPv6 instead of leaving it on the physical interface.
-    /// </remarks>
-    public bool RouteIPv6 { get; private init; }
 
     /// <summary>
     /// Gets how long to wait before starting the channel, so a debugger can be attached to the
@@ -99,9 +85,6 @@ internal sealed class SshVpnConfiguration
     /// VPN. See <see cref="OutboundInterface"/>.
     /// </remarks>
     public string? NetworkAdapter { get; private init; }
-
-    /// <summary>Gets the MTU to advertise on the virtual interface.</summary>
-    public uint Mtu { get; private init; } = DefaultMtu;
 
     /// <summary>
     /// Gets how many seconds a channel open may wait for the server's answer before the connection
@@ -176,12 +159,10 @@ internal sealed class SshVpnConfiguration
             Port = ReadUInt32(root, "Port", 22),
             UserName = ReadString(root, "UserName"),
             PrivateKeyPath = ReadString(root, "PrivateKeyPath"),
-            RouteIPv6 = string.Equals(ReadString(root, "RouteIPv6"), "true", StringComparison.OrdinalIgnoreCase),
             StartDelaySeconds = ReadUInt32(root, "StartDelaySeconds", 0),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
             NetworkAdapter = ReadString(root, "NetworkAdapter"),
-            Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             OpenTimeoutSeconds = ReadUInt32(root, "OpenTimeoutSeconds", 3),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),

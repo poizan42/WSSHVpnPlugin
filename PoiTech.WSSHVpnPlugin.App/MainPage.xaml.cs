@@ -129,19 +129,6 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
-    /// Runs the loopback datagram exchange the plug-in's outer tunnel transport depends on.
-    /// </summary>
-    /// <remarks>
-    /// Here rather than in the plug-in because it needs no VPN channel: the app container check is
-    /// on the package, which is the same one. If this fails, nothing about the tunnel can work, and
-    /// finding that out costs a click instead of an activation.
-    /// </remarks>
-    private async void OnTestLoopbackClick(object sender, RoutedEventArgs e)
-    {
-        await RunAsync("Test loopback", async () => Log(await LoopbackProbe.RunAsync()));
-    }
-
-    /// <summary>
     /// Dumps what the VPN platform actually has registered.
     /// </summary>
     /// <remarks>
@@ -325,7 +312,6 @@ public sealed partial class MainPage : Page
         ConnectButton.IsEnabled = !busy;
         DisconnectButton.IsEnabled = !busy;
         DeleteButton.IsEnabled = !busy;
-        LoopbackButton.IsEnabled = !busy;
         ListButton.IsEnabled = !busy;
     }
 

@@ -47,7 +47,6 @@
             <Button x:Name="ConnectButton" Content="Connect" Click="OnConnectClick"/>
             <Button x:Name="DisconnectButton" Content="Disconnect" Click="OnDisconnectClick"/>
             <Button x:Name="DeleteButton" Content="Delete profile" Click="OnDeleteProfileClick"/>
-            <Button x:Name="LoopbackButton" Content="Test loopback" Click="OnTestLoopbackClick"/>
             <Button x:Name="ListButton" Content="List profiles" Click="OnListProfilesClick"/>
         </StackPanel>
 

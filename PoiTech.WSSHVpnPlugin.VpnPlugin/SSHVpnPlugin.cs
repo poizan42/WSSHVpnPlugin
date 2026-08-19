@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Threading;
+using PoiTech.WSSHVpnPlugin.Net;
 using Windows.Networking;
 using Windows.Networking.Vpn;
 
@@ -223,13 +224,15 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         // option for a while and there is no working value of "off".
         var ipv6 = new List<HostName> { new HostName("fd00::2") };
 
-        var mtu = configuration.Mtu;
+        // Sized to leave room for the SSH record overhead over a 1500-byte path, and the platform's
+        // documented ceiling for this argument anyway.
+        const uint mtu = 1400;
 
-        // The gamble this branch tests: the frame size may cap both directions' buffers, and
-        // 1500-byte deliveries at line rate is the serial-cost death scenario (~8,300/s against a
-        // measured ~8,500/s ceiling). The docs' 1500 ceiling applied to mtu+encapsulation on the
-        // old architecture; here the wire is an SSH byte stream and the buffers carry stream
-        // chunks, not frames. If Start rejects this, one redeploy falls back to 1500.
+        // The frame size caps both directions' buffers, and 1500-byte deliveries at line rate is the
+        // serial-cost death scenario (~8,300/s against a measured ~8,500/s ceiling). The docs' 1500
+        // ceiling applied to mtu+encapsulation on the old architecture; here the wire is an SSH byte
+        // stream and the buffers carry stream chunks, not frames. Accepted in practice, and stream
+        // deliveries average ~40 KB as a result.
         const uint frameSize = 65536;
 
         try
@@ -986,44 +989,95 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         if (configuration.InclusionRoutes.Count == 0)
         {
-            assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName("0.0.0.0"), 1));
-            assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName("128.0.0.0"), 1));
+            AddIpv4InclusionRoutes(
+                assignment,
+                configuration,
+                [new Ipv4Prefix(0, 1), new Ipv4Prefix(0x80000000, 1)]);
 
-            // Deliberately no IPv6 routes, even though an IPv6 address has to be assigned for Start
-            // to succeed at all. There is no IPv6 stack behind this tunnel, so routing IPv6 into it
-            // would black-hole it; leaving it unrouted keeps it on the physical interface. That is a
-            // leak, and an accepted one until the stack grows an IPv6 path.
-            if (configuration.RouteIPv6)
-            {
-                assignment.Ipv6InclusionRoutes.Add(new VpnRoute(new HostName("::"), 1));
-                assignment.Ipv6InclusionRoutes.Add(new VpnRoute(new HostName("8000::"), 1));
-            }
+            // No IPv6 routes, ever, even though an IPv6 address has to be assigned for Start to
+            // succeed at all. There is no IPv6 stack behind this tunnel, so routing IPv6 in would
+            // black-hole it; leaving it unrouted keeps it on the physical interface. That is a leak,
+            // and an accepted one until the stack grows an IPv6 path — at which point this becomes a
+            // deliberate addition rather than a switch nobody could safely turn on.
         }
         else
         {
+            var configured = new List<Ipv4Prefix>(configuration.InclusionRoutes.Count);
             foreach (var route in configuration.InclusionRoutes)
             {
-                assignment.Ipv4InclusionRoutes.Add(ParseRoute(route));
+                configured.Add(Ipv4Prefix.Parse(route));
             }
+
+            AddIpv4InclusionRoutes(assignment, configuration, configured);
         }
 
-        // Exclusions after inclusions, and reported either way: the reference implementation records
-        // this API failing with an access error, so whether it is accepted here is worth knowing from
-        // the log rather than inferred from behaviour.
+        return assignment;
+    }
+
+    /// <summary>
+    /// Adds the IPv4 inclusion routes, with the configured exclusions subtracted out of them.
+    /// </summary>
+    /// <param name="assignment">The assignment to add to.</param>
+    /// <param name="configuration">Supplies <c>&lt;ExcludeRoute&gt;</c>.</param>
+    /// <param name="included">What the tunnel would carry if nothing were excluded.</param>
+    /// <remarks>
+    /// <para>
+    /// Exclusion is by omission, because the platform's own exclusion knobs do nothing:
+    /// <c>Ipv4ExclusionRoutes</c> and <c>ExcludeLocalSubnets</c> are both accepted and both change
+    /// nothing — with the client's LAN excluded, a route lookup for a host in it still returns the
+    /// tunnel and the tunnel's source address, even against a more specific, better-metric on-link
+    /// route on the physical NIC. The inclusion list <em>is</em> honoured, since it is how the tunnel
+    /// gets traffic at all, so removing a range from it is the one lever that bites. See
+    /// <see cref="Ipv4Prefix"/> for why this generalises where a split-routing traffic filter would
+    /// not.
+    /// </para>
+    /// <para>
+    /// A configuration that excludes everything is refused rather than passed on: a tunnel with no
+    /// routes carries nothing, which is a worse and much more confusing failure than an exclusion
+    /// that did not take.
+    /// </para>
+    /// </remarks>
+    private static void AddIpv4InclusionRoutes(
+        VpnRouteAssignment assignment,
+        SshVpnConfiguration configuration,
+        IReadOnlyList<Ipv4Prefix> included)
+    {
+        var excluded = new List<Ipv4Prefix>(configuration.ExclusionRoutes.Count);
         foreach (var route in configuration.ExclusionRoutes)
         {
             try
             {
-                assignment.Ipv4ExclusionRoutes.Add(ParseRoute(route));
-                PluginLog.Info($"Excluding {route} from the tunnel");
+                excluded.Add(Ipv4Prefix.Parse(route));
             }
-            catch (Exception ex)
+            catch (FormatException ex)
             {
-                PluginLog.Error($"Could not exclude '{route}'", ex);
+                PluginLog.Error($"Ignoring the malformed exclusion '{route}'", ex);
             }
         }
 
-        return assignment;
+        var routes = excluded.Count == 0 ? included : Ipv4Prefix.Subtract(included, excluded);
+
+        if (routes.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "The configured exclusions cover every included route, which would leave the tunnel "
+                + "with no routes at all. Narrow <ExcludeRoute> or widen <InclusionRoute>.");
+        }
+
+        foreach (var prefix in routes)
+        {
+            assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName(prefix.ToAddressString()), prefix.Length));
+        }
+
+        if (excluded.Count > 0)
+        {
+            // Worth logging in full the first time this runs on a machine: the count is the thing to
+            // watch, since it is the one unknown here — the platform used to be handed 2 routes and
+            // is now handed as many as the arithmetic produces.
+            PluginLog.Info(
+                $"Excluding {excluded.Count} range(s) by omission: {routes.Count} inclusion route(s) "
+                + $"[{string.Join(", ", routes)}]");
+        }
     }
 
     private static VpnDomainNameAssignment BuildDomainNameAssignment(SshVpnConfiguration configuration)
@@ -1049,20 +1103,4 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         return assignment;
     }
 
-    private static VpnRoute ParseRoute(string cidr)
-    {
-        var slash = cidr.IndexOf('/');
-        if (slash < 0)
-        {
-            return new VpnRoute(new HostName(cidr), 32);
-        }
-
-        var address = cidr[..slash];
-        if (!byte.TryParse(cidr[(slash + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out var prefix))
-        {
-            throw new FormatException($"'{cidr}' is not a valid route: the prefix length is not a number.");
-        }
-
-        return new VpnRoute(new HostName(address), prefix);
-    }
 }
