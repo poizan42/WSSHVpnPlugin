@@ -12,17 +12,18 @@
     <DefaultLanguage>en-US</DefaultLanguage>
     <PublishAot>true</PublishAot>
     <!--
-      Published as its own native DLL rather than linked into the app's executable, which is what
-      lets the platform host the plug-in in backgroundtaskhost.exe. Sharing the executable meant
-      sharing the process with a XAML application, and PLM suspending that application ran
+      Its own executable, hosting itself: backgroundtaskhost.exe is not an option, because a
+      vpnClient task requires a custom background task host (omitting Executable on the extension
+      fails registration with 0x80080204), so Program.Main runs
+      CoreApplication.RunWithActivationFactories and both the extension's Executable and the
+      inProcessServer Path in the manifest name this binary.
+
+      Separate from the app's executable, and deliberately: sharing it put the tunnel inside a
+      XAML application's process, and PLM suspending that application ran
       DXamlCore::OnAfterAppSuspend -> ReferenceTrackerManager::TriggerCollectionForSuspend ->
       GC.Collect() inside the VPN host. That collection deadlocks against a ComWrappers callout,
-      Windows logs "stopped interacting with Windows and was closed", and the tunnel dies about a
+      Windows logs "stopped interacting with Windows and was closed", and the tunnel died about a
       minute after every connect. A background host has no use for a XAML app; this keeps it out.
-
-      CsWinRT's generator emits the DllGetActivationFactory export, so the DLL satisfies the
-      package's windows.activatableClass.inProcessServer registration directly - no re-export from
-      the app is needed any more.
     -->
     <OutputType>WinExe</OutputType>
     <Platforms>x86;x64;arm64</Platforms>
