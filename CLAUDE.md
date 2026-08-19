@@ -203,8 +203,12 @@ by experiment; each attempt costs a deploy, and the channel is **single-shot** (
   unconnected. `Start*` then calls `WaitForPushEnabled`, `TakeTransportOwnership` and
   `VpnExeChannelCreate`, after which **the VPN service reads and writes that socket**. A plug-in
   cannot run its own protocol on it — SSH bytes get consumed by the platform's reader.
-- So the SSH session runs on a **separate socket the platform never sees**, bound to the physical
-  interface, and the platform gets a **loopback dummy socket** as its transport.
+- That ruled out giving the platform the SSH socket, and the answer for two months was a **loopback
+  dummy** transport with SSH on a separate source-bound socket — see
+  `docs\history\loopback-dummy-transport.md`. Superseded on 2026-08-18: the SSH socket *is* the
+  transport now, and the platform reading and writing it is the point rather than the problem, because
+  `Decapsulate` hands those bytes to the session. The bullets below still describe `Start*` itself and
+  hold either way.
 - **`E_OUTOFMEMORY` from `Start*` means the assigned IPv6 address list was empty.** Bisected to a
   single variable: with `mtu 1400` / `maxFrameSize 1500` unchanged, adding one IPv6 address
   (`fd00::2`) turns a hard failure into `StartWithMainTransport accepted`. Assign at least one address
@@ -276,9 +280,11 @@ host and port, so there is no packet-for-packet encapsulation and the usual `Enc
 ### The platform-owned transport (the current architecture)
 
 Since 2026-08-18 the real SSH TCP socket **is** the outer tunnel transport, and the platform owns
-it — replacing the loopback-dummy architecture below, whose section is kept because several of
-its bullets are architecture-independent and still load-bearing. Full results and the experiment
-trail in `docs\experiments\platform-owned-transport.md`; the load-bearing facts:
+it — replacing the loopback-dummy architecture, which is now history and lives in
+`docs\history\loopback-dummy-transport.md`. The findings of that era that outlived it were
+architecture-independent and stayed here, under **Routing** and **Injection, ringing and teardown**
+below. Full results and the experiment trail in `docs\experiments\platform-owned-transport.md`; the
+load-bearing facts:
 
 - **Ordering is forced**: associate the unconnected front `StreamSocket` (with `NoDelay` set
   BEFORE `AssociateTransport` — associate locks the socket's control interface), connect it to
@@ -308,64 +314,17 @@ trail in `docs\experiments\platform-owned-transport.md`; the load-bearing facts:
 - The platform QIs the plug-in for `IVpnPlugInReconnectTransport` (h:5551) per scheduling
   activation and tolerates `E_NOINTERFACE`. Introduced in Build 26100 — a future implementation
   must stay optional; older platforms never ask.
+- The design this replaced — a cross-connected loopback dummy handed to the platform, with SSH on a
+  source-bound socket of its own — is in `docs\history\loopback-dummy-transport.md`, including why
+  the platform cannot simply be given the SSH socket. Nothing there describes current code.
 - Teardown conformance carried over: in-callback `Stop` 0 ms, activations complete, host
   survives, and the platform closes the remote TCP connection at `Stop`.
 
-### The outer tunnel transport is a loopback dummy (the former architecture)
+### Routing: what the tunnel carries, and what it must not
 
-The platform takes **exclusive ownership** of whatever is passed to `AssociateTransport`: it registers
-the socket as a ControlChannelTrigger, then `Start*` calls `WaitForPushEnabled`,
-`TakeTransportOwnership` and `VpnExeChannelCreate`, after which the VPN service reads and writes it
-itself. An SSH session running over that socket has its bytes stolen — we watched the banner come back
-corrupted. Established by crash dump, live stack and disassembly of `Windows.Networking.Vpn.dll`; do
-not re-derive it.
+Architecture-independent — all of this held under the loopback-dummy transport and holds under the
+platform-owned one, because it is about the routes handed to `Start*` rather than about the transport.
 
-So `LoopbackTransport` hands the platform a cross-connected pair of `DatagramSocket`s on `127.0.0.1`
-that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
-
-- **Order**: `AssociateTransport` first and on an *unconnected* socket, then bind both, then
-  cross-connect, then `StartWithMainTransport` passing the same socket. Calling `Start*` on a channel
-  that never had `AssociateTransport` dereferences NULL and kills the host; connecting before
-  associating earns `E_OUTOFMEMORY` from the CCT broker, which is not about memory.
-- **Datagrams, never a listener.** TCP cannot cross-connect, so a `StreamSocket` dummy would need a
-  `StreamSocketListener` — the one loopback shape whose app-container behaviour is doubtful. Loopback
-  itself needs no exemption: the check passes when both endpoints share the package SID.
-- **Inbound injection goes through `Decapsulate`, woken by a doorbell.** Writing one byte to the back
-  socket makes the platform raise the event. The producer calls `GetVpnReceivePacketBuffer()` on its
-  *own* thread, writes the packet directly into that buffer and queues it (`InboundPacketQueue`);
-  `Decapsulate` only appends, which is what returns the buffer. One copy, not two. The back socket is
-  a classic UDP `Socket`, not a `DatagramSocket`: it only ever sends, and the WinRT stream adapter
-  cost an async-operation RCW plus a reflection-computed interface GUID per ring, sampled live.
-- **Ring per empty→non-empty transition, never per batch** — see the activation-watchdog section
-  below for why per-batch rings kill the host at line rate. The old per-batch rule existed because
-  transition-only ringing once stalled forever ("nothing drains, so it never empties, so no later
-  enqueue is a transition"); that deadlock is closed by `Decapsulate`'s exit ring (a drain that
-  leaves work behind rings on its way out), which makes a non-empty queue always owed a visit by
-  induction, and a 250 ms safety re-ring in the stack loop covers an actually lost datagram.
-- **`channel.Stop()` must be called synchronously inside the `Disconnect` callback — and only
-  there.** The docs mean it: `IVpnPlugIn.Disconnect` "instructs the VPN plug-in to ... destroy the
-  VPN channel", and `Stop` is the destroy call. Called in that window it returns in ~0 ms, the
-  disconnect activation completes in half a second, and — the payoff — **the connection-long
-  activation finally completes too** (`VpnExeWaitForTaskToIdle` was waiting for exactly this), so
-  the host is never condemned and no `ExecutionTimeExceeded` cancellations appear at all.
-  Everywhere else `Stop` can never return, and the deadlock is the platform's own, named from a
-  dump taken inside the block (public symbols, disassembly verified):
-  `VpnChannelImpl::DisconnectInternal` runs on the same thread *after* the callback returns,
-  acquires the channel's SRW lock (`this+0xE8`) and then — only when the transport vector is still
-  populated, i.e. only when the plug-in did not stop first — virtually calls
-  `VpnChannelImpl::Stop`, whose first act is to acquire the same non-reentrant lock. That fallback
-  self-deadlocks the disconnect activation inside `ProcessEventAsync` forever; a late `Stop()` of
-  ours just queues a second victim behind it (both were on-stack in the same dump, blocked at
-  `Stop+0x5b`, `LockExclusive`), and only host death resolves the disconnect — which is why, in
-  the non-conforming era, `DisconnectProfileAsync` completed exactly when the host exited. The
-  in-callback `Stop` is safe only with no platform buffers in our hands (`IsFinished`), which a
-  clean disconnect satisfies because the stack thread is joined first; otherwise the old
-  choreography still runs — close the queue, ring once more, let `Decapsulate` finish the teardown,
-  `OnStopWatchdog` reporting whether that call arrived. The bounded wait around the in-callback
-  `Stop` (8 s, then retire) is armor, not expectation: it has measured 0 ms every time.
-  (Curiosity from the same disassembly: `Stop` checks a WIL flag literally named
-  `Feature_VPN_BugFixes_25A` right after taking the lock — Microsoft may have a staged fix for
-  this family of bugs.)
 - **Never a literal `0.0.0.0/0` inclusion route** — recorded in the reference implementation as looping
   back through the tunnel even from a bound socket. Use `0.0.0.0/1` + `128.0.0.0/1`. And only add
   routes for a family that has an assigned address, or the platform hangs.
@@ -422,13 +381,50 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   `<ExcludeRoute>` stays configuration rather than a blanket rule about private addresses either way:
   routing a *remote* private range in is the whole point of a VPN and uses the same machinery, so the
   two cases can only be told apart by the person configuring it.
-- **SSH is source-bound** to a chosen interface (`OutboundInterface`), not kept out with
-  `Ipv4ExclusionRoutes` (which returned `WSAEACCES` for that purpose in the reference implementation;
-  ours is untested for it, and route-based exclusion does not work here anyway — see above).
-  `GetInternetConnectionProfile` is useless here —
-  its "preferred interface" becomes the tunnel. The heuristic cannot tell our tunnel from another
-  VPN's TAP adapter, so `<NetworkAdapter>` in the profile is a real requirement when nesting, not a
-  nicety.
+
+### Injection, ringing and teardown
+
+Also architecture-independent, and the three findings from the loopback-dummy era that outlived it.
+The doorbell is still a loopback datagram pair; it is just the *optional* transport now, alongside the
+real SSH socket, rather than a dummy standing in for one.
+
+- **Inbound injection goes through `Decapsulate`, woken by a doorbell.** Writing one byte to the back
+  socket makes the platform raise the event. The producer calls `GetVpnReceivePacketBuffer()` on its
+  *own* thread, writes the packet directly into that buffer and queues it (`InboundPacketQueue`);
+  `Decapsulate` only appends, which is what returns the buffer. One copy, not two. The back socket is
+  a classic UDP `Socket`, not a `DatagramSocket`: it only ever sends, and the WinRT stream adapter
+  cost an async-operation RCW plus a reflection-computed interface GUID per ring, sampled live.
+- **Ring per empty→non-empty transition, never per batch** — see the activation-watchdog section
+  below for why per-batch rings kill the host at line rate. The old per-batch rule existed because
+  transition-only ringing once stalled forever ("nothing drains, so it never empties, so no later
+  enqueue is a transition"); that deadlock is closed by `Decapsulate`'s exit ring (a drain that
+  leaves work behind rings on its way out), which makes a non-empty queue always owed a visit by
+  induction, and a 250 ms safety re-ring in the stack loop covers an actually lost datagram.
+- **`channel.Stop()` must be called synchronously inside the `Disconnect` callback — and only
+  there.** The docs mean it: `IVpnPlugIn.Disconnect` "instructs the VPN plug-in to ... destroy the
+  VPN channel", and `Stop` is the destroy call. Called in that window it returns in ~0 ms, the
+  disconnect activation completes in half a second, and — the payoff — **the connection-long
+  activation finally completes too** (`VpnExeWaitForTaskToIdle` was waiting for exactly this), so
+  the host is never condemned and no `ExecutionTimeExceeded` cancellations appear at all.
+  Everywhere else `Stop` can never return, and the deadlock is the platform's own, named from a
+  dump taken inside the block (public symbols, disassembly verified):
+  `VpnChannelImpl::DisconnectInternal` runs on the same thread *after* the callback returns,
+  acquires the channel's SRW lock (`this+0xE8`) and then — only when the transport vector is still
+  populated, i.e. only when the plug-in did not stop first — virtually calls
+  `VpnChannelImpl::Stop`, whose first act is to acquire the same non-reentrant lock. That fallback
+  self-deadlocks the disconnect activation inside `ProcessEventAsync` forever; a late `Stop()` of
+  ours just queues a second victim behind it (both were on-stack in the same dump, blocked at
+  `Stop+0x5b`, `LockExclusive`), and only host death resolves the disconnect — which is why, in
+  the non-conforming era, `DisconnectProfileAsync` completed exactly when the host exited. The
+  in-callback `Stop` is safe only with no platform buffers in our hands (`IsFinished`), which a
+  clean disconnect satisfies because the stack thread is joined first; otherwise the old
+  choreography still runs — close the queue, ring once more, let `Decapsulate` finish the teardown,
+  `OnStopWatchdog` reporting whether that call arrived. The bounded wait around the in-callback
+  `Stop` (8 s, then retire) is armor, not expectation: it has measured 0 ms every time.
+  (Curiosity from the same disassembly: `Stop` checks a WIL flag literally named
+  `Feature_VPN_BugFixes_25A` right after taking the lock — Microsoft may have a staged fix for
+  this family of bugs.)
+
 
 ### The 90-second activation watchdog, and the event prolog that trips it
 
