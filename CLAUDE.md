@@ -582,6 +582,18 @@ measured, and most plausible theories were wrong; the order below is the order o
   Debug's apparent AES cost was managed CTR scaffolding that inlined away. So the standing
   cipher-suite item is now the top controllable cost and worth doing —
   see `docs\profiling\2026-08-19-release-build.md`.
+- **A cap that looked binding was holding dead weight.** `MaximumLiveChannels = 128` appeared to be
+  the limit for browsing, and was not. A 10-minute Release browsing session logged **578** `Refusing a channel … 128 channels already
+  live` with flows reaching 102, on 7.8 s of process CPU — so nothing above the cap was saturated.
+  But ~35 of the 128 slots were permanently held by opens to unreachable destinations, and Little's
+  law named the mechanism exactly: 16.7 open timeouts/min (0.278/s) against a steady 26–48 non-flow
+  channels implies a **126 s** hold, which is Linux's default `tcp_syn_retries = 6` —
+  1+2+4+8+16+32+64 = 127 s — spent in the server's `connect()` to a switched-off host. Our
+  `<OpenTimeoutSeconds>` abandons the *wait* after 3 s while the slot keeps counting, correctly,
+  because the server really is still holding the channel. Fixing the routing so that traffic never
+  entered the tunnel reclaimed all of it: the next five-minute session ran `18 flows over 20 channels`
+  with zero refusals and zero timeouts. The lesson is the order — a cap that looks binding may be
+  holding dead weight, and raising it first would only have bought the retry loop more room.
 
 ### Open holes
 
@@ -594,34 +606,11 @@ Deliberate, documented, and not to be silently papered over:
   it instead — which is why the `<RouteIPv6>` switch was deleted rather than left at its only usable
   value. Routing IPv6 in becomes a deliberate addition once the stack can carry it.
 - **UDP other than DNS, and all ICMP, are dropped.** No SSH primitive carries either.
-- ~~**`MaximumLiveChannels = 128` is the binding limit for browsing.**~~ **Closed 2026-08-19 — it was
-  the broken exclusion, not the cap.** Worth keeping for the arithmetic, which is the transferable
-  part. A 10-minute Release browsing session logged **578** `Refusing a channel … 128 channels already
-  live` with flows reaching 102, on 7.8 s of process CPU — so nothing above the cap was saturated.
-  But ~35 of the 128 slots were permanently held by opens to unreachable destinations, and Little's
-  law named the mechanism exactly: 16.7 open timeouts/min (0.278/s) against a steady 26–48 non-flow
-  channels implies a **126 s** hold, which is Linux's default `tcp_syn_retries = 6` —
-  1+2+4+8+16+32+64 = 127 s — spent in the server's `connect()` to a switched-off host. Our
-  `<OpenTimeoutSeconds>` abandons the *wait* after 3 s while the slot keeps counting, correctly,
-  because the server really is still holding the channel. Fixing the routing so that traffic never
-  entered the tunnel reclaimed all of it: the next five-minute session ran `18 flows over 20 channels`
-  with zero refusals and zero timeouts. The lesson is the order — a cap that looks binding may be
-  holding dead weight, and raising it first would only have bought the retry loop more room.
 - **Nobody has measured what the SSH server tolerates in concurrent `direct-tcpip` channels.** 128 was
   picked when it replaced the 8-slot blocking pool, justified as a bound on memory and server-side
   channel state, and never validated against a real server. OpenSSH's `MaxSessions` does not apply to
   port forwards — it caps shell/exec/subsystem multiplexing — so the real ceiling is likely file
   descriptors at both ends and far higher, but that is recitation, not measurement.
-- The bring-up scaffolding is gone: `M0Spike` (`<SpikeProbe>`), `RemoteDummyTransport`,
-  `<LargeFrameSize>` and the `<AssignIPv6>` switch were all removed once their questions were
-  answered — the IPv6 address assignment is now unconditional, because there is no working value of
-  "off". `<StartDelaySeconds>` stays; attaching a debugger to a per-activation host needs it.
-- A designed-but-not-started alternative — SSH over the platform-owned transport via a pipe-backed
-  `SshTransport`, killing the source-binding requirement — lives in
-  `docs\experiments\platform-owned-transport.md`, including the ordered list of unknowns any
-  attempt must probe first (chief among them: whether the plug-in-initiated send path actually
-  transmits, given that its receive-side twin returns success while delivering nothing — verified
-  on healthy channels, see the watchdog section).
 
 ### The fork's transport seam
 
