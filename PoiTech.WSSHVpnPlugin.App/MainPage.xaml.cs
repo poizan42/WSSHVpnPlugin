@@ -72,7 +72,6 @@ public sealed partial class MainPage : Page
             (PrivateKeyPathBox, "PrivateKeyPath"),
             (FingerprintBox, "HostKeyFingerprint"),
             (ClientAddressBox, "ClientIPv4"),
-            (NetworkAdapterBox, "NetworkAdapter"),
             (ExcludeRoutesBox, "ExcludeRoutes"),
             (DnsBox, "DnsServers"),
             (OpenTimeoutBox, "OpenTimeoutSeconds"),
@@ -235,12 +234,6 @@ public sealed partial class MainPage : Page
         if (userName.Length > 0)
         {
             root.Add(new XElement("UserName", userName));
-        }
-
-        var networkAdapter = NetworkAdapterBox.Text.Trim();
-        if (networkAdapter.Length > 0)
-        {
-            root.Add(new XElement("NetworkAdapter", networkAdapter));
         }
 
         var privateKeyPath = PrivateKeyPathBox.Text.Trim();

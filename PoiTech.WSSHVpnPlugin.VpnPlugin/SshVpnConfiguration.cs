@@ -23,8 +23,6 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 ///   &lt;UserName&gt;alice&lt;/UserName&gt;
 ///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
 ///   &lt;ClientIPv4&gt;192.168.255.2&lt;/ClientIPv4&gt;
-///   &lt;NetworkAdapter&gt;192.168.1.20&lt;/NetworkAdapter&gt;
-///   &lt;Mtu&gt;1400&lt;/Mtu&gt;
 ///   &lt;DnsServer&gt;1.1.1.1&lt;/DnsServer&gt;
 ///   &lt;InclusionRoute&gt;10.0.0.0/8&lt;/InclusionRoute&gt;
 /// &lt;/SshVpnConfiguration&gt;
@@ -73,18 +71,6 @@ internal sealed class SshVpnConfiguration
 
     /// <summary>Gets the IPv4 address to assign to the virtual interface.</summary>
     public string ClientIPv4 { get; private init; } = "192.168.255.2";
-
-    /// <summary>
-    /// Gets the interface the SSH session should connect from — either an IPv4 literal or the name
-    /// of a network connection — or <see langword="null"/> to choose one automatically.
-    /// </summary>
-    /// <remarks>
-    /// Needed whenever the automatic choice cannot be trusted, and it cannot be trusted when this
-    /// tunnel runs nested inside another VPN: an adapter belonging to another VPN is
-    /// indistinguishable from a physical one, so SSH would be bound underneath it and leave that
-    /// VPN. See <see cref="OutboundInterface"/>.
-    /// </remarks>
-    public string? NetworkAdapter { get; private init; }
 
     /// <summary>
     /// Gets how many seconds a channel open may wait for the server's answer before the connection
@@ -162,7 +148,6 @@ internal sealed class SshVpnConfiguration
             StartDelaySeconds = ReadUInt32(root, "StartDelaySeconds", 0),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
-            NetworkAdapter = ReadString(root, "NetworkAdapter"),
             OpenTimeoutSeconds = ReadUInt32(root, "OpenTimeoutSeconds", 3),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),

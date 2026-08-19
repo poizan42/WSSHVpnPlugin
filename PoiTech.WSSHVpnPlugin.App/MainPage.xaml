@@ -35,7 +35,6 @@
             <TextBox x:Name="PrivateKeyPathBox" Header="Private key path" PlaceholderText="(leave empty to use a password)"/>
             <TextBox x:Name="FingerprintBox" Header="Host key fingerprint" PlaceholderText="SHA256:..."/>
             <TextBox x:Name="ClientAddressBox" Header="Client IPv4 address" Text="192.168.255.2"/>
-            <TextBox x:Name="NetworkAdapterBox" Header="Connect SSH from" PlaceholderText="(leave empty to choose automatically)"/>
             <TextBox x:Name="ExcludeRoutesBox" Header="Keep out of the tunnel (comma separated CIDR)" PlaceholderText="192.168.1.0/24"/>
             <TextBox x:Name="DnsBox" Header="DNS servers (comma separated)" PlaceholderText="1.1.1.1"/>
             <TextBox x:Name="OpenTimeoutBox" Header="Channel open timeout, seconds (must stay below the 5 s DNS deadline)" Text="3"/>
