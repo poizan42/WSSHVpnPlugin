@@ -1,5 +1,14 @@
 # Where the tunnel's throughput ceiling actually is (2026-08-18)
 
+> **Superseded on 2026-08-19 — see `2026-08-19-release-build.md`.** Every number below was measured
+> on a **Debug** build, which compiles the native code with ILC optimizations off; Release doubles
+> the throughput (97 → 194 Mbit/s) at 1.00 core instead of 1.59. Two conclusions here are wrong as
+> a result: the ceiling did **not** belong to the cipher work (21% of the process was going into
+> uninlined helper calls, and platform injection was larger than all crypto), and the AES-versus-MAC
+> split inverts under optimization — the MAC is the expensive half, not AES. The method section and
+> the pinning trap remain valid, and the "single snapshot is not a distribution" caveat below is
+> exactly what went wrong.
+
 The first honest measurement of the tunnel's capacity, and the attribution of its ceiling. Prior
 numbers — the loopback-dummy architecture's 165 Mbit/s peak included — all had a third-party
 download server as an uncontrolled variable; this session measured against a source we control
@@ -63,13 +72,18 @@ architecture never was the bottleneck at these rates.
 
 1. **Cipher negotiation**: find out what suite the session actually negotiates and why AES-GCM
    (single pass, hardware, no separate MAC) loses — the listener's HMAC pass would disappear
-   outright. Log the negotiated algorithms at connect as the first step.
+   outright. Log the negotiated algorithms at connect as the first step. *(Still the right next step
+   as of 2026-08-19, but for a different reason: the MAC is 12.1% of process CPU and the largest
+   controllable cost, while AES-CTR is 2.4%. The 14.7%-versus-7.5% split below was mostly managed
+   CTR scaffolding that optimization erased.)*
 2. **The upload path** (38.8 Mbit/s vs the line's ~110): never profiled at rate; the send path
    encrypts on the caller's thread and outbound channel windowing has never been examined under
    sustained upload.
 3. **T-Stack**: a real sampled profile (not one snapshot) to split steady-state packetization from
    channel-teardown churn; the iperf parallel runs open and close channels far less than a browser
-   does, so the 74% under a single long-lived flow is mostly steady-state cost.
+   does, so the 74% under a single long-lived flow is mostly steady-state cost. *(Done 2026-08-19 —
+   four sampled sessions, browsing and iperf on both builds. This item is what found the Debug-build
+   problem.)*
 
 ## Addendum (2026-08-19): the dispose frame, resolved
 
@@ -84,8 +98,10 @@ kernel-handle closes (one of which, `_channelData`, was dead and is deleted).
 **700–1,950 µs per reap**. The steady-state single-flow ceiling did not move (126–127 Mbit/s with
 concurrent browsing vs the 136 clean baseline; T-Stack still ~72% of a core mid-download) —
 confirming this section's caveat that a long-lived flow barely churns channels. The win is churn
-smoothness and the removal of a rekey-length block hazard from the hot thread; the ceiling still
-belongs to the cipher work above.
+smoothness and the removal of a rekey-length block hazard from the hot thread. *(The closing claim
+that "the ceiling belongs to the cipher work" was wrong — it belonged to the Debug build; see the
+banner. A browsing window later measured a 39 ms reap, so moving it off T-Stack mattered more than
+these numbers suggested.)*
 
 ## Caveats
 

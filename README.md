@@ -21,10 +21,15 @@ Developer Command Prompt (which puts both `MSBuild.exe` and `vswhere.exe` on `PA
 link step shells out to the latter):
 
 ```bash
-MSBuild.exe PoiTech.WSSHVpnPlugin.Package\PoiTech.WSSHVpnPlugin.Package.wapproj /p:Platform=x64 /p:Configuration=Debug /restore
+MSBuild.exe PoiTech.WSSHVpnPlugin.Package\PoiTech.WSSHVpnPlugin.Package.wapproj /p:Platform=x64 /p:Configuration=Release /restore
 ```
 
 `dotnet build` is fine for `PoiTech.WSSHVpnPlugin.VpnPlugin` on its own.
+
+Build Release unless you specifically need a debug build, and never benchmark a Debug one: because
+this publishes Native AOT, `Configuration=Debug` compiles the native code with ILC optimizations
+disabled — worth roughly half the tunnel's throughput. Details in
+[`docs/profiling/2026-08-19-release-build.md`](docs/profiling/2026-08-19-release-build.md).
 
 ## Running it locally
 
@@ -32,8 +37,12 @@ Developer Mode is enough; no signing needed. Register the loose layout the packa
 produces — restricted capabilities are accepted on this path:
 
 ```bash
-Add-AppxPackage -Register PoiTech.WSSHVpnPlugin.Package\bin\x64\Debug\AppxManifest.xml
+Add-AppxPackage -Register PoiTech.WSSHVpnPlugin.Package\bin\x64\Release\AppxManifest.xml
 ```
+
+Switching configuration needs a `Remove-AppxPackage` first: registering a different configuration's
+manifest over an existing registration reports success and silently keeps the old one, because the
+identity and version are unchanged. Check `(Get-AppxPackage *3703e6b2*).InstallLocation`.
 
 ```bash
 Get-AppxPackage *3703e6b2-f1f9-447d-b506-da47be3094ff* | Remove-AppxPackage

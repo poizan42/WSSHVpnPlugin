@@ -18,14 +18,24 @@ Build everything (from a Developer Command Prompt, so `vswhere.exe` is on `PATH`
 link step shells out to it and otherwise fails with `MSB3073 ... exited with code 123`):
 
 ```
-MSBuild.exe PoiTech.WSSHVpnPlugin.Package\PoiTech.WSSHVpnPlugin.Package.wapproj /p:Platform=x64 /p:Configuration=Debug /restore
+MSBuild.exe PoiTech.WSSHVpnPlugin.Package\PoiTech.WSSHVpnPlugin.Package.wapproj /p:Platform=x64 /p:Configuration=Release /restore
 ```
+
+**Build Release, and measure nothing in Debug.** `Configuration=Debug` sets `Optimize=false`, and
+the SDK only passes ILC an optimization flag when `Optimize` is true (`--Os`/`--Ot`, or plain `-O`
+with no `OptimizationPreference`) — so a Debug build compiles the *native* code with ILC
+optimizations **off**, which is not what "Debug" means for a JIT assembly. Measured cost: **~2×
+throughput** (97 → 194 Mbit/s) and 1.59 → 1.00 cores, because 21% of the process's CPU was
+out-of-line calls to helpers like `Span.Slice`, `get_Length` and `ReverseEndianness` that inlining
+erases entirely. `-g` is passed either way, so Release still yields a PDB and profiles fine. Full
+numbers in `docs\profiling\2026-08-19-release-build.md`; the whole project up to 2026-08-19 was
+built and measured in Debug, so treat every earlier throughput figure as a Debug figure.
 
 Deploy locally — Developer Mode only, no signing, and restricted capabilities are accepted on this
 path (verified):
 
 ```
-Add-AppxPackage -Register PoiTech.WSSHVpnPlugin.Package\bin\x64\Debug\AppxManifest.xml
+Add-AppxPackage -Register PoiTech.WSSHVpnPlugin.Package\bin\x64\Release\AppxManifest.xml
 Get-AppxPackage *3703e6b2-f1f9-447d-b506-da47be3094ff* | Remove-AppxPackage
 ```
 
@@ -39,6 +49,11 @@ Deploy-loop practicalities, each learned by hitting it:
   `0x80073CFB`; that needs `Remove-AppxPackage` + register, which resets the
   `broadFileSystemAccess` consent (see below) **and wipes `wsshvpn.log`** — copy the log out first
   if anything in it still matters.
+- **Switching configuration needs the same remove + register, and fails silently otherwise.**
+  Registering `bin\x64\Release\AppxManifest.xml` over an installed Debug registration *reports
+  success* and changes nothing: same identity, same version, so it is a no-op and `Get-AppxPackage`
+  still shows the old `InstallLocation`. Always read `InstallLocation` back — it is the only
+  confirmation that the build you think you deployed is the one that will run.
 
 ## Tests
 
@@ -509,6 +524,15 @@ measured, and most plausible theories were wrong; the order below is the order o
   reflected GUID per ring) and became one syscall on a classic UDP socket. With the activation
   watchdog also fixed: **165 Mbit/s peak, two full 6.1 GB downloads back to back** — the full arc
   from 630 kbit/s is ~260×.
+- **The last rung was the build itself: every rung above was climbed in Debug.** Switching to
+  Release doubled it again — **194 Mbit/s peak wire, 1.00 core where Debug needed 1.59** — and
+  inverted the profile: our own code fell from 40.7% of the process to 11.9%, the checksum got 16×
+  cheaper *per byte*, and what remains is 47% platform (`VpnExeRioPumpPostSendBatch` pushing our
+  packets through WFP/NDIS/NDISWAN into Windows' stack, against 1.2% in our own `Decapsulate`) and
+  12% **HMAC**. Optimization also flipped the crypto ranking: AES-CTR is 2.4%, because most of
+  Debug's apparent AES cost was managed CTR scaffolding that inlined away. So the standing
+  cipher-suite item is now the top controllable cost and worth doing —
+  see `docs\profiling\2026-08-19-release-build.md`.
 
 ### Open holes
 
@@ -520,6 +544,11 @@ Deliberate, documented, and not to be silently papered over:
   IPv6 keeps using the physical NIC. Accepted; routing it in with no stack behind it would black-hole
   it instead.
 - **UDP other than DNS, and all ICMP, are dropped.** No SSH primitive carries either.
+- **`MaximumLiveChannels = 128` is now the binding limit for browsing**, not CPU. A 10-minute
+  Release-build browsing session logged **578** `Refusing a channel … 128 channels already live`
+  with flows reaching 102, while the process used only 7.8 s of CPU across the whole trace. The
+  refusals are not new — the Debug session had 874 — but nothing above them is saturated any more,
+  so raising the cap (or reaping idle channels sooner) is the next thing browsing wants.
 - The bring-up scaffolding is gone: `M0Spike` (`<SpikeProbe>`), `RemoteDummyTransport`,
   `<LargeFrameSize>` and the `<AssignIPv6>` switch were all removed once their questions were
   answered — the IPv6 address assignment is now unconditional, because there is no working value of
