@@ -45,10 +45,20 @@ Deploy-loop practicalities, each learned by hitting it:
   fails the build's copy step. Run a kill loop for `PoiTech.WSSHVpnPlugin.VpnPlugin` and
   `PoiTech.WSSHVpnPlugin.App` for the build's duration. A deploy also tears down the user's live
   tunnel — coordinate before building when a session is up.
-- Re-registering in place is enough for code changes. A **manifest change** fails it with
-  `0x80073CFB`; that needs `Remove-AppxPackage` + register, which resets the
-  `broadFileSystemAccess` consent (see below) **and wipes `wsshvpn.log`** — copy the log out first
-  if anything in it still matters.
+- **A code change needs no re-registration at all.** `Add-AppxPackage -Register` on a loose manifest
+  registers *in place*, so `InstallLocation` is the build output and the running host's image path is
+  literally `bin\x64\<cfg>\PoiTech.WSSHVpnPlugin.VpnPlugin\…exe` — the next activation runs whatever
+  the build just wrote. Build, make sure no stale host process survives, done. Re-registering is not
+  merely redundant here: against a live host it fails with `0x80073D02` ("resources it modifies are
+  currently in use"), and killing the host to satisfy it would tear down a connected tunnel for
+  nothing.
+- A **manifest change** does need registering, and fails with `0x80073CFB` unless preceded by
+  `Remove-AppxPackage` — which resets the `broadFileSystemAccess` consent (see below) **and wipes
+  `wsshvpn.log`**, so copy the log out first if anything in it still matters.
+- **Removing an `x:Name` from XAML needs the App project's `obj` cleared** for that configuration.
+  The UWP XAML compiler reused a stale `MainPage.g.cs` and failed with `CS1061` on the very names the
+  `.xaml` no longer declares — an error that reads like the code-behind is wrong when it is the
+  generated file that is old.
 - **Switching configuration needs the same remove + register, and fails silently otherwise.**
   Registering `bin\x64\Release\AppxManifest.xml` over an installed Debug registration *reports
   success* and changes nothing: same identity, same version, so it is a no-op and `Get-AppxPackage`
@@ -380,16 +390,35 @@ that carries nothing, and SSH runs on a socket of its own. Load-bearing details:
   is not the same as being excluded. What survives is that one long-lived retry loop punches straight
   through: 2,638 flows to a host inside the excluded range in one session, and 2,457 in an earlier
   one, every one of them logged as excluded.
-- **The documented place this lives is `VpnTrafficFilter.RoutingPolicyType`**, not the route
-  assignment: it "Gets or sets whether the apps allowed by this traffic filter are force tunneled
-  through the VPN interface, or whether they are split tunneled and allowed to talk through other
-  interfaces". So an exclusion is not a deny rule but an *allow* filter matching the range, carrying
-  `SplitRouting` — and it acts at the layer that is actually doing the redirecting. A plug-in can
-  supply one without touching the profile: `VpnTrafficFilterAssignment` is documented for plug-in
-  use, and `StartWithTrafficFilter` has an overload taking the same main and optional transports we
-  already pass plus the assignment. Untried as of 2026-08-19; `AllowInbound`/`AllowOutbound` have no
-  documented defaults, so probe them before trusting an assignment not to deny everything, and keep
-  the `StartWithMainTransport` path reachable, because `Start` is single-shot per activation.
+- **What works: exclusion by omission.** The inclusion list *is* honoured — it is how the tunnel gets
+  any traffic at all — so `BuildRouteAssignment` subtracts the excluded prefixes out of it with
+  `Ipv4Prefix.Subtract` and passes the remainder. The tunnel then has no route covering an excluded
+  range and the physical interface wins on the ordinary rules. `Ipv4ExclusionRoutes` is no longer
+  populated at all; leaving it in would imply it did something. Verified live on 2026-08-19: one
+  excluded `/24` becomes **24 inclusion routes** and `Start` accepts them (`StartWithMainTransport
+  accepted (mtu 1400, frame 65536, ipv6 1)`), which answers the only real unknown, since the platform
+  had never been handed more than 2. A five-minute session with 113 flows then logged **zero** hits on
+  the excluded range where the old rate predicted ~75, **zero** channel refusals, **zero** open
+  timeouts and **zero** errors — against 4,422 excluded-range lines in the preceding session on the
+  old build. The channel accounting is the tell: `18 flows over 20 channels` where it used to be
+  `19 flows over 53`. Prefix subtraction is pure arithmetic, lives in the `.Net` project and is
+  covered in the fast loop, including a brute-force oracle over every subset of five overlapping and
+  nested holes; both it and the tests were checked against deliberate mutants.
+- **This also closed the channel-cap "hole".** The ~35 permanently occupied slots were never a
+  browsing cost: they were opens to unreachable destinations that the exclusion had failed to keep
+  out, each held for the server's full SYN timeout. Fixing the routing reclaimed them without
+  touching `MaximumLiveChannels`.
+- **A split-routing traffic filter would not have generalised**, which is why this was not the route
+  taken. `VpnTrafficFilter.RoutingPolicyType` does select force-tunnel versus split per rule, and the
+  VPNv2 CSP that the API mirrors documents `App` as optional so matching really is by address, port
+  and protocol — but `SplitTunnel` means "only the traffic meant for the VPN interface (as determined
+  by the networking stack) goes over the interface", i.e. it hands the decision back to routing. That
+  only excludes a range that already has a better route elsewhere, i.e. an on-link subnet; for a
+  remote range the tunnel's `/1` still beats the physical `0.0.0.0/0` on prefix length, which is the
+  whole reason the half-default pair is used. It would have fixed the LAN case and silently failed for
+  a remote one. Two further cautions if it is ever revisited: `AllowInbound`/`AllowOutbound` have no
+  documented defaults, and the CSP says `RoutingPolicyType` applies "if an App or Claims type is used
+  in the traffic filter". Prefer omission, which needs none of that.
   `<ExcludeRoute>` stays configuration rather than a blanket rule about private addresses either way:
   routing a *remote* private range in is the whole point of a VPN and uses the same machinery, so the
   two cases can only be told apart by the person configuring it.
@@ -562,22 +591,22 @@ Deliberate, documented, and not to be silently papered over:
   loss expensive.
 - **IPv6 leaks.** An address is assigned (it must be, or `Start*` fails) but nothing is routed, so
   IPv6 keeps using the physical NIC. Accepted; routing it in with no stack behind it would black-hole
-  it instead.
+  it instead — which is why the `<RouteIPv6>` switch was deleted rather than left at its only usable
+  value. Routing IPv6 in becomes a deliberate addition once the stack can carry it.
 - **UDP other than DNS, and all ICMP, are dropped.** No SSH primitive carries either.
-- **`MaximumLiveChannels = 128` is now the binding limit for browsing**, not CPU. A 10-minute
-  Release-build browsing session logged **578** `Refusing a channel … 128 channels already live`
-  with flows reaching 102, while the process used only 7.8 s of CPU across the whole trace. The
-  refusals are not new — the Debug session had 874 — but nothing above them is saturated any more.
-  **Raising the cap is not the first fix, though**: about **35 of the 128 slots are permanently held
-  by opens to unreachable destinations**, and that is arithmetic rather than a guess. Little's law on
-  the same session: 16.7 open timeouts/min (0.278/s) against a steady 26–48 non-flow channels implies
-  a **126 s** hold, which is Linux's default `tcp_syn_retries = 6` — 1+2+4+8+16+32+64 = 127 s — spent
-  in the server's `connect()` to a host that is switched off. Our `<OpenTimeoutSeconds>` abandons the
-  *wait* after 3 s but the slot keeps counting, correctly, because the server really is still holding
-  the channel. Almost all of it is one LAN destination that should never have entered the tunnel at
-  all (see the exclusion bullets above), so fixing the exclusion reclaims those slots; raising the cap
-  first just buys the retry loop more room. The refusals themselves are browsing-driven — they appear
-  only once flows pass ~90, while the retry loop stays flat at ~16/min.
+- ~~**`MaximumLiveChannels = 128` is the binding limit for browsing.**~~ **Closed 2026-08-19 — it was
+  the broken exclusion, not the cap.** Worth keeping for the arithmetic, which is the transferable
+  part. A 10-minute Release browsing session logged **578** `Refusing a channel … 128 channels already
+  live` with flows reaching 102, on 7.8 s of process CPU — so nothing above the cap was saturated.
+  But ~35 of the 128 slots were permanently held by opens to unreachable destinations, and Little's
+  law named the mechanism exactly: 16.7 open timeouts/min (0.278/s) against a steady 26–48 non-flow
+  channels implies a **126 s** hold, which is Linux's default `tcp_syn_retries = 6` —
+  1+2+4+8+16+32+64 = 127 s — spent in the server's `connect()` to a switched-off host. Our
+  `<OpenTimeoutSeconds>` abandons the *wait* after 3 s while the slot keeps counting, correctly,
+  because the server really is still holding the channel. Fixing the routing so that traffic never
+  entered the tunnel reclaimed all of it: the next five-minute session ran `18 flows over 20 channels`
+  with zero refusals and zero timeouts. The lesson is the order — a cap that looks binding may be
+  holding dead weight, and raising it first would only have bought the retry loop more room.
 - **Nobody has measured what the SSH server tolerates in concurrent `direct-tcpip` channels.** 128 was
   picked when it replaced the 8-slot blocking pool, justified as a bound on memory and server-side
   channel state, and never validated against a real server. OpenSSH's `MaxSessions` does not apply to
