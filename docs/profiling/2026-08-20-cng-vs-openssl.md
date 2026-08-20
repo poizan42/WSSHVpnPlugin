@@ -23,10 +23,10 @@ else — no harness difference, no interop difference, no different measurement 
   sending near-maximum SSH packets. 1 s per case, 100 warm-up iterations, six rounds **interleaved**
   Windows/WSL so both arms see the same thermal and load conditions.
 
-Two caveats on the method itself. WSL2 is a VM, so its arm carries whatever overhead that adds; for a
-pure-compute test that should be negligible but it is not zero. And this is a laptop: run-to-run
-spread is roughly ±20%, which is the same order as the difference being measured, so treat the ratios
-as "about parity" rather than as precise figures.
+Two caveats on the method itself. WSL2 is a VM, so its arm carries whatever overhead that adds; for
+a pure-compute test that should be negligible but it is not zero. And this is a laptop: run-to-run
+spread is roughly ±20%, the same order as the difference being measured, so treat the ratios as
+"about parity" rather than as precise figures.
 
 ## Numbers
 
@@ -39,9 +39,9 @@ Six interleaved rounds, 32 KB blocks, MiB/s, median with range:
 | AES-256-GCM encrypt+tag | 2161 (1528–2388) | 2348 (1994–2404) | 1.09× |
 
 A seventh Windows run, taken later on a fully idle machine, measured CNG at **262 / 270 / 2445** —
-at or above the OpenSSL medians for all three. That is one unpaired sample rather than another round,
-but it points the same way: on this CPU the two backends are close enough that ordinary machine noise
-swamps the difference.
+at or above the OpenSSL medians for all three. That is one unpaired sample rather than another
+round, but it points the same way: on this CPU the two backends are close enough that ordinary
+machine noise swamps the difference.
 
 The number that actually matters is in the same table, and it is not a comparison between backends:
 **AES-GCM is ~9× faster per byte than HMAC-SHA256** (2161 against 240 on CNG; 2348 against 293 on
@@ -78,21 +78,42 @@ pointed at a multi-week piece of work.
 
 An earlier note claimed a P/Invoke per SSH packet would eat into any OpenSSL gain. That was wrong.
 The plug-in already sets `DisableRuntimeMarshalling`, so blittable spans pass straight through, and
-`SuppressGCTransition` (or a raw function pointer with `CallConvSuppressGCTransition`) removes the GC
-mode switch, leaving little more than a call instruction. But the decisive point is simpler: at
+`SuppressGCTransition` (or a raw function pointer with `CallConvSuppressGCTransition`) removes the
+GC mode switch, leaving little more than a call instruction. But the decisive point is simpler: at
 1.4–32 KB blocks the hashing itself takes 6–130 µs, so even an ordinary transition of tens of
 nanoseconds is under 1% and there is nothing to optimize.
 
 Which is fortunate, because `SuppressGCTransition` would not be available here anyway. Its
 documentation lists requirements the method "must have all of", the first being that the native
-function "always executes for a trivial amount of time (**less than 1 microsecond**)" — a 130 µs hash
-is over a hundred times outside that — and lists the consequences of invalid use as "GC starvation.
-Immediate runtime termination. Data corruption." Whether *duration alone* could really produce the
-latter two is doubtful; they read like consequences of the other listed violations (blocking
-syscalls, callbacks into the runtime, exceptions, touching locks). So the 1 µs bar is probably
+function "always executes for a trivial amount of time (**less than 1 microsecond**)" — a 130 µs
+hash is over a hundred times outside that — and lists the consequences of invalid use as "GC
+starvation. Immediate runtime termination. Data corruption." Whether *duration alone* could really
+produce the latter two is doubtful; they read like consequences of the other listed violations
+(blocking syscalls, callbacks into the runtime, exceptions, locks). So the 1 µs bar is probably
 conservative for a pure-compute call. It is still a documented requirement, this is a data path
 inside a background-task host where a wedge is expensive to diagnose, and the gain being chased is
-under 1% — so relying on a generous reading of it would be a poor trade even if the reading is right.
+under 1% — so a generous reading of it would be a poor trade even if the reading is right.
+
+Two notes that close off the obvious ways to reopen that, both worth having because both are the
+argument someone would reach for.
+
+**"But the runtime itself does long native calls without transitioning."** It may well, and the CLR
+coding guide holds runtime code to the same principle — "in cooperative mode, you are blocking other
+threads from GC so you must avoid long or blocking operations" — but it also gives that code an
+escape our P/Invoke does not have: `GCX_COOP`/`GCX_PREEMP` holders, and the raw
+`GetThread()->EnablePreemptiveGC()`, let internal code drop to preemptive mode around exactly the
+slow part and come back. So the runtime's long native work need not be uninterruptible; ours would
+be. The 1 µs bar is not a claim that 130 µs of cooperative mode is fatal, it is the consequence of
+having no way to reach a safe point until the native function returns.
+
+**A hook can retroactively violate the contract.** "Does not call back into the runtime" is a
+property of whatever actually runs behind that entry point on someone else's machine, not of the
+function we chose to call. Security software, telemetry and instrumentation libraries hook exactly
+this kind of API — a registry or crypto entry point — and a hook may re-enter managed code where the
+original never did. Reported from experience with such a hook on `RegQueryValueExW`, which tripped
+the "transition into the runtime without transitioning out" MDA when internal runtime code called
+through it. So a suppressed transition on a widely-hooked function is a bet on other people's
+software, which is not a bet to take for under 1%.
 
 ## Verdict
 
