@@ -143,6 +143,19 @@ internal sealed class SshVpnConnection : IDisposable
             client.KeepAliveInterval = KeepAliveInterval;
             client.Connect();
             PluginLog.Info($"SSH session established with {configuration.Host}:{configuration.Port} over {transportName}");
+
+            // Logged because the suite decides a real share of the host's CPU and cannot be inferred
+            // from anything else in this log. A separate MAC algorithm means a separate hashing pass
+            // over every packet, which measured 12% of process CPU on a machine whose AES is hardware
+            // and whose SHA-256 is not; an AEAD cipher reports no MAC because it needs none. We offer
+            // AEAD ahead of CTR, so a MAC appearing here means the server offered no AEAD suite.
+            var info = client.ConnectionInfo;
+            PluginLog.Info(
+                $"Negotiated: kex {info.CurrentKeyExchangeAlgorithm}, host key {info.CurrentHostKeyAlgorithm}, "
+                + $"cipher in {info.CurrentServerEncryption} out {info.CurrentClientEncryption}, "
+                + $"mac in {info.CurrentServerHmacAlgorithm ?? "none (AEAD)"} "
+                + $"out {info.CurrentClientHmacAlgorithm ?? "none (AEAD)"}");
+
             return connection;
         }
         catch

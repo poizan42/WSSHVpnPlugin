@@ -95,10 +95,34 @@ were not measured — turned out to be the operative fact. Two corrections:
    inlining erased. Release: **MAC 12.1%, AES-CTR 2.4%.** AES-NI is nearly free; SHA-2 on this
    machine is not.
 
-So the standing follow-up (get AES-GCM or chacha20-poly1305 negotiated, deleting the separate MAC
-pass) is still the right next step — but it is worth doing because the MAC is 12.1% and the top
-controllable item, not because "the cipher is the ceiling". First step unchanged: log the negotiated
-algorithms at connect.
+### What that does and does not license (2026-08-20)
+
+The cause turned out to be ours: the fork listed `aes*-ctr` **before** the AEAD suites, and RFC 4253
+§7.1 selects the first algorithm on the *client's* list that the server also offers, so a server that
+supports GCM still gave us CTR plus a separate MAC because that is what we asked for first. AEAD is
+now offered ahead of CTR, which needs no fallback logic — a server without it matches further down
+the same list.
+
+Three limits on reading that as a fix:
+
+1. **It helps only against servers that offer an AEAD suite.** Plenty of deployments run older or
+   restricted SSH servers that offer none. For those the MAC pass stays exactly as measured, and this
+   change does nothing for them. The general problem is not solved, only avoided where the far end
+   cooperates.
+2. **The remaining cost is real work, not overhead.** `HMACSHA256` is the BCL's, so the time is inside
+   `bcryptprimitives.dll`; BouncyCastle appears only as a fallback for GCM/ChaCha/ECDSA, and
+   `AesGcm.IsSupported` is true here so even GCM is native. There is no managed layer to delete.
+3. **Its size is specific to this CPU.** An i7-6700HQ has AES-NI and PCLMULQDQ but no SHA
+   extensions, so GHASH is hardware and SHA-256 is not: ~756 MB hashed in 4.54 s is ~166 MB/s on one
+   thread, software speed. With SHA-NI the same work would be several times cheaper and would not
+   have been the top item.
+
+And the absolute figure deserves repeating, because percentages of process CPU invite
+misreading: 12.1% of the process is **0.12 of one core** on an 8-thread machine, at 162 Mbit/s.
+Whether that is worth further engineering on the non-AEAD path is genuinely open.
+
+A log line at connect now records the negotiated kex, host key, ciphers and MACs, so the suite is
+observable from the log instead of inferred from a profile.
 
 ## Method
 

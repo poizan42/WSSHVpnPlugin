@@ -576,9 +576,31 @@ measured, and most plausible theories were wrong; the order below is the order o
   cheaper *per byte*, and what remains is 47% platform (`VpnExeRioPumpPostSendBatch` pushing our
   packets through WFP/NDIS/NDISWAN into Windows' stack, against 1.2% in our own `Decapsulate`) and
   12% **HMAC**. Optimization also flipped the crypto ranking: AES-CTR is 2.4%, because most of
-  Debug's apparent AES cost was managed CTR scaffolding that inlined away. So the standing
-  cipher-suite item is now the top controllable cost and worth doing —
-  see `docs\profiling\2026-08-19-release-build.md`.
+  Debug's apparent AES cost was managed CTR scaffolding that inlined away.
+  See `docs\profiling\2026-08-19-release-build.md`.
+- **The MAC pass is 12% of process CPU, and how much of that is fixable depends on the server.**
+  Two things to keep separate. Ours to fix: the fork offered `aes*-ctr` *ahead* of the AEAD suites,
+  and RFC 4253 §7.1 picks the first entry on the **client's** list that the server also offers — so a
+  modern OpenSSH server still ended up on CTR plus a separate HMAC pass because we asked for it
+  first. AEAD is now offered first, which needs no fallback logic: a server without it matches
+  further down the same list exactly as before. Not ours to fix: against a server that offers no AEAD
+  suite the MAC pass stays, and it is genuine SHA-256 work rather than overhead — `HMACSHA256` is the
+  BCL's, so the time is inside `bcryptprimitives.dll`, and BouncyCastle is only a fallback for GCM
+  and ChaCha. Its size is also machine-specific: this is a Skylake i7 with AES-NI and PCLMULQDQ but
+  **no SHA extensions**, so GCM's GHASH is hardware while SHA-256 is not — ~756 MB hashed in 4.54 s,
+  about 166 MB/s on one thread, is software SHA-256 speed. On a CPU with SHA-NI it would be several
+  times cheaper and would not be the top item at all. And keep the absolute size in view: 12% of
+  process CPU is **0.12 of one core**, so whether it is worth engineering further on the non-AEAD
+  path is an open question, not an obvious yes.
+- **Swapping CNG for OpenSSL is settled: don't.** Measured by running the same managed benchmark on
+  Windows and under WSL on the same CPU, which isolates the backend exactly, because
+  `System.Security.Cryptography` uses CNG on Windows and OpenSSL on Linux. OpenSSL came out
+  ~1.1–1.2× ahead on SHA-256, HMAC and AES-GCM alike, inside this laptop's ±20% run-to-run spread —
+  nowhere near enough to justify shipping and CVE-tracking libcrypto in the package. The same
+  measurement gives the reason AEAD is worth preferring: **AES-GCM is ~9× faster per byte than
+  HMAC-SHA256** on either backend, because GHASH is hardware here and SHA-256 is not. Numbers,
+  method and a runnable benchmark in `docs\profiling\2026-08-20-cng-vs-openssl.md`; the first attempt
+  reported a 2–3× gap because a package build was running beside it, which is recorded there too.
 - **An open to an unreachable destination costs a channel slot for two minutes, not three seconds.**
   The arithmetic is the transferable part. Little's law on one measured session: 16.7 open
   timeouts/min (0.278/s) against a steady 26–48 non-flow channels implies a **126 s** hold, which is
