@@ -363,10 +363,11 @@ platform-owned one, because it is about the routes handed to `Start*` rather tha
   `19 flows over 53`. Prefix subtraction is pure arithmetic, lives in the `.Net` project and is
   covered in the fast loop, including a brute-force oracle over every subset of five overlapping and
   nested holes; both it and the tests were checked against deliberate mutants.
-- **This also closed the channel-cap "hole".** The ~35 permanently occupied slots were never a
-  browsing cost: they were opens to unreachable destinations that the exclusion had failed to keep
-  out, each held for the server's full SYN timeout. Fixing the routing reclaimed them without
-  touching `MaximumLiveChannels`.
+- **It also reclaimed the channel slots this machine was wasting** — ~35 of 128, held by opens to
+  destinations inside the excluded range that the tunnel should never have carried, each pinned for
+  the server's SYN timeout. Worth being exact about the scope: that removed one *source* of such
+  opens, on one machine, for a range someone had configured an exclusion for. It did nothing about the
+  underlying sensitivity to opens that cannot be answered, which is its own hole.
 - **A split-routing traffic filter would not have generalised**, which is why this was not the route
   taken. `VpnTrafficFilter.RoutingPolicyType` does select force-tunnel versus split per rule, and the
   VPNv2 CSP that the API mirrors documents `App` as optional so matching really is by address, port
@@ -578,18 +579,16 @@ measured, and most plausible theories were wrong; the order below is the order o
   Debug's apparent AES cost was managed CTR scaffolding that inlined away. So the standing
   cipher-suite item is now the top controllable cost and worth doing —
   see `docs\profiling\2026-08-19-release-build.md`.
-- **A cap that looked binding was holding dead weight.** `MaximumLiveChannels = 128` appeared to be
-  the limit for browsing, and was not. A 10-minute Release browsing session logged **578** `Refusing a channel … 128 channels already
-  live` with flows reaching 102, on 7.8 s of process CPU — so nothing above the cap was saturated.
-  But ~35 of the 128 slots were permanently held by opens to unreachable destinations, and Little's
-  law named the mechanism exactly: 16.7 open timeouts/min (0.278/s) against a steady 26–48 non-flow
-  channels implies a **126 s** hold, which is Linux's default `tcp_syn_retries = 6` —
-  1+2+4+8+16+32+64 = 127 s — spent in the server's `connect()` to a switched-off host. Our
-  `<OpenTimeoutSeconds>` abandons the *wait* after 3 s while the slot keeps counting, correctly,
-  because the server really is still holding the channel. Fixing the routing so that traffic never
-  entered the tunnel reclaimed all of it: the next five-minute session ran `18 flows over 20 channels`
-  with zero refusals and zero timeouts. The lesson is the order — a cap that looks binding may be
-  holding dead weight, and raising it first would only have bought the retry loop more room.
+- **An open to an unreachable destination costs a channel slot for two minutes, not three seconds.**
+  The arithmetic is the transferable part. Little's law on one measured session: 16.7 open
+  timeouts/min (0.278/s) against a steady 26–48 non-flow channels implies a **126 s** hold, which is
+  Linux's default `tcp_syn_retries = 6` — 1+2+4+8+16+32+64 = 127 s — spent inside the SSH server's
+  `connect()`. `<OpenTimeoutSeconds>` abandons *our* wait after 3 s, but the slot keeps counting, and
+  correctly so: the server is still holding the channel, and SSH has no way to cancel an open it has
+  not answered yet. So occupancy is the arrival rate times two minutes, and a slow trickle pins a
+  large share of `MaximumLiveChannels = 128` — on the machine this was measured on, ~35 slots, a
+  quarter of the budget, went to one application polling a host that happened to be switched off.
+  Whether that is acceptable in general is an open question, not a closed one: see **Open holes**.
 
 ### Open holes
 
@@ -602,6 +601,17 @@ Deliberate, documented, and not to be silently papered over:
   it instead — which is why the `<RouteIPv6>` switch was deleted rather than left at its only usable
   value. Routing IPv6 in becomes a deliberate addition once the stack can carry it.
 - **UDP other than DNS, and all ICMP, are dropped.** No SSH primitive carries either.
+- **Ordinary polling of a host that is offline spends the channel budget.** An application checking
+  periodically whether some host is up — a sleeping laptop, a printer, a NAS, a peer that is only
+  sometimes on — is a normal thing for a machine to be doing, and it should cost close to nothing.
+  Here every attempt pins one of the 128 slots for the server's whole SYN timeout (arithmetic in the
+  throughput section), so one app polling every few seconds took about a quarter of the budget. That
+  is a sensitivity in our accounting rather than a misbehaving environment, and nothing has been done
+  about it: a routing fix removed one source of it on one machine, which is not the same thing.
+  Neither obvious mitigation is validated — raising the cap runs straight into the unmeasured server
+  ceiling below, and not counting abandoned opens would understate real server-side channel state,
+  which is exactly why they are counted. Suspect this before concluding the cap is too small for
+  someone's browsing.
 - **Nobody has measured what the SSH server tolerates in concurrent `direct-tcpip` channels.** 128 was
   picked when it replaced the 8-slot blocking pool, justified as a bound on memory and server-side
   channel state, and never validated against a real server. OpenSSH's `MaxSessions` does not apply to
