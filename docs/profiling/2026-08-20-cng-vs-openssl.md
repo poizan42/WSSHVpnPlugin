@@ -76,14 +76,23 @@ pointed at a multi-week piece of work.
 
 ## Interop was never the obstacle
 
-An earlier note claimed a P/Invoke per SSH packet would eat into any OpenSSL gain. That was wrong on
-two counts. The plug-in already sets `DisableRuntimeMarshalling`, so blittable spans pass straight
-through, and `SuppressGCTransition` (or a raw function pointer with `CallConvSuppressGCTransition`)
-removes the GC mode switch, leaving little more than a call instruction. More to the point, at
-1.4–32 KB blocks the hashing itself takes 6–130 µs, so even an unsuppressed transition of tens of
-nanoseconds is under 1%. Note also that `SuppressGCTransition` is contraindicated for calls this
-long: it delays GC suspension for the duration of the native call, and 130 µs is not the brief call
-the attribute is meant for.
+An earlier note claimed a P/Invoke per SSH packet would eat into any OpenSSL gain. That was wrong.
+The plug-in already sets `DisableRuntimeMarshalling`, so blittable spans pass straight through, and
+`SuppressGCTransition` (or a raw function pointer with `CallConvSuppressGCTransition`) removes the GC
+mode switch, leaving little more than a call instruction. But the decisive point is simpler: at
+1.4–32 KB blocks the hashing itself takes 6–130 µs, so even an ordinary transition of tens of
+nanoseconds is under 1% and there is nothing to optimize.
+
+Which is fortunate, because `SuppressGCTransition` would not be available here anyway. Its
+documentation lists requirements the method "must have all of", the first being that the native
+function "always executes for a trivial amount of time (**less than 1 microsecond**)" — a 130 µs hash
+is over a hundred times outside that — and lists the consequences of invalid use as "GC starvation.
+Immediate runtime termination. Data corruption." Whether *duration alone* could really produce the
+latter two is doubtful; they read like consequences of the other listed violations (blocking
+syscalls, callbacks into the runtime, exceptions, touching locks). So the 1 µs bar is probably
+conservative for a pure-compute call. It is still a documented requirement, this is a data path
+inside a background-task host where a wedge is expensive to diagnose, and the gain being chased is
+under 1% — so relying on a generous reading of it would be a poor trade even if the reading is right.
 
 ## Verdict
 
