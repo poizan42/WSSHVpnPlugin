@@ -597,10 +597,13 @@ measured, and most plausible theories were wrong; the order below is the order o
   `System.Security.Cryptography` uses CNG on Windows and OpenSSL on Linux. OpenSSL came out
   ~1.1–1.2× ahead on SHA-256, HMAC and AES-GCM alike, inside this laptop's ±20% run-to-run spread —
   nowhere near enough to justify shipping and CVE-tracking libcrypto in the package. The same
-  measurement gives the reason AEAD is worth preferring: **AES-GCM is ~9× faster per byte than
-  HMAC-SHA256** on either backend, because GHASH is hardware here and SHA-256 is not. Numbers,
-  method and a runnable benchmark in `docs\profiling\2026-08-20-cng-vs-openssl.md`; the first attempt
-  reported a 2–3× gap because a package build was running beside it, which is recorded there too.
+  measurement gives the reason AEAD is worth preferring, and it has since been confirmed in
+  production: the reorder took crypto from **12.7% of process CPU to 1.7%**, 3.7× cheaper per byte.
+  Numbers, method and a runnable benchmark in `docs\profiling\2026-08-20-cng-vs-openssl.md`, along
+  with two mistakes worth not repeating — a 2–3× gap measured next to a running package build, and a
+  benchmark block size (32 KB) the tunnel does not actually use, since it sends one SSH message per
+  IP packet and the real blocks are MTU-sized. At that size OpenSSL's lead is ~1.3–1.5× rather than
+  ~1.1–1.2×, and the verdict is unchanged only because AEAD shrank the cost it applies to.
 - **An open to an unreachable destination costs a channel slot for two minutes, not three seconds.**
   The arithmetic is the transferable part. Little's law on one measured session: 16.7 open
   timeouts/min (0.278/s) against a steady 26–48 non-flow channels implies a **126 s** hold, which is

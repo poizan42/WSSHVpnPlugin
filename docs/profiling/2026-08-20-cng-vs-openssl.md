@@ -4,11 +4,14 @@
 `2026-08-19-release-build.md`). Microsoft's CNG is not always the best-optimized implementation, so
 would shipping OpenSSL in the package buy anything?
 
-**Answer: no, not enough to be worth it.** CNG is within ~1.1–1.2× of OpenSSL on this CPU for
-SHA-256, HMAC-SHA256 and AES-GCM alike. Shipping and patch-tracking libcrypto for that is a bad
-trade for a security-critical dependency. The real win is not the library, it is **not needing the
-MAC at all**: AES-GCM runs ~9× faster per byte than HMAC-SHA256 here, on *either* backend, which is
-what makes the AEAD-first cipher order worth having.
+**Answer: no, not enough to be worth it.** OpenSSL leads by ~1.1–1.2× at 32 KB blocks and ~1.3–1.5×
+at the MTU-sized blocks the tunnel actually produces. Shipping and patch-tracking libcrypto for that
+is a bad trade for a security-critical dependency. The real win is not the library, it is **not
+needing the MAC at all** — and that one is now measured in production rather than projected: moving
+to AES-GCM took crypto from **12.7% of the plug-in host's CPU to 1.7%**, and 3.7× cheaper per byte.
+
+**Read the dated section at the end before quoting anything above it.** The block size this document
+first reasoned about was wrong, which moved both the OpenSSL ratio and the AEAD gain.
 
 ## Method
 
@@ -136,3 +139,61 @@ dotnet run docs/profiling/macbench.cs 32768
 
 It prints `sha256 hmac gcm` in MiB/s. Run it on Windows and under WSL and interleave the rounds. The
 machine must be idle — see above.
+
+## Correction and production result (2026-08-21)
+
+The AEAD reorder shipped, the server took it — `cipher in aes256-gcm@openssh.com out
+aes256-gcm@openssh.com, mac in none (AEAD) out none (AEAD)` — and a profile of the result corrects
+two things above.
+
+### The block size was wrong, and it moves both conclusions
+
+This document reasoned about 32 KB blocks, on the grounds that a bulk download has the server
+sending near-maximum SSH packets. That was an assumption, and the production profile disproves it.
+Measured AES-GCM cost is **1.89 ms/MiB**, against benchmark rows of 1.68 at 1400 bytes, 1.41 at 8 KB
+and 0.46 at 32 KB. The traffic is MTU-sized, not 32 KB — which stands to reason, since the stack
+sends one SSH channel-data message per IP packet.
+
+Re-measured at 1400 bytes, same OS to avoid the problem in the next subsection, OpenSSL's lead is
+**larger** than the headline figure: SHA-256 222–231 against CNG 147–219, AES-GCM 1891–1906 against
+CNG 1040–1465, so roughly 1.3–1.5× rather than 1.1–1.2×. Per-call overhead matters more at 1.4 KB
+than the algorithm does, and the two libraries pay it differently.
+
+The verdict does not change, and gets stronger in absolute terms: after the reorder crypto is 1.7%
+of process CPU, so 1.4× of it is worth about half a point. What changes is that the earlier figure
+was quoted for a block size the tunnel does not use.
+
+### The WSL method breaks down at small block sizes
+
+Running the same managed code on Windows and under WSL is a clean way to isolate CNG from OpenSSL —
+at 32 KB. At 1400 bytes it produced nonsense: CNG appeared to *beat* OpenSSL, by 2–3× on AES-GCM
+(1040–1465 against 179–606), and the WSL arm swung 3.4× between rounds. At this size the benchmark
+makes ~90,000 calls a second, so what it measures is WSL2's per-call overhead, not the algorithm.
+The document's original caveat — "WSL2 is a VM, so its arm carries whatever overhead that adds; for
+a pure-compute test that should be negligible but it is not zero" — turned out to be the
+load-bearing sentence. Compare same-OS (`openssl speed` against the .NET benchmark on Windows) when
+the block is small, and accept the slightly less clean harness in exchange.
+
+### AEAD, measured rather than projected
+
+The same iperf-style download, before and after, with the caveat that the after-run was intermittent
+(~264 MiB over the 34 s trace, ~65 Mbit/s, against ~756 MiB and ~170 Mbit/s before) — so compare
+shares and per-byte costs, not absolute cores:
+
+| | CTR + HMAC | AES-GCM |
+|---|---|---|
+| `bcryptprimitives.dll` | 4.77 s | 0.50 s |
+| managed cipher scaffolding (`CtrImpl`) | 0.58 s | none |
+| crypto share of process CPU | **12.7%** | **1.7%** |
+| crypto per byte | 7.08 ms/MiB | 1.89 ms/MiB (**3.7×**) |
+
+So the earlier "~9× faster per byte" was the 32 KB benchmark ratio for GCM against HMAC alone. The
+real gain is 3.7×, because the old path's cost was CTR *plus* HMAC and GCM replaces both, and
+because MTU-sized blocks amortise per-call overhead far less well than 32 KB ones. Still the largest
+single win available on this path, and it needed no fallback logic — but 3.7×, not 9×.
+
+Not comparable across this pair, and worth stating so nobody reads it as a regression: total process
+CPU per byte got *worse* (49.5 → 113 ms/MiB), because the after-run moved a third of the data at a
+third of the rate with 11–17 flows instead of one, so the stack's per-second and per-flow costs
+amortise over far fewer bytes. A clean before/after on total CPU needs two steady runs at the same
+rate.
