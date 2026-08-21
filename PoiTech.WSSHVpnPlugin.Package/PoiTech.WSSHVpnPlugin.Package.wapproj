@@ -54,6 +54,30 @@
     <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
     <NoWarn>$(NoWarn);NU1702</NoWarn>
     <EntryPointProjectUniqueName>..\PoiTech.WSSHVpnPlugin.App\PoiTech.WSSHVpnPlugin.App.csproj</EntryPointProjectUniqueName>
+
+
+    <!--
+      Visual Studio's Build otherwise produces a package whose plug-in cannot be activated, and says
+      nothing about it: the host dies before any of our code loads, wsshvpn.log stays empty, and the
+      connect fails with just "ConnectProfileAsync: ServerConnection". Two separate things are gated
+      off inside the IDE by Microsoft.DesktopBridge.targets, and _IsGeneratingAppxPackage (line 353,
+      which this property sets) turns both on:
+
+        - _BuildDependentProjects (line 491) issues the Publish request that runs ILC. Its condition
+          skips it whenever BuildingInsideVisualStudio is true, so the IDE never ran ILC at all.
+        - payload collection (line 550) otherwise asks each project for $(PackageOutputGroups)
+          (Microsoft.DesktopBridge.props:92), whose BuiltProjectOutputGroup is the *build* output -
+          the ~160 KB managed apphost. With the gate on it asks for
+          DesktopBridgePublishItemsOutputGroup instead, i.e. PublishDir, where ILC wrote the real
+          binary. DllGetActivationFactory exists only in that binary.
+
+      The command line needs neither: BuildingInsideVisualStudio is empty there, so
+      _BuildDependentProjects already runs, which is why this only ever bit inside the IDE. Hence the
+      condition - the command-line build is left exactly as it was.
+    -->
+    <GenerateAppxPackageOnBuild Condition="'$(BuildingInsideVisualStudio)' == 'true'">true</GenerateAppxPackageOnBuild>
+    <UapAppxPackageBuildMode>SideloadOnly</UapAppxPackageBuildMode>
+    <AppxBundle>Never</AppxBundle>
   </PropertyGroup>
   <ItemGroup>
     <AppxManifest Include="Package.appxmanifest">
@@ -105,4 +129,75 @@
       <PublishProfile>Properties\PublishProfiles\win-$(Platform).pubxml</PublishProfile>
     </ProjectReference>
   </ItemGroup>
+  <!--
+    Turning that gate on makes Microsoft.Build.DesktopBridge.SetPublishProperties decorate each
+    payload reference with an obj redirect (ProjectToOverrideProjectExtensionsPath plus
+    ProjectExtensionsPathForSpecifiedProject -> obj\wappublish\<rid>\) so the IDE-driven publish
+    cannot collide with Visual Studio's own builds of the same project. Nothing restores into that
+    directory, and it has to be restored *before the redirected project instance is first
+    evaluated*, which is earlier than it looks.
+
+    SetPublishProperties runs in SetProjectReferenceProperties (line 421), which is
+    AfterTargets="_SplitProjectReferencesByFileExistence" - very early in reference resolution - and
+    which then replaces _MSBuildProjectReferenceExistent with the decorated items. Reference
+    resolution immediately evaluates those redirected instances. If obj\wappublish\<rid>\ is empty
+    at that moment, the SDK's wildcard imports of $(MSBuildProjectExtensionsPath) find no
+    nuget.g.props/targets, so the instance imports *no NuGet-provided targets at all* - including
+    CsWinRT's. Microsoft.Windows.CsWinRT.Authoring.targets never loads, so
+    CsWinRTSetAuthoringWinMDs (Authoring.targets:39, hooked BeforeTargets on the editor-config
+    generation) never runs, the authoring properties are empty when
+    PoiTech.WSSHVpnPlugin.VpnPlugin.GeneratedMSBuildEditorConfig.editorconfig is written, and the
+    CsWinRT source generator - seeing no build_property.CsWinRTComponent - silently generates
+    nothing. The build then fails with CS0234 on WinRT.Module in Program.cs, plus CsWinRT1028 on
+    every authored class, and neither message mentions the real cause.
+
+    Hooking this on _WapProjGetProjectClosure is NOT early enough - measured in an MSBuild binary
+    log, the redirected evaluation happens roughly 8,500 log lines before that target starts. The
+    failure is also intermittent in a way that hides it: a plain build of the payload project leaves
+    a correct editor config behind, so the bad one only matters when the redirected instance is the
+    one that has to compile, i.e. when the project is otherwise up-to-date.
+  -->
+  <Target Name="RestoreWapPublishObj" BeforeTargets="SetProjectReferenceProperties"
+          Condition="'$(_IsGeneratingAppxPackage)' == 'true'">
+    <MSBuild Projects="@(ProjectReference)"
+             Targets="Restore"
+             Properties="Configuration=$(Configuration);Platform=$(Platform);ProjectToOverrideProjectExtensionsPath=%(FullPath);ProjectExtensionsPathForSpecifiedProject=%(RootDir)%(Directory)obj\wappublish\win-$(Platform)\;_WapRestorePass=true" />
+  </Target>
+
+  <!--
+    A regression alarm for the two properties above. Both failures they prevent are silent at build
+    time and only show up as a tunnel that will not connect - the platform starts the host, it dies
+    before any of our code loads, and wsshvpn.log stays empty - so assert the invariant here instead:
+    the plug-in in the package layout must be exactly the binary ILC produced.
+
+    Hash equality rather than a size floor, because it also catches a stale payload and a payload
+    built for another architecture, and GetFileHash is a built-in task, so this needs no external
+    process. (A property function cannot do it: MSBuild's whitelist rejects both
+    [System.IO.FileInfo]::new(...).Length and [System.IO.File]::ReadAllBytes(...) with MSB4185.)
+
+    The published path mirrors PublishDir from Properties\PublishProfiles\win-<platform>.pubxml.
+    AnyCPU is excluded because the payload projects only define x86, x64 and arm64.
+  -->
+  <Target Name="VerifyPayloadIsNativeAot" AfterTargets="Build" Condition="'$(Platform)' != 'AnyCPU'">
+    <PropertyGroup>
+      <_PluginPayload>$(OutDir)PoiTech.WSSHVpnPlugin.VpnPlugin\PoiTech.WSSHVpnPlugin.VpnPlugin.exe</_PluginPayload>
+      <_PluginPublished>..\PoiTech.WSSHVpnPlugin.VpnPlugin\bin\win-$(Platform)\publish\PoiTech.WSSHVpnPlugin.VpnPlugin.exe</_PluginPublished>
+    </PropertyGroup>
+
+    <Error Condition="!Exists('$(_PluginPayload)')"
+           Text="No plug-in payload was collected into the package layout at $(_PluginPayload)." />
+    <Error Condition="!Exists('$(_PluginPublished)')"
+           Text="The plug-in was never published, so ILC never ran: $(_PluginPublished) does not exist." />
+
+    <GetFileHash Files="$(_PluginPayload)" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="_PluginPayloadHash" />
+    </GetFileHash>
+    <GetFileHash Files="$(_PluginPublished)" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="_PluginPublishedHash" />
+    </GetFileHash>
+
+    <Error Condition="'$(_PluginPayloadHash)' != '$(_PluginPublishedHash)'"
+           Text="The package layout does not hold the published Native AOT plug-in - most likely the ~160 KB managed apphost, which cannot be activated because DllGetActivationFactory exists only in the ILC binary. Layout: $(_PluginPayload). Published: $(_PluginPublished)." />
+  </Target>
+
 </Project>

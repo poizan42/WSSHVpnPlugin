@@ -31,6 +31,60 @@ erases entirely. `-g` is passed either way, so Release still yields a PDB and pr
 numbers in `docs\profiling\2026-08-19-release-build.md`; the whole project up to 2026-08-19 was
 built and measured in Debug, so treat every earlier throughput figure as a Debug figure.
 
+**Visual Studio's Build works too, and three lines in the wapproj are what make it work.** Left
+alone the IDE produces a package whose plug-in cannot be activated, and says nothing about it: the
+platform starts the host, it dies before any of our code loads, `wsshvpn.log` stays empty, and the
+connect fails with nothing but `ConnectProfileAsync: ServerConnection`. Two separate things in
+`Microsoft.DesktopBridge.targets` are conditioned off inside the IDE, and `_IsGeneratingAppxPackage`
+(line 353) turns both on — `GenerateAppxPackageOnBuild` is the public property that sets it:
+
+- `_BuildDependentProjects` (line 491) is what issues the `Publish` request that runs ILC, and its
+  condition skips it whenever `BuildingInsideVisualStudio` is true. Without it the IDE compiles the
+  managed assemblies and ILC never runs at all.
+- Payload collection (line 550) otherwise asks each payload project for `$(PackageOutputGroups)`
+  (`Microsoft.DesktopBridge.props:92`), whose `BuiltProjectOutputGroup` is the *build* output — the
+  ~160 KB managed apphost. With the gate on it asks for `DesktopBridgePublishItemsOutputGroup`
+  instead, i.e. `PublishDir`, where ILC wrote the real binary. `DllGetActivationFactory` is exported
+  only from that one.
+
+The command line needs neither, because `BuildingInsideVisualStudio` is empty there — which is why
+this only ever bit inside the IDE, and why the property is conditioned so the CLI build is untouched.
+
+**Turning that gate on needs the redirected obj restored, and the hook point is load-bearing.**
+`SetPublishProperties` decorates each payload reference with an obj redirect
+(`obj\wappublish\<rid>\`) so the IDE-driven publish cannot collide with VS's own build of the same
+project, and nothing restores into it. It has to be restored *before the redirected project instance
+is first evaluated*, which is much earlier than it looks: `SetPublishProperties` runs in
+`SetProjectReferenceProperties` (line 421), `AfterTargets="_SplitProjectReferencesByFileExistence"`,
+which then replaces `_MSBuildProjectReferenceExistent` with the decorated items — and reference
+resolution evaluates those instances immediately. `RestoreWapPublishObj` is therefore hooked
+`BeforeTargets="SetProjectReferenceProperties"`. Hooking it on `_WapProjGetProjectClosure` is **not**
+early enough: measured in an MSBuild binary log, the redirected evaluation happens ~8,500 log lines
+before that target starts.
+
+Get that ordering wrong and nothing in the failure names the cause. With the redirected obj empty,
+the SDK's wildcard imports of `$(MSBuildProjectExtensionsPath)` find no `nuget.g.props`/`.targets`,
+so the instance imports **no NuGet-provided targets at all** — CsWinRT's included.
+`Authoring.targets` never loads, so `CsWinRTSetAuthoringWinMDs` (`Authoring.targets:39`, hooked
+`BeforeTargets` on the editor-config generation) never runs, the authoring properties are empty when
+`…GeneratedMSBuildEditorConfig.editorconfig` is written, and the CsWinRT source generator — seeing no
+`build_property.CsWinRTComponent` — silently generates nothing. The build then fails with **`CS0234`
+on `WinRT.Module`** in `Program.cs`, plus **`CsWinRT1028`** on every authored class. It is also
+intermittent in a way that hides the mechanism: a plain build of the payload project leaves a correct
+editor config behind, so the bad one only matters when the redirected instance is the one that has to
+compile — i.e. when the project is otherwise up-to-date. Two dead ends, both tried: declaring the
+CsWinRT properties as `CompilerVisibleProperty` in the csproj, and setting `AssemblyVersion` by hand.
+Each only moves the failure along (to `CS8785` from the generator, on an empty path); the csproj needs
+no changes at all once the ordering is right.
+
+`VerifyPayloadIsNativeAot` is the regression alarm for all of this. It hashes the layout payload and
+the published binary with the built-in `GetFileHash` task and fails the build when they differ, which
+also catches a stale or wrong-architecture payload — both invisible to a size check. A property
+function cannot do it: MSBuild's whitelist rejects `[System.IO.FileInfo]::new(...).Length` and
+`[System.IO.File]::ReadAllBytes(...)` alike with `MSB4185`, which is why the check is a task rather
+than an expression. Verified in both directions — passing on a good layout, and failing with the
+apphost planted in it.
+
 Deploy locally — Developer Mode only, no signing, and restricted capabilities are accepted on this
 path (verified):
 
