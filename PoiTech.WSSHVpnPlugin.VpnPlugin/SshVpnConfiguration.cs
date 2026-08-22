@@ -22,6 +22,7 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 ///   &lt;Port&gt;22&lt;/Port&gt;
 ///   &lt;UserName&gt;alice&lt;/UserName&gt;
 ///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
+///   &lt;PrivateKeyToken&gt;{GUID from the app's file picker}&lt;/PrivateKeyToken&gt;
 ///   &lt;ClientIPv4&gt;192.168.255.2&lt;/ClientIPv4&gt;
 ///   &lt;Mtu&gt;1400&lt;/Mtu&gt;
 ///   &lt;DnsServer&gt;1.1.1.1&lt;/DnsServer&gt;
@@ -48,10 +49,15 @@ internal sealed class SshVpnConfiguration
     public string? UserName { get; private init; }
 
     /// <summary>
-    /// Gets the path of an unencrypted private key to authenticate with, or <see langword="null"/>
-    /// to authenticate with a password.
+    /// Gets a FutureAccessList token for the unencrypted private key to authenticate with, or
+    /// <see langword="null"/> to authenticate with a password.
     /// </summary>
-    public string? PrivateKeyPath { get; private init; }
+    /// <remarks>
+    /// A token, not a path: the app picks the file, and the token is what grants the plug-in access
+    /// to it, so the package needs no file-system capability. The list is package-scoped, which is
+    /// why the background-task host can redeem what the app added.
+    /// </remarks>
+    public string? PrivateKeyToken { get; private init; }
 
     /// <summary>
     /// Gets how long to wait before starting the channel, so a debugger can be attached to the
@@ -179,7 +185,7 @@ internal sealed class SshVpnConfiguration
         {
             Port = ReadUInt32(root, "Port", 22),
             UserName = ReadString(root, "UserName"),
-            PrivateKeyPath = ReadString(root, "PrivateKeyPath"),
+            PrivateKeyToken = ReadString(root, "PrivateKeyToken"),
             StartDelaySeconds = ReadUInt32(root, "StartDelaySeconds", 0),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",

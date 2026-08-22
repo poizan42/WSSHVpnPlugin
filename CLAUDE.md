@@ -107,8 +107,9 @@ Deploy-loop practicalities, each learned by hitting it:
   currently in use"), and killing the host to satisfy it would tear down a connected tunnel for
   nothing.
 - A **manifest change** does need registering, and fails with `0x80073CFB` unless preceded by
-  `Remove-AppxPackage` — which resets the `broadFileSystemAccess` consent (see below) **and wipes
-  `wsshvpn.log`**, so copy the log out first if anything in it still matters.
+  `Remove-AppxPackage` — which **wipes the package's application data**: the saved profile, the
+  private key's access token and `wsshvpn.log` all go. Copy the log out first if anything in it still
+  matters, and expect to pick the key file again and re-save the profile afterwards.
 - **Removing an `x:Name` from XAML needs the App project's `obj` cleared** for that configuration.
   The UWP XAML compiler reused a stale `MainPage.g.cs` and failed with `CS1061` on the very names the
   `.xaml` no longer declares — an error that reads like the code-behind is wrong when it is the
@@ -232,11 +233,24 @@ cost most of an evening to establish:
 - The app project **must not reference the plug-in**. It never used a type from it; the reference
   existed only to make AOT link and re-export the factory, which is what caused all of the above.
 
-**`broadFileSystemAccess` consent resets on every reinstall.** `Remove-AppxPackage` +
-`Add-AppxPackage -Register` silently clears it, and the next connect fails with
-`ConnectProfileAsync: ServerConnection` and an `UnauthorizedAccessException` from `ReadThroughBroker`
-in the log. Re-enable it under Settings > Privacy & security > File system. Removing the package also
-**wipes `wsshvpn.log`**, so a failure right after a reinstall may leave nothing to read.
+**The private key is reached through a picker token, and the package declares no file-system
+capability.** The app picks the key with a `FileOpenPicker`, adds it to
+`StorageApplicationPermissions.FutureAccessList`, and puts the returned token in the profile as
+`<PrivateKeyToken>`; the plug-in redeems it with `GetFileAsync` and reads through `FileIO`. That works
+because the list is **package-scoped** — the app adds the entry and the background-task host, a
+separate process with its own `Application Id`, redeems it. The documentation does not settle that
+either way, so it was established by running it.
+
+Two things follow. Reads must still go through the `Windows.Storage` broker whatever grants the
+access: a raw Win32 open is checked against the file's ACL, which for an ordinary user file carries no
+`ALL APPLICATION PACKAGES` entry, so `File.OpenRead` fails with `UnauthorizedAccessException`
+regardless. And `Remove-AppxPackage` takes the token with the rest of the package's application data,
+so a reinstall means picking the key again and re-saving the profile — along with `wsshvpn.log`, which
+means a failure right after a reinstall may leave nothing to read.
+
+A path is deliberately not offered as an alternative. One appears to work, but only once the same file
+has been picked, because picking is what grants access to that item — so it would be a setting that
+works for a reason the user cannot see.
 
 ### Runtime flow
 
@@ -498,7 +512,7 @@ failed experiment, so check here before re-deriving any of it:
   activations evidently bypass the user background-access policy entirely, so neither the
   capability nor any access level was ever part of the story. One durable side-fact: the
   `AlwaysAllowed` grant survives `Remove-AppxPackage` (stored against the app identity, not the
-  package), unlike `broadFileSystemAccess`.
+  package), unlike anything held in the package's own application data.
 - **Why activations starved: `ProcessEventAsync` runs a delivery prolog first.** A mid-stall dump
   (taken by a log-tailing watcher 30 s before the execution, symbolized later) shows the
   89-second-old activation inside `VpnChannelFactory::ProcessEventAsync → VpnExeProcessTask →

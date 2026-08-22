@@ -126,7 +126,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
             // A key-based profile that already names its user needs nothing from the user, and
             // asking anyway would put a prompt in front of a background task for no reason.
-            var needsCredentials = configuration.PrivateKeyPath is null || configuration.UserName is null;
+            var needsCredentials = configuration.PrivateKeyToken is null || configuration.UserName is null;
 
             var credential = needsCredentials
                 ? channel.RequestCredentials(

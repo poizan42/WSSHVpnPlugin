@@ -6,6 +6,8 @@ using System.Xml.Linq;
 using Windows.ApplicationModel;
 using Windows.Networking.Vpn;
 using Windows.Storage;
+using Windows.Storage.AccessCache;
+using Windows.Storage.Pickers;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 
@@ -22,6 +24,13 @@ namespace PoiTech.WSSHVpnPlugin.App;
 public sealed partial class MainPage : Page
 {
     private readonly VpnManagementAgent _agent = new();
+
+    private const string PrivateKeyTokenSetting = "PrivateKeyToken";
+
+    /// <summary>
+    /// The FutureAccessList token for the picked key, which is what the plug-in redeems to read it.
+    /// </summary>
+    private string _privateKeyToken = string.Empty;
 
     public MainPage()
     {
@@ -48,6 +57,13 @@ public sealed partial class MainPage : Page
             }
         }
 
+        // Not shown in the form: it is an opaque handle, and the file name above is what identifies
+        // the key to the user.
+        if (values.ContainsKey(PrivateKeyTokenSetting) && values[PrivateKeyTokenSetting] is string token)
+        {
+            _privateKeyToken = token;
+        }
+
     }
 
     private void SaveSettings()
@@ -59,6 +75,8 @@ public sealed partial class MainPage : Page
             values[key] = box.Text;
         }
 
+        values[PrivateKeyTokenSetting] = _privateKeyToken;
+
     }
 
     private (TextBox Box, string Key)[] SettingsBoxes()
@@ -69,15 +87,48 @@ public sealed partial class MainPage : Page
             (HostBox, "Host"),
             (PortBox, "Port"),
             (UserNameBox, "UserName"),
-            (PrivateKeyPathBox, "PrivateKeyPath"),
             (FingerprintBox, "HostKeyFingerprint"),
             (ClientAddressBox, "ClientIPv4"),
             (ExcludeRoutesBox, "ExcludeRoutes"),
             (DnsBox, "DnsServers"),
+            (KeyFileBox, "PrivateKeyFile"),
             (MtuBox, "Mtu"),
             (OpenTimeoutBox, "OpenTimeoutSeconds"),
             (StartDelayBox, "StartDelaySeconds"),
         };
+    }
+
+    /// <summary>
+    /// Picks the private key and keeps durable access to it, which is what lets the package declare
+    /// no file-system capability.
+    /// </summary>
+    /// <remarks>
+    /// The FutureAccessList entry keeps the picked file readable across restarts, and the token is a
+    /// string, so it travels in the profile like any other setting. Only the plug-in reads the key;
+    /// this process just picks it.
+    /// </remarks>
+    private async void OnPickKeyClick(object sender, RoutedEventArgs e)
+    {
+        await RunAsync("Pick key file", async () =>
+        {
+            var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.DocumentsLibrary };
+
+            // SSH keys conventionally have no extension, and the picker rejects an empty filter list.
+            picker.FileTypeFilter.Add("*");
+
+            var file = await picker.PickSingleFileAsync();
+            if (file is null)
+            {
+                Log("Pick key file: cancelled");
+                return;
+            }
+
+            _privateKeyToken = StorageApplicationPermissions.FutureAccessList.Add(file);
+            KeyFileBox.Text = file.Path;
+
+            Log($"Key file: {file.Path}");
+            Log("Save the profile to carry it to the plug-in.");
+        });
     }
 
     private async void OnSaveProfileClick(object sender, RoutedEventArgs e)
@@ -237,12 +288,6 @@ public sealed partial class MainPage : Page
             root.Add(new XElement("UserName", userName));
         }
 
-        var privateKeyPath = PrivateKeyPathBox.Text.Trim();
-        if (privateKeyPath.Length > 0)
-        {
-            root.Add(new XElement("PrivateKeyPath", privateKeyPath));
-        }
-
         var fingerprint = FingerprintBox.Text.Trim();
         if (fingerprint.Length > 0)
         {
@@ -253,6 +298,11 @@ public sealed partial class MainPage : Page
         if (startDelay.Length > 0 && startDelay != "0")
         {
             root.Add(new XElement("StartDelaySeconds", startDelay));
+        }
+
+        if (_privateKeyToken.Length > 0)
+        {
+            root.Add(new XElement("PrivateKeyToken", _privateKeyToken));
         }
 
         // Only written when it differs from the plug-in's default, so an empty box means "default".

@@ -7,6 +7,7 @@ using Renci.SshNet.Connection;
 using Windows.Networking;
 using Windows.Networking.Vpn;
 using Windows.Storage;
+using Windows.Storage.AccessCache;
 using Windows.Storage.Streams;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
@@ -166,7 +167,7 @@ internal sealed class SshVpnConnection : IDisposable
     }
 
     /// <summary>
-    /// Chooses how to authenticate: a private key when the profile names one, otherwise a password.
+    /// Chooses how to authenticate: the private key the app picked, otherwise a password.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -174,13 +175,11 @@ internal sealed class SshVpnConnection : IDisposable
     /// which is the same reason host keys must be pinned.
     /// </para>
     /// <para>
-    /// The key is opened through <see cref="StorageFile"/> rather than <c>System.IO.File</c>, and
-    /// that is load-bearing. The plug-in runs in an app container, and <c>broadFileSystemAccess</c>
-    /// grants reach outside the package's own folders only via the <c>Windows.Storage</c> broker.
-    /// A raw Win32 open goes straight to the file system and is checked against the file's ACL,
-    /// which for an ordinary user file carries no <c>ALL APPLICATION PACKAGES</c> entry — so
-    /// <c>File.OpenRead</c> fails with <c>UnauthorizedAccessException</c> even with the capability
-    /// declared and the privacy toggle switched on.
+    /// The key is read through <see cref="StorageFile"/> rather than <c>System.IO.File</c>, and that
+    /// is load-bearing. The plug-in runs in an app container, and a raw Win32 open is checked against
+    /// the file's ACL, which for an ordinary user file carries no <c>ALL APPLICATION PACKAGES</c>
+    /// entry - so <c>File.OpenRead</c> fails with <c>UnauthorizedAccessException</c> however the
+    /// access was granted. Only the <c>Windows.Storage</c> broker honours it.
     /// </para>
     /// </remarks>
     private static AuthenticationMethod CreateAuthenticationMethod(
@@ -188,40 +187,49 @@ internal sealed class SshVpnConnection : IDisposable
         string userName,
         string password)
     {
-        if (configuration.PrivateKeyPath is not { } keyPath)
+        if (configuration.PrivateKeyToken is not { Length: > 0 } token)
         {
             return new PasswordAuthenticationMethod(userName, password);
         }
 
-        PluginLog.Info($"Authenticating with the private key at {keyPath}");
-
         try
         {
-            using var keyStream = new MemoryStream(ReadThroughBroker(keyPath), writable: false);
+            using var keyStream = new MemoryStream(ReadThroughToken(token), writable: false);
             var privateKey = new PrivateKeyFile(keyStream);
             return new PrivateKeyAuthenticationMethod(userName, privateKey);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
             throw new InvalidOperationException(
-                $"The private key at '{keyPath}' could not be read. Check that the package has the " +
-                "broadFileSystemAccess capability and that file system access is enabled for it in " +
-                "Settings > Privacy & security > File system.",
+                "The private key could not be read. Choose the key file again in the app: the token " +
+                "in the profile is what grants this plug-in access to it, and package state does not " +
+                "necessarily survive a reinstall.",
                 ex);
         }
     }
 
     /// <summary>
-    /// Reads a file through the storage broker, which is what makes
-    /// <c>broadFileSystemAccess</c> apply.
+    /// Reads the private key through the FutureAccessList entry the app created for it.
     /// </summary>
-    private static byte[] ReadThroughBroker(string path)
+    /// <remarks>
+    /// The entry count is logged because it separates a stale token from a list this process cannot
+    /// see at all - the app adds the entry, and this runs in the background-task host, a separate
+    /// process with its own Application Id under the same package identity.
+    /// </remarks>
+    private static byte[] ReadThroughToken(string token)
     {
-        var file = StorageFile.GetFileFromPathAsync(path).AsTask().GetAwaiter().GetResult();
+        var list = StorageApplicationPermissions.FutureAccessList;
+        PluginLog.Info(
+            $"FutureAccessList as seen by the plug-in host: {list.Entries.Count} entry(ies); "
+            + $"redeeming '{token}'");
+
+        var file = list.GetFileAsync(token).AsTask().GetAwaiter().GetResult();
         var buffer = FileIO.ReadBufferAsync(file).AsTask().GetAwaiter().GetResult();
 
         var bytes = new byte[buffer.Length];
         DataReader.FromBuffer(buffer).ReadBytes(bytes);
+
+        PluginLog.Info($"Token redeemed: {file.Path} ({bytes.Length} bytes)");
         return bytes;
     }
 

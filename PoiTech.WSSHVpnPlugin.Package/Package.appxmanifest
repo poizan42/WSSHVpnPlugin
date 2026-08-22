@@ -93,12 +93,6 @@
       and the package must be signed for the machine to accept it.
     -->
     <rescap:Capability Name="networkingVpnProvider" />
-    <!--
-      Needed only to read a private key from a path outside the package, since the plug-in runs in
-      an app container. If key handling later moves into the package's own local folder, or to a
-      certificate via RequestCredentials, this can go.
-    -->
-    <rescap:Capability Name="broadFileSystemAccess" />
   </Capabilities>
 
   <Extensions>
