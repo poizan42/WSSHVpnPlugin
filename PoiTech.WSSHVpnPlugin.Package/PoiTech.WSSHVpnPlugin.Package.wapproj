@@ -49,7 +49,31 @@
   <PropertyGroup>
     <ProjectGuid>c333db51-8f1d-47e7-9cd1-5f8912209199</ProjectGuid>
     <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
-    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+
+    <!--
+      Both TargetDeviceFamily versions in Package.appxmanifest are overwritten at build time unless
+      told otherwise: the wapproj hands GenerateDesktopBridgeAppxManifest its TargetPlatformMinVersion
+      and TargetPlatformVersion (Microsoft.DesktopBridge.targets:267-268) and the two
+      ...ReplaceManifestVersion switches default to true, so editing the manifest alone is inert.
+
+      The minimum is left generated, and was wrong until now: it said 10.0.17763.0 - the SDK default -
+      while the packet path calls AppendVpnReceivePacketBuffer and FlushVpnReceivePacketBuffers
+      unconditionally and those arrived in 10.0.20348.0, which is what both payload projects declare.
+      The platform-compatibility analyzer does not flag the mismatch, so the too-low value bought a
+      runtime failure on an old build rather than a build error here.
+    -->
+    <TargetPlatformMinVersion>10.0.20348.0</TargetPlatformMinVersion>
+
+    <!--
+      MaxVersionTested, on the other hand, has to come from the manifest, because generated it would
+      be $(TargetPlatformVersion) - the SDK we compile against - and there is no 26200 platform SDK to
+      point that at (the installed set jumps 26100 -> 28000) even though 26200 is the only build any
+      of this has been tested on. Suppressing the replacement keeps Package.appxmanifest authoritative
+      for this one value. It is worth declaring accurately rather than understating: the documentation
+      describes MaxVersionTested as "used at runtime to determine the effective process space for
+      quirks", so it selects behaviour rather than merely recording a claim.
+    -->
+    <AppxOSMaxVersionTestedReplaceManifestVersion>false</AppxOSMaxVersionTestedReplaceManifestVersion>
     <DefaultLanguage>en-US</DefaultLanguage>
     <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
     <NoWarn>$(NoWarn);NU1702</NoWarn>
