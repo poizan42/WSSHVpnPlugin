@@ -108,10 +108,12 @@ internal sealed class SshVpnConfiguration
     /// architecture (we already run a 65536 frame size for that reason).
     /// </para>
     /// <para>
-    /// Measured on build 26200, where 1400, 32768 and 65535 are all accepted - so the whole UINT16
-    /// range appears usable, and 32768 is the best of the three at 222 Mbit/s peak against 194 at
-    /// 1400. The gain is per-packet amortisation of the kernel networking path: the same bytes move
-    /// in about 21x fewer packets.
+    /// 1400, 32768 and 65535 are all accepted on builds 20348 and 26200, so the whole UINT16 range
+    /// appears usable - but raising it is not established to help. 32768 measured 222 Mbit/s against
+    /// 194 at 1400 on one machine, which is inside that laptop's plus or minus 8 percent run-to-run
+    /// spread, and a five-point sweep elsewhere found 1400 through 32768 indistinguishable. Any gain
+    /// is per-packet amortisation of the kernel networking path, so it only pays where that path is
+    /// the bottleneck.
     /// </para>
     /// <para>
     /// Larger is not better, though, and the receive pool is why - exactly as the documented

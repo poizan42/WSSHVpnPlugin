@@ -689,15 +689,24 @@ measured, and most plausible theories were wrong; the order below is the order o
   **IVpnPacketBuffers** in the Receive pool". On build 26200, **1400, 32768 and 65535 are all
   accepted**, so the whole UINT16 range appears usable, and the ranking is not monotonic:
 
-  | MTU | peak | refusals | notes |
+  | MTU | peak | refusals | verdict |
   |---|---|---|---|
-  | 1400 | 194 Mbit/s | 0 | the documented value |
-  | **32768** | **222 Mbit/s** | 11 per run | best measured |
-  | 65535 | 188 Mbit/s | 24,467 in ~1 min | worse on every count |
+  | 1400 | 194 Mbit/s | 0 | the documented value, and the default |
+  | 32768 | 222 Mbit/s | 11 per run | *within the noise floor* of 1400 |
+  | 65535 | 188 Mbit/s | 24,467 in ~1 min | clearly worse, on every count |
 
-  32768 wins because the same bytes move in ~21× fewer packets (815/s against 17,300/s) and the
-  kernel networking path is charged per packet — `NETIO.SYS` 10.6%, `tcpip.sys` 9.7%, `NDIS.SYS` 6.4%
-  of process CPU, against our own binary at 10.5%. 65535 loses because the pool's budget is
+  **Only the 65535 verdict is solid.** 1400 and 32768 differ by 14% here, but this laptop's
+  run-to-run spread on identical configuration measures **±8%** (297/336/345 Mbit/s across three
+  runs), so a single-run 14% resolves nothing — and a five-point sweep on a Server 2022 guest found
+  1400, 8192, 16384 and 32768 indistinguishable, with only 65535 collapsing. So there is no
+  established reason to raise this, and one established reason not to raise it far. Full numbers,
+  the noise floor and the ruled-out explanations are in
+  `docs\profiling\2026-08-22-host-vs-guest-throughput.md`.
+
+  Any per-packet gain a larger MTU can offer comes from the kernel networking path being charged per
+  packet — `NETIO.SYS` 10.6%, `tcpip.sys` 9.7%, `NDIS.SYS` 6.4% of process CPU against our own binary
+  at 10.5% — so it only pays on a machine that is per-packet-CPU-bound. 65535 loses regardless,
+  because the pool's budget is
   denominated in **bytes, not buffers**: it refuses at ~110 outstanding 32 KiB buffers and ~55
   outstanding 64 KiB ones, both about **3.5 MB**, so doubling the MTU halves the packets in flight.
   At 64 KiB, 3,329 of those refusals arrived while holding *no* buffers at all — the pool empty
