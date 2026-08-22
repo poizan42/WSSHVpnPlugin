@@ -74,6 +74,7 @@ public sealed partial class MainPage : Page
             (ClientAddressBox, "ClientIPv4"),
             (ExcludeRoutesBox, "ExcludeRoutes"),
             (DnsBox, "DnsServers"),
+            (MtuBox, "Mtu"),
             (OpenTimeoutBox, "OpenTimeoutSeconds"),
             (StartDelayBox, "StartDelaySeconds"),
         };
@@ -252,6 +253,16 @@ public sealed partial class MainPage : Page
         if (startDelay.Length > 0 && startDelay != "0")
         {
             root.Add(new XElement("StartDelaySeconds", startDelay));
+        }
+
+        // Only written when it differs from the plug-in's default, so an empty box means "default".
+        // Raising this past 1400 goes against the documented maximum: it is worth about 14% on a
+        // build that accepts it, and on one that does not the connect fails outright rather than
+        // degrading, because the channel cannot be started twice. See SshVpnConfiguration.Mtu.
+        var mtu = MtuBox.Text.Trim();
+        if (mtu.Length > 0 && mtu != "1400")
+        {
+            root.Add(new XElement("Mtu", mtu));
         }
 
         // Only written when it differs from the plug-in's default, so an empty box means "default".

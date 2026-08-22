@@ -224,9 +224,11 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
         // option for a while and there is no working value of "off".
         var ipv6 = new List<HostName> { new HostName("fd00::2") };
 
-        // Sized to leave room for the SSH record overhead over a 1500-byte path, and the platform's
-        // documented ceiling for this argument anyway.
-        const uint mtu = 1400;
+        // Configurable, and defaulting to the documented maximum. See SshVpnConfiguration.Mtu for
+        // why: this argument also sizes every buffer in the platform's receive pool, raising it is
+        // worth about 14% on a build that accepts it, and a build that does not accept it fails the
+        // connect outright rather than degrading.
+        var mtu = configuration.Mtu;
 
         // The frame size caps both directions' buffers, and 1500-byte deliveries at line rate is the
         // serial-cost death scenario (~8,300/s against a measured ~8,500/s ceiling). The docs' 1500

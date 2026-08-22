@@ -188,6 +188,12 @@ internal sealed class InboundPacketQueue
         var releasePacket = false;
         var deferredChannel = default(IntPtr);
 
+        // Captured under the gate so the number in the log is the rental at the moment of refusal,
+        // which is the only figure that can size Capacity: a refusal while we are *below* Capacity
+        // says the platform's pool ran out, not that we failed to give buffers back. Capacity counts
+        // buffers rather than bytes, so raising the MTU multiplies the rental at the same depth.
+        var outstandingAtFailure = 0;
+
         lock (_gate)
         {
             _acquiring--;
@@ -195,6 +201,7 @@ internal sealed class InboundPacketQueue
             if (hr < 0 || packet == default)
             {
                 _outstanding--;
+                outstandingAtFailure = _outstanding;
             }
             else if (_released)
             {
@@ -221,7 +228,9 @@ internal sealed class InboundPacketQueue
 
         if (hr < 0)
         {
-            PluginLog.Error($"The platform would not lend a receive buffer (0x{hr:X8})");
+            PluginLog.Error(
+                $"The platform would not lend a receive buffer (0x{hr:X8}) while holding "
+                + $"{outstandingAtFailure} of {Capacity}");
         }
 
         return packet != default;

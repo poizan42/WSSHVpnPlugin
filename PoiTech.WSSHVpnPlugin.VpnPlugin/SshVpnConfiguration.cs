@@ -23,6 +23,7 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 ///   &lt;UserName&gt;alice&lt;/UserName&gt;
 ///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
 ///   &lt;ClientIPv4&gt;192.168.255.2&lt;/ClientIPv4&gt;
+///   &lt;Mtu&gt;1400&lt;/Mtu&gt;
 ///   &lt;DnsServer&gt;1.1.1.1&lt;/DnsServer&gt;
 ///   &lt;InclusionRoute&gt;10.0.0.0/8&lt;/InclusionRoute&gt;
 /// &lt;/SshVpnConfiguration&gt;
@@ -83,6 +84,40 @@ internal sealed class SshVpnConfiguration
     /// DNS server channel has to be re-established.
     /// </remarks>
     public uint OpenTimeoutSeconds { get; private init; } = 3;
+
+    /// <summary>The default MTU. The documented maximum for this argument.</summary>
+    public const uint DefaultMtu = 1400;
+
+    /// <summary>
+    /// Gets the MTU to advertise on the virtual interface, which is also the size of every buffer
+    /// in the platform's receive pool.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Configurable because the documented limit and the measured behaviour disagree, and which
+    /// Windows builds enforce the limit is unknown. StartWithMainTransport's page says mtuSize
+    /// "should be configured to be at most 1400" and that it "is also the size of the
+    /// IVpnPacketBuffers in the Receive pool" - and the neighbouring maxFrameSize cap of 1500 is
+    /// written for a plug-in that puts one IP packet in one datagram, which is not this
+    /// architecture (we already run a 65536 frame size for that reason).
+    /// </para>
+    /// <para>
+    /// Measured on build 26200: 32768 is accepted and worth about 14% - 222 Mbit/s peak against
+    /// 194 at 1400 - because it amortises the per-packet cost of the kernel networking path over
+    /// 21x fewer packets for the same bytes. It also has a cost the documented sentence above
+    /// predicts: at 32 KiB per receive buffer the pool refuses to lend at around 110 outstanding
+    /// buffers, a few megabytes, where 1400 never came close. Those refusals are counted and
+    /// absorbed as backpressure - measured with zero drops, zero retransmissions and zero
+    /// window-full - so they cost throughput only if they become constant.
+    /// </para>
+    /// <para>
+    /// The default stays at the documented value because a rejected value is not survivable: a
+    /// refused Start returns E_OUTOFMEMORY, the channel is single-shot afterwards, so there is no
+    /// falling back within the activation and the tunnel simply never connects. Raise it per
+    /// profile on a build where it has been tried.
+    /// </para>
+    /// </remarks>
+    public uint Mtu { get; private init; } = DefaultMtu;
 
     /// <summary>Gets the DNS servers to assign, if any.</summary>
     public IReadOnlyList<string> DnsServers { get; private init; } = Array.Empty<string>();
@@ -149,6 +184,7 @@ internal sealed class SshVpnConfiguration
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
             OpenTimeoutSeconds = ReadUInt32(root, "OpenTimeoutSeconds", 3),
+            Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             DnsServers = ReadStringList(root, "DnsServer"),
             InclusionRoutes = ReadStringList(root, "InclusionRoute"),
             ExclusionRoutes = ReadStringList(root, "ExcludeRoute"),

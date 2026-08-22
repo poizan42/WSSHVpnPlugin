@@ -669,6 +669,26 @@ measured, and most plausible theories were wrong; the order below is the order o
   quarter of the budget, went to one application polling a host that happened to be switched off.
   Whether that is acceptable in general is an open question, not a closed one: see **Open holes**.
 
+- **The MTU is the receive pool's buffer size, and raising it trades documented conformance for
+  ~14%.** `StartWithMainTransport`'s page says `mtuSize` "should be configured to be at most 1400"
+  and — the load-bearing half — that it "is also the size of the **IVpnPacketBuffers** in the Receive
+  pool". Measured on build 26200: 32768 is accepted and gives **222 Mbit/s peak against 194 at
+  1400**, because the same bytes move in ~21× fewer packets (815/s against 17,300/s) and the kernel
+  networking path is charged per packet — `NETIO.SYS` 10.6%, `tcpip.sys` 9.7%, `NDIS.SYS` 6.4% of
+  process CPU, against our own binary at 10.5%. The cost is exactly what that documented sentence
+  predicts: at 32 KiB per buffer the pool stops lending at **~110 outstanding buffers**, a few
+  megabytes, where 1400 never came close. It is backpressure rather than loss — 11 refusals in a run
+  with zero drops, zero retransmissions and zero window-full — and the queue's own `Capacity = 512`
+  never binds, which is also the proof that nothing is being leaked: `_stalls` counts local-cap and
+  platform refusals alike, and the two counts matched exactly. Two conclusions worth not re-deriving:
+  reducing the refusal count buys nothing (a deferral is one failed cross-process call plus a retry
+  on the next pass), and bytes in flight are capped by the platform's budget *whatever* the MTU, so
+  the in-flight bound the inbound queue was sized around is MTU-independent — the MTU only buys
+  per-packet amortisation. Left configurable (`<Mtu>`, default 1400) rather than simply raised,
+  because a refused value is not survivable: `Start` fails with `E_OUTOFMEMORY` and the channel is
+  single-shot afterwards, so there is no falling back inside the activation and the tunnel never
+  connects at all.
+
 ### Open holes
 
 Deliberate, documented, and not to be silently papered over:
@@ -696,6 +716,14 @@ Deliberate, documented, and not to be silently papered over:
   channel state, and never validated against a real server. OpenSSH's `MaxSessions` does not apply to
   port forwards — it caps shell/exec/subsystem multiplexing — so the real ceiling is likely file
   descriptors at both ends and far higher, but that is recitation, not measurement.
+
+- **Which Windows builds accept an MTU above the documented 1400 is unknown.** 32768 works on 26200,
+  the only build it has been tried on; the package declares support from 20348, and the docs state
+  the cap for every version from 10240 to 28000, so nothing promises it anywhere. Hence the default
+  is the documented value and the knob exists to raise it per profile on a build where it has been
+  tested. The same caution does not transfer to `maxFrameSize`, whose 1500 cap is written for a
+  plug-in that puts one IP packet in one datagram — not this architecture — and which has months of
+  real use at 65536 behind it.
 
 ### The fork's transport seam
 

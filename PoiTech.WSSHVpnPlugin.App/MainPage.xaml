@@ -37,6 +37,7 @@
             <TextBox x:Name="ClientAddressBox" Header="Client IPv4 address" Text="192.168.255.2"/>
             <TextBox x:Name="ExcludeRoutesBox" Header="Keep out of the tunnel (comma separated CIDR)" PlaceholderText="192.168.1.0/24"/>
             <TextBox x:Name="DnsBox" Header="DNS servers (comma separated)" PlaceholderText="1.1.1.1"/>
+            <TextBox x:Name="MtuBox" Header="MTU (1400 is the documented maximum; higher is faster where the platform accepts it)" Text="1400"/>
             <TextBox x:Name="OpenTimeoutBox" Header="Channel open timeout, seconds (must stay below the 5 s DNS deadline)" Text="3"/>
             <TextBox x:Name="StartDelayBox" Header="Delay before Start, seconds (0 = none; for attaching a debugger)" Text="0"/>
         </StackPanel>
