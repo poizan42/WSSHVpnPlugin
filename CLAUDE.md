@@ -745,13 +745,15 @@ Deliberate, documented, and not to be silently papered over:
   port forwards — it caps shell/exec/subsystem multiplexing — so the real ceiling is likely file
   descriptors at both ends and far higher, but that is recitation, not measurement.
 
-- **Which Windows builds accept an MTU above the documented 1400 is unknown.** 32768 works on 26200,
-  the only build it has been tried on; the package declares support from 20348, and the docs state
-  the cap for every version from 10240 to 28000, so nothing promises it anywhere. Hence the default
-  is the documented value and the knob exists to raise it per profile on a build where it has been
-  tested. The same caution does not transfer to `maxFrameSize`, whose 1500 cap is written for a
-  plug-in that puts one IP packet in one datagram — not this architecture — and which has months of
-  real use at 65536 behind it.
+- **Both ends of the supported range accept the whole UINT16 MTU; the builds in between are
+  untested.** `StartWithMainTransport` took `mtuSize 65535` with `maxFrameSize 65536` on **20348**
+  (Server 2022, the declared minimum) and on **26200**, and carried real traffic on both — so the
+  documented "at most 1400" is not a limit that newer builds relaxed. It reads as guidance written
+  for a plug-in that puts one IP packet in one datagram, which is also why the neighbouring 1500
+  frame cap never applied to this architecture. Nothing has been tried between 20348 and 26200, and
+  the default stays at the documented value regardless: a refused value fails the connect outright,
+  and 32768 is the best measured setting anyway (see **Throughput**), so the knob exists to raise it
+  per profile where it has been tried.
 
 ### The fork's transport seam
 
