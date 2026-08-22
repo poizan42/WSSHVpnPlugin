@@ -108,13 +108,22 @@ internal sealed class SshVpnConfiguration
     /// architecture (we already run a 65536 frame size for that reason).
     /// </para>
     /// <para>
-    /// Measured on build 26200: 32768 is accepted and worth about 14% - 222 Mbit/s peak against
-    /// 194 at 1400 - because it amortises the per-packet cost of the kernel networking path over
-    /// 21x fewer packets for the same bytes. It also has a cost the documented sentence above
-    /// predicts: at 32 KiB per receive buffer the pool refuses to lend at around 110 outstanding
-    /// buffers, a few megabytes, where 1400 never came close. Those refusals are counted and
-    /// absorbed as backpressure - measured with zero drops, zero retransmissions and zero
-    /// window-full - so they cost throughput only if they become constant.
+    /// Measured on build 26200, where 1400, 32768 and 65535 are all accepted - so the whole UINT16
+    /// range appears usable, and 32768 is the best of the three at 222 Mbit/s peak against 194 at
+    /// 1400. The gain is per-packet amortisation of the kernel networking path: the same bytes move
+    /// in about 21x fewer packets.
+    /// </para>
+    /// <para>
+    /// Larger is not better, though, and the receive pool is why - exactly as the documented
+    /// sentence above implies, since this value sizes every buffer in it. The pool's budget measures
+    /// as a few megabytes and is denominated in bytes rather than buffers: it refuses at around 110
+    /// outstanding 32 KiB buffers and around 55 outstanding 64 KiB ones, both about 3.5 MB. So
+    /// doubling this halves the packets in flight, and 65535 is worse than 32768 on every count -
+    /// 188 Mbit/s peak, and 24,467 refusals in roughly a minute against 11 for a comparable stretch
+    /// at 32768. Of those, 3,329 arrived while holding no buffers at all, which is the pool being
+    /// empty because the platform has not recycled what it already took, not anything we are
+    /// renting. Refusals are absorbed as backpressure - zero drops, zero retransmissions, zero
+    /// window-full at either size - so they cost throughput only in that volume.
     /// </para>
     /// <para>
     /// The default stays at the documented value because a rejected value is not survivable: a

@@ -683,22 +683,36 @@ measured, and most plausible theories were wrong; the order below is the order o
   quarter of the budget, went to one application polling a host that happened to be switched off.
   Whether that is acceptable in general is an open question, not a closed one: see **Open holes**.
 
-- **The MTU is the receive pool's buffer size, and raising it trades documented conformance for
-  ~14%.** `StartWithMainTransport`'s page says `mtuSize` "should be configured to be at most 1400"
-  and — the load-bearing half — that it "is also the size of the **IVpnPacketBuffers** in the Receive
-  pool". Measured on build 26200: 32768 is accepted and gives **222 Mbit/s peak against 194 at
-  1400**, because the same bytes move in ~21× fewer packets (815/s against 17,300/s) and the kernel
-  networking path is charged per packet — `NETIO.SYS` 10.6%, `tcpip.sys` 9.7%, `NDIS.SYS` 6.4% of
-  process CPU, against our own binary at 10.5%. The cost is exactly what that documented sentence
-  predicts: at 32 KiB per buffer the pool stops lending at **~110 outstanding buffers**, a few
-  megabytes, where 1400 never came close. It is backpressure rather than loss — 11 refusals in a run
-  with zero drops, zero retransmissions and zero window-full — and the queue's own `Capacity = 512`
-  never binds, which is also the proof that nothing is being leaked: `_stalls` counts local-cap and
-  platform refusals alike, and the two counts matched exactly. Two conclusions worth not re-deriving:
-  reducing the refusal count buys nothing (a deferral is one failed cross-process call plus a retry
-  on the next pass), and bytes in flight are capped by the platform's budget *whatever* the MTU, so
-  the in-flight bound the inbound queue was sized around is MTU-independent — the MTU only buys
-  per-packet amortisation. Left configurable (`<Mtu>`, default 1400) rather than simply raised,
+- **The MTU is the receive pool's buffer size, which makes both the gain and the ceiling follow from
+  one documented sentence.** `StartWithMainTransport`'s page says `mtuSize` "should be configured to
+  be at most 1400" and — the load-bearing half — that it "is also the size of the
+  **IVpnPacketBuffers** in the Receive pool". On build 26200, **1400, 32768 and 65535 are all
+  accepted**, so the whole UINT16 range appears usable, and the ranking is not monotonic:
+
+  | MTU | peak | refusals | notes |
+  |---|---|---|---|
+  | 1400 | 194 Mbit/s | 0 | the documented value |
+  | **32768** | **222 Mbit/s** | 11 per run | best measured |
+  | 65535 | 188 Mbit/s | 24,467 in ~1 min | worse on every count |
+
+  32768 wins because the same bytes move in ~21× fewer packets (815/s against 17,300/s) and the
+  kernel networking path is charged per packet — `NETIO.SYS` 10.6%, `tcpip.sys` 9.7%, `NDIS.SYS` 6.4%
+  of process CPU, against our own binary at 10.5%. 65535 loses because the pool's budget is
+  denominated in **bytes, not buffers**: it refuses at ~110 outstanding 32 KiB buffers and ~55
+  outstanding 64 KiB ones, both about **3.5 MB**, so doubling the MTU halves the packets in flight.
+  At 64 KiB, 3,329 of those refusals arrived while holding *no* buffers at all — the pool empty
+  because the platform had not recycled what it already took, nothing to do with our rental.
+
+  Refusals are backpressure rather than loss at either size: zero drops, zero retransmissions, zero
+  window-full throughout, and the queue's own `Capacity = 512` never binds — which is also the proof
+  that nothing leaks, since `_stalls` counts local-cap and platform refusals alike and the two counts
+  matched exactly. Two conclusions worth not re-deriving: reducing the refusal count buys nothing in
+  itself (a deferral is one failed cross-process call plus a retry on the next pass), and bytes in
+  flight are capped by that same budget *whatever* the MTU, so the in-flight bound the inbound queue
+  was sized around is MTU-independent — the MTU only buys per-packet amortisation. Raw logs for the
+  above are kept out of the repo; `dumps\` holds the local copies.
+
+  Left configurable (`<Mtu>`, default 1400) rather than simply raised,
   because a refused value is not survivable: `Start` fails with `E_OUTOFMEMORY` and the channel is
   single-shot afterwards, so there is no falling back inside the activation and the tunnel never
   connects at all.
