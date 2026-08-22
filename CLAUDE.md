@@ -682,6 +682,22 @@ measured, and most plausible theories were wrong; the order below is the order o
   large share of `MaximumLiveChannels = 128` — on the machine this was measured on, ~35 slots, a
   quarter of the budget, went to one application polling a host that happened to be switched off.
   Whether that is acceptable in general is an open question, not a closed one: see **Open holes**.
+- **The architecture's ceiling on this machine is ~510 Mbit/s, and the host reaches only 326 of it.**
+  The control is `ssh -L` plus `iperf3 -R -t 60 -P 4` on the same machine — OpenSSH doing the
+  forwarding over one SSH connection, our code and the VPN platform out of the path, everything else
+  identical. It sustains **510 Mbit/s** against a ~620–650 Mbit/s access link, so ~80% is what bulk
+  TCP over a single SSH connection costs here, and no tunnel of this shape beats it. Our tunnel
+  reaches **493 Mbit/s on a Server 2022 guest** — 97% of that ceiling, so the stack itself is not the
+  limit — and **~326 on the host**, a 36% shortfall against a ±8% noise floor. Context-switch tracing
+  at the host's best rate shows the plug-in host **idle**: 0.79 cores of 8, no thread above 0.12, 93%
+  of scheduling waits under a millisecond, and the stack thread blocked on its own wait-for-work
+  event. So the shortfall is not ours, not CPU and not the network; what is left is the platform's
+  transport-delivery path, the one stretch `ssh -L` does not traverse. Whether that is a 26200
+  regression or client-OS background activity is still confounded — a Windows 11 guest on the same
+  host and switch would separate them. Numbers, the ruled-out list and the method are in
+  `docs\profiling\2026-08-22-host-vs-guest-throughput.md`. One correction it carries: the `ssh -D`
+  figure of 282 Mbit/s above is **not** this machine's capability — it settled the 8 Mbit question
+  and nothing more.
 
 - **The MTU is the receive pool's buffer size, which makes both the gain and the ceiling follow from
   one documented sentence.** `StartWithMainTransport`'s page says `mtuSize` "should be configured to
