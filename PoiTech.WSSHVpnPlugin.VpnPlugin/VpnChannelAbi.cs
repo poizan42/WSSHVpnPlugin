@@ -64,11 +64,11 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>
     /// The three <c>IUnknown</c> slots that prefix every COM vtable. The interface-specific vtables
-    /// below embed this (via <see cref="InspectableVtable"/> for WinRT interfaces, directly for
-    /// <see cref="BufferByteAccessVtable"/>), so the inheritance chain is visible as layout.
+    /// below embed this (via <see cref="InspectableVTable"/> for WinRT interfaces, directly for
+    /// <see cref="BufferByteAccessVTable"/>), so the inheritance chain is visible as layout.
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct IUnknownVtable
+    private readonly struct IUnknownVTable
     {
         private readonly IntPtr QueryInterfacePtr; // slot 0
         private readonly IntPtr AddRefPtr;         // slot 1
@@ -97,9 +97,9 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>The six slots that prefix every WinRT (IInspectable-derived) vtable.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct InspectableVtable
+    private readonly struct InspectableVTable
     {
-        private readonly IUnknownVtable IUnknown;       // slots 0-2
+        private readonly IUnknownVTable IUnknown;       // slots 0-2
         private readonly IntPtr GetIidsPtr;             // slot 3
         private readonly IntPtr GetRuntimeClassNamePtr; // slot 4
         private readonly IntPtr GetTrustLevelPtr;       // slot 5
@@ -107,9 +107,9 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>IVpnChannel2 — windows.networking.vpn.h:12095.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct VpnChannel2Vtable
+    private readonly struct VpnChannel2VTable
     {
-        private readonly InspectableVtable IInspectable;      // slots 0-5
+        private readonly InspectableVTable IInspectable;      // slots 0-5
         private readonly IntPtr StartWithMainTransportPtr;    // slot 6
         private readonly IntPtr StartExistingTransportsPtr;   // slot 7
         private readonly IntPtr AddActivityStateChangePtr;    // slot 8, add_ActivityStateChange
@@ -140,9 +140,9 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>IVpnChannel5 — windows.networking.vpn.h:12317, the out-of-band Append/Flush lane.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct VpnChannel5Vtable
+    private readonly struct VpnChannel5VTable
     {
-        private readonly InspectableVtable IInspectable;         // slots 0-5
+        private readonly InspectableVTable IInspectable;         // slots 0-5
         private readonly IntPtr AppendVpnReceivePacketBufferPtr; // slot 6, h:12333
         private readonly IntPtr AppendVpnSendPacketBufferPtr;    // slot 7, h:12335
         private readonly IntPtr FlushVpnReceivePacketBuffersPtr; // slot 8, h:12337
@@ -163,9 +163,9 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>IVpnPacketBuffer — windows.networking.vpn.h:15001. put_Status precedes get_Status.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct VpnPacketBufferVtable
+    private readonly struct VpnPacketBufferVTable
     {
-        private readonly InspectableVtable IInspectable;    // slots 0-5
+        private readonly InspectableVTable IInspectable;    // slots 0-5
         private readonly IntPtr GetBufferPtr;               // slot 6, get_Buffer
         private readonly IntPtr PutStatusPtr;               // slot 7, put_Status
         private readonly IntPtr GetStatusPtr;               // slot 8, get_Status
@@ -195,9 +195,9 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>IVpnPacketBufferList — windows.networking.vpn.h:15306. RemoveAtEnd precedes RemoveAtBegin.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct VpnPacketBufferListVtable
+    private readonly struct VpnPacketBufferListVTable
     {
-        private readonly InspectableVtable IInspectable; // slots 0-5
+        private readonly InspectableVTable IInspectable; // slots 0-5
         private readonly IntPtr AppendPtr;               // slot 6
         private readonly IntPtr AddAtBeginPtr;           // slot 7
         private readonly IntPtr RemoveAtEndPtr;          // slot 8
@@ -236,9 +236,9 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>IBuffer — windows.storage.streams.h:4140.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct BufferVtable
+    private readonly struct BufferVTable
     {
-        private readonly InspectableVtable IInspectable; // slots 0-5
+        private readonly InspectableVTable IInspectable; // slots 0-5
         private readonly IntPtr GetCapacityPtr;          // slot 6, get_Capacity
         private readonly IntPtr GetLengthPtr;            // slot 7, get_Length
         private readonly IntPtr PutLengthPtr;            // slot 8, put_Length
@@ -276,9 +276,9 @@ internal static unsafe class VpnChannelAbi
     /// method is slot 3, not 6.
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct BufferByteAccessVtable
+    private readonly struct BufferByteAccessVTable
     {
-        private readonly IUnknownVtable IUnknown; // slots 0-2
+        private readonly IUnknownVTable IUnknown; // slots 0-2
         private readonly IntPtr BufferPtr;        // slot 3, Buffer
 
         public int Buffer(IntPtr thisPtr, out byte* data)
@@ -294,9 +294,9 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>IVpnChannelStatics — windows.networking.vpn.h:12754.</summary>
     [StructLayout(LayoutKind.Sequential)]
-    private readonly struct VpnChannelStaticsVtable
+    private readonly struct VpnChannelStaticsVTable
     {
-        private readonly InspectableVtable IInspectable; // slots 0-5
+        private readonly InspectableVTable IInspectable; // slots 0-5
         private readonly IntPtr ProcessEventAsyncPtr;    // slot 6, ProcessEventAsync(IInspectable* thirdPartyPlugIn, IInspectable* event)
 
         public int ProcessEventAsync(IntPtr thisPtr, IntPtr plugIn, IntPtr thirdPartyEvent)
@@ -308,11 +308,11 @@ internal static unsafe class VpnChannelAbi
 
     /// <summary>IVpnChannelStatics slot 6 — dispatches one activation's event to the plug-in.</summary>
     internal static int ProcessEvent(IntPtr statics, IntPtr plugIn, IntPtr thirdPartyEvent)
-        => (*(VpnChannelStaticsVtable**)statics)->ProcessEventAsync(statics, plugIn, thirdPartyEvent);
+        => (*(VpnChannelStaticsVTable**)statics)->ProcessEventAsync(statics, plugIn, thirdPartyEvent);
 
     /// <summary>IUnknown slot 0.</summary>
     internal static int QueryInterface(IntPtr ptr, in Guid iid, out IntPtr result)
-        => (*(IUnknownVtable**)ptr)->QueryInterface(ptr, in iid, out result);
+        => (*(IUnknownVTable**)ptr)->QueryInterface(ptr, in iid, out result);
 
     /// <summary>IUnknown slot 2. Tolerates zero so cleanup paths need no guards.</summary>
     internal static void Release(IntPtr ptr)
@@ -322,12 +322,12 @@ internal static unsafe class VpnChannelAbi
             return;
         }
 
-        _ = (*(IUnknownVtable**)ptr)->Release(ptr);
+        _ = (*(IUnknownVTable**)ptr)->Release(ptr);
     }
 
     /// <summary>IVpnChannel2 slot 11. Slot 10 is GetVpnSendPacketBuffer.</summary>
     internal static int GetReceiveBuffer(IntPtr channel2, out IntPtr packetBuffer)
-        => (*(VpnChannel2Vtable**)channel2)->GetVpnReceivePacketBuffer(channel2, out packetBuffer);
+        => (*(VpnChannel2VTable**)channel2)->GetVpnReceivePacketBuffer(channel2, out packetBuffer);
 
     /// <summary>
     /// IVpnChannel2 slot 10. Same-index trap, both directions load-bearing: IVpnChannel's slots
@@ -335,19 +335,19 @@ internal static unsafe class VpnChannelAbi
     /// GetVpnSendPacketBuffer/GetVpnReceivePacketBuffer pair.
     /// </summary>
     internal static int GetSendBuffer(IntPtr channel2, out IntPtr packetBuffer)
-        => (*(VpnChannel2Vtable**)channel2)->GetVpnSendPacketBuffer(channel2, out packetBuffer);
+        => (*(VpnChannel2VTable**)channel2)->GetVpnSendPacketBuffer(channel2, out packetBuffer);
 
     /// <summary>IVpnChannel5 slot 7. The channel takes its own reference; the caller's must still be released.</summary>
     internal static int AppendSendBuffer(IntPtr channel5, IntPtr packetBuffer)
-        => (*(VpnChannel5Vtable**)channel5)->AppendVpnSendPacketBuffer(channel5, packetBuffer);
+        => (*(VpnChannel5VTable**)channel5)->AppendVpnSendPacketBuffer(channel5, packetBuffer);
 
     /// <summary>IVpnChannel5 slot 9. Transmits everything appended since the last flush, in append order.</summary>
     internal static int FlushSendBuffers(IntPtr channel5)
-        => (*(VpnChannel5Vtable**)channel5)->FlushVpnSendPacketBuffers(channel5);
+        => (*(VpnChannel5VTable**)channel5)->FlushVpnSendPacketBuffers(channel5);
 
     /// <summary>IVpnPacketBuffer slot 6, get_Buffer.</summary>
     internal static int GetBuffer(IntPtr packetBuffer, out IntPtr buffer)
-        => (*(VpnPacketBufferVtable**)packetBuffer)->GetBuffer(packetBuffer, out buffer);
+        => (*(VpnPacketBufferVTable**)packetBuffer)->GetBuffer(packetBuffer, out buffer);
 
     /// <summary>
     /// IVpnPacketBuffer slot 10, get_TransportAffinity — which of the two associated transports a
@@ -355,35 +355,35 @@ internal static unsafe class VpnChannelAbi
     /// doorbell datagrams (optional).
     /// </summary>
     internal static int GetTransportAffinity(IntPtr packetBuffer, out uint affinity)
-        => (*(VpnPacketBufferVtable**)packetBuffer)->GetTransportAffinity(packetBuffer, out affinity);
+        => (*(VpnPacketBufferVTable**)packetBuffer)->GetTransportAffinity(packetBuffer, out affinity);
 
     /// <summary>IBuffer slot 6, get_Capacity.</summary>
     internal static int GetCapacity(IntPtr buffer, out uint capacity)
-        => (*(BufferVtable**)buffer)->GetCapacity(buffer, out capacity);
+        => (*(BufferVTable**)buffer)->GetCapacity(buffer, out capacity);
 
     /// <summary>IBuffer slot 7, get_Length.</summary>
     internal static int GetLength(IntPtr buffer, out uint length)
-        => (*(BufferVtable**)buffer)->GetLength(buffer, out length);
+        => (*(BufferVTable**)buffer)->GetLength(buffer, out length);
 
     /// <summary>IBuffer slot 8, put_Length.</summary>
     internal static int SetLength(IntPtr buffer, uint length)
-        => (*(BufferVtable**)buffer)->PutLength(buffer, length);
+        => (*(BufferVTable**)buffer)->PutLength(buffer, length);
 
     /// <summary>IBufferByteAccess slot 3, Buffer.</summary>
     internal static int GetBytes(IntPtr byteAccess, out byte* data)
-        => (*(BufferByteAccessVtable**)byteAccess)->Buffer(byteAccess, out data);
+        => (*(BufferByteAccessVTable**)byteAccess)->Buffer(byteAccess, out data);
 
     /// <summary>IVpnPacketBufferList slot 6, Append. The list takes its own reference.</summary>
     internal static int ListAppend(IntPtr list, IntPtr packetBuffer)
-        => (*(VpnPacketBufferListVtable**)list)->Append(list, packetBuffer);
+        => (*(VpnPacketBufferListVTable**)list)->Append(list, packetBuffer);
 
     /// <summary>IVpnPacketBufferList slot 9, RemoveAtBegin. Slot 8 is RemoveAtEnd.</summary>
     internal static int ListRemoveAtBegin(IntPtr list, out IntPtr packetBuffer)
-        => (*(VpnPacketBufferListVtable**)list)->RemoveAtBegin(list, out packetBuffer);
+        => (*(VpnPacketBufferListVTable**)list)->RemoveAtBegin(list, out packetBuffer);
 
     /// <summary>IVpnPacketBufferList slot 13, get_Size.</summary>
     internal static int ListSize(IntPtr list, out uint size)
-        => (*(VpnPacketBufferListVtable**)list)->GetSize(list, out size);
+        => (*(VpnPacketBufferListVTable**)list)->GetSize(list, out size);
 
     /// <summary>
     /// Gets an owned <c>IVpnChannel2</c> pointer from the projected channel.
