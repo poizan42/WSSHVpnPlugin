@@ -124,6 +124,8 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             var configuration = SshVpnConfiguration.FromChannelConfiguration(channel.Configuration);
             PluginLog.Info($"Connecting to {configuration.Host}:{configuration.Port}");
 
+            RouteTableProbe.Run();
+
             // A key-based profile that already names its user needs nothing from the user, and
             // asking anyway would put a prompt in front of a background task for no reason.
             var needsCredentials = configuration.PrivateKeyToken is null || configuration.UserName is null;
@@ -1098,9 +1100,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
         if (excluded.Count > 0)
         {
-            // Worth logging in full the first time this runs on a machine: the count is the thing to
-            // watch, since it is the one unknown here - the platform used to be handed 2 routes per
-            // family and is now handed as many as the arithmetic produces.
+            // Logged in full because the count is what the platform might refuse: subtraction
+            // yields up to one route per bit of the excluded prefix, and a rejected Start fails the
+            // connect outright rather than degrading.
             PluginLog.Info(
                 $"Excluding {excluded.Count} {family} range(s) by omission: {routes.Count} inclusion route(s) "
                 + $"[{string.Join(", ", routes)}]");

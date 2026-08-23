@@ -82,11 +82,11 @@ internal sealed class SshVpnConfiguration
 
     /// <summary>Gets the IPv6 address to assign to the virtual interface.</summary>
     /// <remarks>
-    /// Always assigned - <c>Start*</c> fails with <c>E_OUTOFMEMORY</c> when the assigned IPv6
-    /// address list is empty - and, now that the stack carries IPv6, also the tunnel's v6 source
-    /// address. The ULA default makes Windows prefer IPv4 for dual-stack names (RFC 6724 gives a
-    /// ULA source a mismatched label against a global destination), so v6 traffic is mostly
-    /// v6-only hosts and literals until this is set to a global-scope address.
+    /// Always assigned, for two reasons: <c>Start*</c> fails with <c>E_OUTOFMEMORY</c> when the
+    /// assigned IPv6 address list is empty, and this is the tunnel's IPv6 source address. The ULA
+    /// default makes Windows prefer IPv4 for dual-stack names (RFC 6724 gives a ULA source a
+    /// mismatched label against a global destination), so v6 traffic is mostly v6-only hosts and
+    /// literals until this is set to a global-scope address.
     /// </remarks>
     public string ClientIPv6 { get; private init; } = "fd00::2";
 

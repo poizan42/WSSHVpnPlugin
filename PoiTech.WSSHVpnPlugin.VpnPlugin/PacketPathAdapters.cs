@@ -29,9 +29,9 @@ internal static class Counters
 
     /// <summary>
     /// Stopwatch ticks the reaper spent inside channel teardown — close-sequence sends, session
-    /// event unsubscription, kernel-handle closes. Worker time now; it used to be stack time,
-    /// because the zero-timeout close's await completed synchronously and the "deferred" disposal
-    /// never left the caller.
+    /// event unsubscription, kernel-handle closes. This must be worker time, which is what makes it
+    /// worth counting: a zero-timeout close's await can complete synchronously, and a "deferred"
+    /// disposal that never leaves its caller puts all of this on the stack thread instead.
     /// </summary>
     public static long ReapTicks;
 }

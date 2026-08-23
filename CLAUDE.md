@@ -252,6 +252,43 @@ A path is deliberately not offered as an alternative. One appears to work, but o
 has been picked, because picking is what grants access to that item — so it would be a setting that
 works for a reason the user cannot see.
 
+**The app container does not restrict the routing table, and it is the better source anyway.**
+Measured from inside the background-task host on 2026-08-23: `GetIpForwardTable2` (iphlpapi, via
+`DllImport` with pointer-form signatures — `DisableRuntimeMarshalling` forbids by-ref) returns
+`NO_ERROR` and the full table, 72 routes across both families, with correct metrics and interface
+indices. Reading it needs no privilege and the container adds none of its own.
+
+It beats `NetworkInformation.GetHostNames()` on every axis, which is worth knowing before anyone
+reaches for the WinRT-shaped answer:
+
+- **Coverage.** 72 routes against 5 entries. `GetHostNames` filters APIPA and link-local, so on a
+  machine with 11 IPv4 addresses and 11 IPv6 ones it returned three v4 prefixes and **zero v6** —
+  while the route table showed 35 v6 routes. Nothing about IPv6 is reliably visible in the address
+  list; the filter is right for reconstructing on-link prefixes and wrong for anything else.
+- **Reach.** Addresses yield on-link prefixes only. A static route, or another VPN's pushed routes,
+  appears in neither the address list nor its prefix lengths.
+- **Cost.** 8 ms for the route table, against 132 ms for the address enumeration — of which 78 ms is
+  the first `IPInformation`/`NetworkAdapter` touch, the per-adapter machinery warming up. On the
+  connect path, which is where either would run.
+
+What this is for: an assigned client address becomes a host route on the tunnel interface
+(`192.168.255.2/32`, `fd00::2/128`), and a host route beats every other prefix length, so an address
+that collides makes whatever it collides with quietly unreachable for the life of the tunnel. The
+routing table is where such a claim is *published*, which makes reading it before assigning the
+coordination protocol rather than a heuristic — and a later arrival that does not read it is no more
+our problem than it is any other virtual interface's. Two calibration notes from the same run:
+`0.0.0.0/0` was the only default route of the 72, so "more specific than a default" is not a useful
+filter; and the ranges to discard before testing containment are the ones nothing would allocate from
+anyway (`127/8`, multicast, `fe80::/10`).
+
+No such probe is needed for IPv6, and the asymmetry is the point: a randomly generated 40-bit ULA
+global ID (RFC 4193 §3.2.2, which requires exactly that — `fd00::2` uses a global ID of zero and is
+the lazy value most likely to be shared with another product) collides only with someone drawing the
+same 40 bits. For v6 the compliance that matters is ours; for v4 it is everyone else's, and no v4
+range is safe by construction — `100.64.0.0/10` is Tailscale's, `198.18.0.0/15` turns up in proxy
+tooling, `192.0.2.0/24` gets copy-pasted out of documentation. Hence observation for v4, entropy for
+v6.
+
 ### Runtime flow
 
 `VpnBackgroundTask.Run` is what the platform activates, once per event (connect, encapsulate,

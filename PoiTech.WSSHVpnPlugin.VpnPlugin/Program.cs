@@ -15,15 +15,16 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// supplies one, and this is it.
 /// </para>
 /// <para>
-/// What matters is what this does <em>not</em> do: start a XAML application. The host used to be the
-/// UI app's executable, because Native AOT linked the component into it and re-exported its
-/// activation factory. That put the VPN host inside a XAML application's process, and when the
-/// platform suspended that application, <c>DXamlCore::OnAfterAppSuspend</c> called
-/// <c>GC.Collect()</c> inside the tunnel's process. That collection deadlocks against a ComWrappers
-/// callout — a class constructor runs inside the collection, allocates, and waits for the collection
-/// it is already inside — so Windows logged "stopped interacting with Windows and was closed" and
-/// killed the host about a minute after every connect. Traced from live thread stacks; see the
-/// hang notes in CLAUDE.md. A background host has no window to show and nothing to suspend.
+/// What matters is what this does <em>not</em> do: start a XAML application. Naming the UI app's
+/// executable as the host is tempting, since Native AOT will link the component into it and
+/// re-export its activation factory — and fatal, because it puts the VPN host inside a XAML
+/// application's process. When the platform suspends that application,
+/// <c>DXamlCore::OnAfterAppSuspend</c> calls <c>GC.Collect()</c> inside the tunnel's process, and
+/// that collection deadlocks against a ComWrappers callout: a class constructor runs inside the
+/// collection, allocates, and waits for the collection it is already inside. Windows then logs
+/// "stopped interacting with Windows and was closed" and kills the host about a minute after every
+/// connect. See the hang notes in CLAUDE.md. A background host has no window to show and nothing to
+/// suspend.
 /// </para>
 /// </remarks>
 internal static class Program
@@ -31,7 +32,7 @@ internal static class Program
     private static void Main()
     {
         // Hands the platform the activation factories this executable exports, then runs the loop
-        // that services them. This is what Application.Start used to do, minus everything XAML.
+        // that services them. This is what Application.Start does, minus everything XAML.
         CoreApplication.RunWithActivationFactories(new ActivationFactorySource());
     }
 }

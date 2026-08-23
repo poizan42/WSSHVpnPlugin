@@ -56,11 +56,12 @@
       and TargetPlatformVersion (Microsoft.DesktopBridge.targets:267-268) and the two
       ...ReplaceManifestVersion switches default to true, so editing the manifest alone is inert.
 
-      The minimum is left generated, and was wrong until now: it said 10.0.17763.0 - the SDK default -
-      while the packet path calls AppendVpnReceivePacketBuffer and FlushVpnReceivePacketBuffers
-      unconditionally and those arrived in 10.0.20348.0, which is what both payload projects declare.
-      The platform-compatibility analyzer does not flag the mismatch, so the too-low value bought a
-      runtime failure on an old build rather than a build error here.
+      The minimum is left generated, so it comes from the value below rather than from the manifest,
+      and it has to be declared rather than left at the SDK default of 10.0.17763.0: the packet path
+      calls AppendVpnReceivePacketBuffer and FlushVpnReceivePacketBuffers unconditionally, and those
+      arrived in 10.0.20348.0, which is what both payload projects declare. The platform-compatibility
+      analyzer does not flag a minimum below what the code calls, so a lower value here costs a
+      runtime failure on an old build instead of a build error.
     -->
     <TargetPlatformMinVersion>10.0.20348.0</TargetPlatformMinVersion>
 
