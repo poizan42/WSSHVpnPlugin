@@ -189,8 +189,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             }
 
             // The packet path needs the queue, which exists; the doorbell is a no-op on this
-            // transport, so injection rides the data-driven decapsulate visits.
-            connection.AttachPacketPath(inbound, transport);
+            // transport, so injection rides the data-driven decapsulate visits. The MTU is what
+            // Start was given: the stack derives every segment size and scratch buffer from it.
+            connection.AttachPacketPath(inbound, transport, (int)configuration.Mtu);
         }
         catch (Exception ex)
         {
@@ -218,11 +219,14 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     {
         var ipv4 = new List<HostName> { new HostName(configuration.ClientIPv4) };
 
-        // Unconditional, and not because IPv6 is carried: Start* fails with E_OUTOFMEMORY - a
-        // resource error that has nothing to do with resources - whenever the assigned IPv6
-        // address list is empty. Bisected to this single variable during the bring-up; it was an
-        // option for a while and there is no working value of "off".
-        var ipv6 = new List<HostName> { new HostName("fd00::2") };
+        // Unconditional - Start* fails with E_OUTOFMEMORY, a resource error that has nothing to do
+        // with resources, whenever the assigned IPv6 address list is empty; bisected to this single
+        // variable during the bring-up, and there is no working value of "off". IPv6 is carried
+        // now, so the address is also load-bearing: it is the tunnel's v6 source. The ULA default
+        // makes Windows prefer v4 for dual-stack names (RFC 6724 label mismatch), so default v6
+        // volume is v6-only hosts and literals; a profile wanting full v6 preference sets
+        // <ClientIPv6> to a global-scope address.
+        var ipv6 = new List<HostName> { new HostName(configuration.ClientIPv6) };
 
         // Configurable, and defaulting to the documented maximum. See SshVpnConfiguration.Mtu for
         // why: this argument also sizes every buffer in the platform's receive pool, raising it is
@@ -970,86 +974,65 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     }
 
     /// <summary>
-    /// Builds the route assignment.
+    /// Builds the route assignment, for both families.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A literal <c>0.0.0.0/0</c> is never used, even though it is what "send everything" means. It
-    /// is recorded in the reference implementation that a default route written that way pulls
-    /// traffic back into the tunnel even from a socket bound to another interface, which would take
-    /// the SSH session down with it. The split default covers exactly the same addresses and behaves.
+    /// A literal default route (<c>0.0.0.0/0</c> or <c>::/0</c>) is never used, even though it is
+    /// what "send everything" means. It is recorded in the reference implementation that a default
+    /// route written that way pulls traffic back into the tunnel even from a socket bound to another
+    /// interface, which would take the SSH session down with it. The split default covers exactly
+    /// the same addresses and behaves.
     /// </para>
     /// <para>
-    /// Only IPv4 routes are added, because only an IPv4 address is assigned: the platform hangs when
-    /// given routes for a family it has no address for. The consequence is that IPv6 traffic keeps
-    /// using the physical interface — it leaves the tunnel rather than being blocked.
+    /// Both families are routed in: the stack carries IPv6 TCP and DNS the same way it carries v4.
+    /// A profile that wants IPv6 kept out writes <c>&lt;ExcludeRoute&gt;::/0&lt;/ExcludeRoute&gt;</c>
+    /// - the subtraction turns that into "no IPv6 routes", and IPv6 stays on the physical interface
+    /// exactly as it did before the stack could carry it. The exclusion-covers-everything guard is
+    /// therefore per family: for v4 it is a configuration error (a tunnel with no routes carries
+    /// nothing), for v6 it is the off switch.
     /// </para>
     /// </remarks>
     private static VpnRouteAssignment BuildRouteAssignment(SshVpnConfiguration configuration)
     {
         var assignment = new VpnRouteAssignment { ExcludeLocalSubnets = true };
 
-        if (configuration.InclusionRoutes.Count == 0)
-        {
-            AddIpv4InclusionRoutes(
-                assignment,
-                configuration,
-                [new Ipv4Prefix(0, 1), new Ipv4Prefix(0x80000000, 1)]);
+        // Configured routes carry their family in their text: a colon is v6, dotted-quad is v4.
+        // A malformed inclusion throws - the user asked for a route the tunnel cannot provide, and
+        // connecting without it would silently carry the wrong traffic.
+        var included4 = new List<IpPrefix>();
+        var included6 = new List<IpPrefix>();
 
-            // No IPv6 routes, ever, even though an IPv6 address has to be assigned for Start to
-            // succeed at all. There is no IPv6 stack behind this tunnel, so routing IPv6 in would
-            // black-hole it; leaving it unrouted keeps it on the physical interface. That is a leak,
-            // and an accepted one until the stack grows an IPv6 path — at which point this becomes a
-            // deliberate addition rather than a switch nobody could safely turn on.
-        }
-        else
+        foreach (var route in configuration.InclusionRoutes)
         {
-            var configured = new List<Ipv4Prefix>(configuration.InclusionRoutes.Count);
-            foreach (var route in configuration.InclusionRoutes)
-            {
-                configured.Add(Ipv4Prefix.Parse(route));
-            }
-
-            AddIpv4InclusionRoutes(assignment, configuration, configured);
+            var prefix = IpPrefix.Parse(route);
+            (prefix.IsV4 ? included4 : included6).Add(prefix);
         }
 
-        return assignment;
-    }
+        // A family nobody configured gets its half-default pair.
+        if (included4.Count == 0)
+        {
+            included4.Add(IpPrefix.Parse("0.0.0.0/1"));
+            included4.Add(IpPrefix.Parse("128.0.0.0/1"));
+        }
 
-    /// <summary>
-    /// Adds the IPv4 inclusion routes, with the configured exclusions subtracted out of them.
-    /// </summary>
-    /// <param name="assignment">The assignment to add to.</param>
-    /// <param name="configuration">Supplies <c>&lt;ExcludeRoute&gt;</c>.</param>
-    /// <param name="included">What the tunnel would carry if nothing were excluded.</param>
-    /// <remarks>
-    /// <para>
-    /// Exclusion is by omission, because the platform's own exclusion knobs do nothing:
-    /// <c>Ipv4ExclusionRoutes</c> and <c>ExcludeLocalSubnets</c> are both accepted and both change
-    /// nothing — with the client's LAN excluded, a route lookup for a host in it still returns the
-    /// tunnel and the tunnel's source address, even against a more specific, better-metric on-link
-    /// route on the physical NIC. The inclusion list <em>is</em> honoured, since it is how the tunnel
-    /// gets traffic at all, so removing a range from it is the one lever that bites. See
-    /// <see cref="Ipv4Prefix"/> for why this generalises where a split-routing traffic filter would
-    /// not.
-    /// </para>
-    /// <para>
-    /// A configuration that excludes everything is refused rather than passed on: a tunnel with no
-    /// routes carries nothing, which is a worse and much more confusing failure than an exclusion
-    /// that did not take.
-    /// </para>
-    /// </remarks>
-    private static void AddIpv4InclusionRoutes(
-        VpnRouteAssignment assignment,
-        SshVpnConfiguration configuration,
-        IReadOnlyList<Ipv4Prefix> included)
-    {
-        var excluded = new List<Ipv4Prefix>(configuration.ExclusionRoutes.Count);
+        if (included6.Count == 0)
+        {
+            included6.Add(IpPrefix.Parse("::/1"));
+            included6.Add(IpPrefix.Parse("8000::/1"));
+        }
+
+        // A malformed exclusion is logged and skipped rather than thrown: failing the whole tunnel
+        // over a range that would merely have been kept out is the wrong trade.
+        var excluded4 = new List<IpPrefix>();
+        var excluded6 = new List<IpPrefix>();
+
         foreach (var route in configuration.ExclusionRoutes)
         {
             try
             {
-                excluded.Add(Ipv4Prefix.Parse(route));
+                var prefix = IpPrefix.Parse(route);
+                (prefix.IsV4 ? excluded4 : excluded6).Add(prefix);
             }
             catch (FormatException ex)
             {
@@ -1057,27 +1040,69 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             }
         }
 
-        var routes = excluded.Count == 0 ? included : Ipv4Prefix.Subtract(included, excluded);
+        AddInclusionRoutes(assignment.Ipv4InclusionRoutes, "IPv4", included4, excluded4, required: true);
+        AddInclusionRoutes(assignment.Ipv6InclusionRoutes, "IPv6", included6, excluded6, required: false);
+
+        return assignment;
+    }
+
+    /// <summary>
+    /// Adds one family's inclusion routes, with that family's exclusions subtracted out of them.
+    /// </summary>
+    /// <param name="target">The assignment's route list for this family.</param>
+    /// <param name="family">The family's name, for the log.</param>
+    /// <param name="included">What the tunnel would carry if nothing were excluded.</param>
+    /// <param name="excluded">The ranges to keep out.</param>
+    /// <param name="required">
+    /// Whether an empty result is a configuration error. For IPv4 it is - a tunnel with no routes
+    /// carries nothing. For IPv6 it is the off switch: excluding <c>::/0</c> is how a profile keeps
+    /// IPv6 on the physical interface.
+    /// </param>
+    /// <remarks>
+    /// Exclusion is by omission, because the platform's own exclusion knobs do nothing:
+    /// <c>Ipv4ExclusionRoutes</c> and <c>ExcludeLocalSubnets</c> are both accepted and both change
+    /// nothing - with the client's LAN excluded, a route lookup for a host in it still returns the
+    /// tunnel and the tunnel's source address, even against a more specific, better-metric on-link
+    /// route on the physical NIC. The inclusion list <em>is</em> honoured, since it is how the tunnel
+    /// gets traffic at all, so removing a range from it is the one lever that bites. See
+    /// <see cref="IpPrefix"/> for why this generalises where a split-routing traffic filter would
+    /// not.
+    /// </remarks>
+    private static void AddInclusionRoutes(
+        IList<VpnRoute> target,
+        string family,
+        IReadOnlyList<IpPrefix> included,
+        IReadOnlyList<IpPrefix> excluded,
+        bool required)
+    {
+        var routes = excluded.Count == 0 ? included : IpPrefix.Subtract(included, excluded);
 
         if (routes.Count == 0)
         {
-            throw new InvalidOperationException(
-                "The configured exclusions cover every included route, which would leave the tunnel "
-                + "with no routes at all. Narrow <ExcludeRoute> or widen <InclusionRoute>.");
+            if (required)
+            {
+                throw new InvalidOperationException(
+                    "The configured exclusions cover every included route, which would leave the tunnel "
+                    + "with no routes at all. Narrow <ExcludeRoute> or widen <InclusionRoute>.");
+            }
+
+            PluginLog.Info(
+                $"The configured exclusions cover every {family} route; {family} stays on the physical interface.");
+            return;
         }
 
         foreach (var prefix in routes)
         {
-            assignment.Ipv4InclusionRoutes.Add(new VpnRoute(new HostName(prefix.ToAddressString()), prefix.Length));
+            target.Add(new VpnRoute(new HostName(prefix.ToAddressString()), prefix.Length));
         }
 
         if (excluded.Count > 0)
         {
             // Worth logging in full the first time this runs on a machine: the count is the thing to
-            // watch, since it is the one unknown here — the platform used to be handed 2 routes and
-            // is now handed as many as the arithmetic produces.
+            // watch, since it is the one unknown here - the platform used to be handed 2 routes per
+            // family and is now handed as many as the arithmetic produces.
             PluginLog.Info(
-                $"Excluding {excluded.Count} range(s) by omission: {routes.Count} inclusion route(s) "
+                $"Excluding {excluded.Count} {family} range(s) by omission: {routes.Count} inclusion route(s) "
                 + $"[{string.Join(", ", routes)}]");
         }
     }

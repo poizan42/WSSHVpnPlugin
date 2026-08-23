@@ -112,11 +112,11 @@ internal sealed class FakeChannelFactory : IByteChannelFactory
 
     public int OpenRequests { get; private set; }
 
-    public uint LastAddress { get; private set; }
+    public IpAddr LastAddress { get; private set; }
 
     public ushort LastPort { get; private set; }
 
-    public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
+    public void BeginOpen(IpAddr address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
     {
         OpenRequests++;
         LastAddress = address;
@@ -194,22 +194,42 @@ internal sealed class FakeSink : IPacketSink
         return true;
     }
 
-    /// <summary>Reads back the last packet as an IPv4 and TCP pair.</summary>
-    public (uint Source, uint Destination, ushort SourcePort, ushort DestinationPort, uint Seq, uint Ack, TcpFlags Flags, byte[] Payload) Last()
+    /// <summary>Reads back the last packet as an IP and TCP pair, whichever family it is.</summary>
+    public (IpAddr Source, IpAddr Destination, ushort SourcePort, ushort DestinationPort, uint Seq, uint Ack, TcpFlags Flags, byte[] Payload) Last()
     {
         return At(Packets.Count - 1);
     }
 
-    public (uint Source, uint Destination, ushort SourcePort, ushort DestinationPort, uint Seq, uint Ack, TcpFlags Flags, byte[] Payload) At(int index)
+    public (IpAddr Source, IpAddr Destination, ushort SourcePort, ushort DestinationPort, uint Seq, uint Ack, TcpFlags Flags, byte[] Payload) At(int index)
     {
         var bytes = Packets[index];
+        IpAddr source;
+        IpAddr destination;
+        Span<byte> payload;
 
-        if (!Ipv4Packet.TryParse(bytes, out var ip) || !TcpSegment.TryParse(ip.Payload, out var tcp))
+        if (Ipv4Packet.TryParse(bytes, out var ip4))
         {
-            throw new InvalidOperationException("The stack produced something that is not TCP over IPv4.");
+            source = IpAddr.FromV4(ip4.Source);
+            destination = IpAddr.FromV4(ip4.Destination);
+            payload = ip4.Payload;
+        }
+        else if (Ipv6Packet.TryParse(bytes, out var ip6))
+        {
+            source = ip6.Source;
+            destination = ip6.Destination;
+            payload = ip6.Payload;
+        }
+        else
+        {
+            throw new InvalidOperationException("The stack produced something that is not an IP packet.");
         }
 
-        return (ip.Source, ip.Destination, tcp.SourcePort, tcp.DestinationPort,
+        if (!TcpSegment.TryParse(payload, out var tcp))
+        {
+            throw new InvalidOperationException("The stack produced something that is not TCP.");
+        }
+
+        return (source, destination, tcp.SourcePort, tcp.DestinationPort,
                 tcp.SequenceNumber, tcp.AcknowledgementNumber, tcp.Flags, tcp.Payload.ToArray());
     }
 }
@@ -219,14 +239,14 @@ internal sealed class FakeSink : IPacketSink
 /// </summary>
 internal static class Packets
 {
-    public static uint Address(string dotted)
+    public static IpAddr Address(string text)
     {
-        return BinaryPrimitives.ReadUInt32BigEndian(IPAddress.Parse(dotted).GetAddressBytes());
+        return IpAddr.Parse(text);
     }
 
     public static byte[] Tcp(
-        uint source,
-        uint destination,
+        IpAddr source,
+        IpAddr destination,
         ushort sourcePort,
         ushort destinationPort,
         uint sequenceNumber,
@@ -237,7 +257,7 @@ internal static class Packets
         ushort windowSize = 65535)
     {
         var buffer = new byte[1500];
-        var tcpStart = Ipv4Packet.MinimumHeaderLength;
+        var tcpStart = source.HeaderLength;
         var headerLength = TcpSegment.MinimumHeaderLength + (mss.HasValue ? 4 : 0);
 
         payload.CopyTo(buffer.AsSpan(tcpStart + headerLength));
@@ -255,7 +275,26 @@ internal static class Packets
             payload.Length,
             mss);
 
-        var total = Ipv4Packet.Write(buffer, IpProtocol.Tcp, source, destination, tcpLength);
+        var total = IpHeader.Write(buffer, IpProtocol.Tcp, source, destination, tcpLength);
+        return buffer.AsSpan(0, total).ToArray();
+    }
+
+    public static byte[] Udp(
+        IpAddr source,
+        IpAddr destination,
+        ushort sourcePort,
+        ushort destinationPort,
+        ReadOnlySpan<byte> payload)
+    {
+        var buffer = new byte[1500];
+        var udpStart = source.HeaderLength;
+
+        payload.CopyTo(buffer.AsSpan(udpStart + UdpDatagram.HeaderLength));
+
+        var udpLength = UdpDatagram.Write(
+            buffer.AsSpan(udpStart), source, destination, sourcePort, destinationPort, payload.Length);
+
+        var total = IpHeader.Write(buffer, IpProtocol.Udp, source, destination, udpLength);
         return buffer.AsSpan(0, total).ToArray();
     }
 }

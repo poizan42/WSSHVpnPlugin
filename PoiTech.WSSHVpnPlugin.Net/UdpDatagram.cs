@@ -68,8 +68,8 @@ internal readonly ref struct UdpDatagram
     /// <returns>The total length of the datagram.</returns>
     public static int Write(
         Span<byte> buffer,
-        uint source,
-        uint destination,
+        in IpAddr source,
+        in IpAddr destination,
         ushort sourcePort,
         ushort destinationPort,
         int payloadLength)
@@ -82,14 +82,7 @@ internal readonly ref struct UdpDatagram
         BinaryPrimitives.WriteUInt16BigEndian(header[4..6], (ushort)total);
         BinaryPrimitives.WriteUInt16BigEndian(header[6..8], 0);
 
-        Span<byte> pseudoHeader = stackalloc byte[12];
-        BinaryPrimitives.WriteUInt32BigEndian(pseudoHeader[0..4], source);
-        BinaryPrimitives.WriteUInt32BigEndian(pseudoHeader[4..8], destination);
-        pseudoHeader[8] = 0;
-        pseudoHeader[9] = (byte)IpProtocol.Udp;
-        BinaryPrimitives.WriteUInt16BigEndian(pseudoHeader[10..12], (ushort)total);
-
-        var sum = InternetChecksum.Accumulate(0, pseudoHeader);
+        var sum = PseudoHeader.Accumulate(source, destination, IpProtocol.Udp, total);
         sum = InternetChecksum.Accumulate(sum, buffer[..total]);
         var checksum = InternetChecksum.Finish(sum);
 

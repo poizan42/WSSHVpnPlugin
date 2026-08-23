@@ -145,7 +145,7 @@ internal readonly ref struct TcpSegment
     /// checksums - if it treats the tunnel interface as offload-capable they may never be computed -
     /// and a stack that dropped those would blackhole every flow while looking healthy.
     /// </remarks>
-    public bool IsChecksumValid(uint source, uint destination)
+    public bool IsChecksumValid(in IpAddr source, in IpAddr destination)
     {
         if (BinaryPrimitives.ReadUInt16BigEndian(_segment[16..18]) == 0)
         {
@@ -175,8 +175,8 @@ internal readonly ref struct TcpSegment
     /// <returns>The total length of the segment.</returns>
     public static int Write(
         Span<byte> buffer,
-        uint source,
-        uint destination,
+        in IpAddr source,
+        in IpAddr destination,
         ushort sourcePort,
         ushort destinationPort,
         uint sequenceNumber,
@@ -216,16 +216,9 @@ internal readonly ref struct TcpSegment
     /// <summary>
     /// Computes the TCP checksum over the pseudo-header and the segment.
     /// </summary>
-    private static ushort ComputeChecksum(ReadOnlySpan<byte> segment, uint source, uint destination)
+    private static ushort ComputeChecksum(ReadOnlySpan<byte> segment, in IpAddr source, in IpAddr destination)
     {
-        Span<byte> pseudoHeader = stackalloc byte[12];
-        BinaryPrimitives.WriteUInt32BigEndian(pseudoHeader[0..4], source);
-        BinaryPrimitives.WriteUInt32BigEndian(pseudoHeader[4..8], destination);
-        pseudoHeader[8] = 0;
-        pseudoHeader[9] = (byte)IpProtocol.Tcp;
-        BinaryPrimitives.WriteUInt16BigEndian(pseudoHeader[10..12], (ushort)segment.Length);
-
-        var sum = InternetChecksum.Accumulate(0, pseudoHeader);
+        var sum = PseudoHeader.Accumulate(source, destination, IpProtocol.Tcp, segment.Length);
         sum = InternetChecksum.Accumulate(sum, segment);
         return InternetChecksum.Finish(sum);
     }

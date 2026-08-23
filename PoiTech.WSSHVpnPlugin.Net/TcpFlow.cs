@@ -22,9 +22,6 @@ internal sealed class TcpFlow
     /// <summary>What we advertise, and the most we will buffer from the peer.</summary>
     private const ushort ReceiveWindow = 32768;
 
-    /// <summary>Our MTU less the IPv4 and TCP headers.</summary>
-    private const ushort OurMaximumSegmentSize = 1360;
-
     /// <summary>
     /// How many segments one flow may send in a single visit before yielding.
     /// </summary>
@@ -53,7 +50,13 @@ internal sealed class TcpFlow
     private readonly TcpFlowKey _key;
     private readonly IPacketSink _sink;
     private readonly IStackClock _clock;
-    private readonly byte[] _scratch = new byte[1500];
+    private readonly byte[] _scratch;
+
+    /// <summary>The IP header length of this flow's family: what precedes the TCP header in scratch.</summary>
+    private readonly int _ipHeaderLength;
+
+    /// <summary>The MTU less this family's IP header and the TCP header.</summary>
+    private readonly ushort _maximumSegmentSize;
 
     /// <summary>How long to wait for an acknowledgement before resending, initially.</summary>
     /// <remarks>Doubled on each expiry, so a dead peer costs retries, not a flood.</remarks>
@@ -70,14 +73,14 @@ internal sealed class TcpFlow
     private bool _finSent;
     private TimeSpan _retransmitAt;
     private TimeSpan _retransmitInterval = InitialRetransmitTimeout;
-    private ushort _peerMaximumSegmentSize = 536;
+    private ushort _peerMaximumSegmentSize;
     private bool _channelEofSent;
     private bool _ackDue;
     private TimeSpan _ackDueAt;
     private TimeSpan _lastAdvanceAt;
     private TimeSpan _lastSendAt;
 
-    public TcpFlow(TcpFlowKey key, IPacketSink sink, IStackClock clock)
+    public TcpFlow(TcpFlowKey key, IPacketSink sink, IStackClock clock, int mtu)
     {
         _key = key;
         _sink = sink;
@@ -85,6 +88,14 @@ internal sealed class TcpFlow
         _state = TcpState.Listen;
         _lastAdvanceAt = clock.Now;
         _lastSendAt = clock.Now;
+
+        _ipHeaderLength = key.LocalAddress.HeaderLength;
+        _scratch = new byte[mtu];
+        _maximumSegmentSize = (ushort)(mtu - _ipHeaderLength - TcpSegment.MinimumHeaderLength);
+
+        // What a peer that advertises nothing is assumed to accept: 536 for IPv4 (RFC 9293), 1220
+        // for IPv6 (the 1280 minimum MTU less the headers).
+        _peerMaximumSegmentSize = key.LocalAddress.IsV4 ? (ushort)536 : (ushort)1220;
     }
 
     /// <summary>Gets the flow's current state.</summary>
@@ -300,7 +311,7 @@ internal sealed class TcpFlow
 
         // The SYN-ACK carries our MSS. Omitting it leaves the peer assuming 536, which halves
         // throughput while appearing to work perfectly.
-        SendSegment(TcpFlags.Syn | TcpFlags.Ack, ReadOnlySpan<byte>.Empty, OurMaximumSegmentSize);
+        SendSegment(TcpFlags.Syn | TcpFlags.Ack, ReadOnlySpan<byte>.Empty, _maximumSegmentSize);
         _sendNext++;
 
         // Counted as acknowledged at once: a SYN occupies a sequence number but no channel bytes,
@@ -405,7 +416,7 @@ internal sealed class TcpFlow
                 break;
             }
 
-            var take = Math.Min(Math.Min(unsent, OurMaximumSegmentSize), (int)window);
+            var take = Math.Min(Math.Min(unsent, _maximumSegmentSize), (int)window);
 
             if (!SendSegment(TcpFlags.Ack | TcpFlags.Psh, data.AsSpan().Slice(inFlight, take)))
             {
@@ -554,7 +565,7 @@ internal sealed class TcpFlow
         // Every segment carries the acknowledgement number, so anything we send settles the debt.
         _ackDue = false;
 
-        var tcpStart = Ipv4Packet.MinimumHeaderLength;
+        var tcpStart = _ipHeaderLength;
         var headerLength = TcpSegment.MinimumHeaderLength + (mss.HasValue ? 4 : 0);
 
         payload.CopyTo(_scratch.AsSpan(tcpStart + headerLength));
@@ -573,7 +584,7 @@ internal sealed class TcpFlow
             payload.Length,
             mss);
 
-        var total = Ipv4Packet.Write(_scratch, IpProtocol.Tcp, _key.RemoteAddress, _key.LocalAddress, tcpLength);
+        var total = IpHeader.Write(_scratch, IpProtocol.Tcp, _key.RemoteAddress, _key.LocalAddress, tcpLength);
         return _sink.TryWrite(_scratch.AsSpan(0, total));
     }
 
@@ -587,11 +598,12 @@ internal sealed class TcpFlow
     /// </remarks>
     public static void Reset(IPacketSink sink, in TcpFlowKey key, in TcpSegment tcp)
     {
-        var buffer = new byte[Ipv4Packet.MinimumHeaderLength + TcpSegment.MinimumHeaderLength];
+        var ipHeaderLength = key.RemoteAddress.HeaderLength;
+        var buffer = new byte[ipHeaderLength + TcpSegment.MinimumHeaderLength];
 
         // Reversed: what the operating system sent to the far end now comes back from it.
         var tcpLength = TcpSegment.Write(
-            buffer.AsSpan(Ipv4Packet.MinimumHeaderLength),
+            buffer.AsSpan(ipHeaderLength),
             key.RemoteAddress,
             key.LocalAddress,
             key.RemotePort,
@@ -602,7 +614,7 @@ internal sealed class TcpFlow
             ReceiveWindow,
             0);
 
-        var total = Ipv4Packet.Write(buffer, IpProtocol.Tcp, key.RemoteAddress, key.LocalAddress, tcpLength);
+        var total = IpHeader.Write(buffer, IpProtocol.Tcp, key.RemoteAddress, key.LocalAddress, tcpLength);
         _ = sink.TryWrite(buffer.AsSpan(0, total));
     }
 

@@ -243,12 +243,14 @@ internal sealed class SshVpnConnection : IDisposable
     /// Separate from <see cref="Establish"/> because the SSH session is established before the
     /// channel starts, and neither of these exists until it has.
     /// </remarks>
-    public void AttachPacketPath(InboundPacketQueue inbound, IOuterTransport transport)
+    public void AttachPacketPath(InboundPacketQueue inbound, IOuterTransport transport, int mtu)
     {
         ArgumentNullException.ThrowIfNull(inbound);
         ArgumentNullException.ThrowIfNull(transport);
 
-        var path = new PacketPath(_client, inbound, transport, _openTimeout);
+        // The stack's arithmetic needs headers to fit with room to spare; a value Start would have
+        // refused anyway must not reach it as a negative segment size.
+        var path = new PacketPath(_client, inbound, transport, _openTimeout, Math.Clamp(mtu, 576, 65535));
         _packetPath = path;
         path.Start();
 

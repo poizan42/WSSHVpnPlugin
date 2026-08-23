@@ -89,6 +89,7 @@ public sealed partial class MainPage : Page
             (UserNameBox, "UserName"),
             (FingerprintBox, "HostKeyFingerprint"),
             (ClientAddressBox, "ClientIPv4"),
+            (ClientIPv6Box, "ClientIPv6"),
             (ExcludeRoutesBox, "ExcludeRoutes"),
             (DnsBox, "DnsServers"),
             (KeyFileBox, "PrivateKeyFile"),
@@ -281,6 +282,12 @@ public sealed partial class MainPage : Page
             new XElement("Host", HostBox.Text.Trim()),
             new XElement("Port", port.ToString(CultureInfo.InvariantCulture)),
             new XElement("ClientIPv4", ClientAddressBox.Text.Trim()));
+
+        var clientIPv6 = ClientIPv6Box.Text.Trim();
+        if (clientIPv6.Length > 0 && clientIPv6 != "fd00::2")
+        {
+            root.Add(new XElement("ClientIPv6", clientIPv6));
+        }
 
         var userName = UserNameBox.Text.Trim();
         if (userName.Length > 0)

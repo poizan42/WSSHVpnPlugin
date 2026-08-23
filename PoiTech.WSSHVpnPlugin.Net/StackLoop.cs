@@ -23,6 +23,9 @@ internal sealed class StackLoop
     private readonly IByteChannelFactory _channels;
     private readonly IPacketSink _sink;
     private readonly IStackClock _clock;
+
+    /// <summary>The tunnel MTU, from which every flow derives its segment size and scratch.</summary>
+    private readonly int _mtu;
     private readonly Dictionary<TcpFlowKey, TcpFlow> _flows = new();
     private readonly List<TcpFlowKey> _finished = new();
 
@@ -42,12 +45,13 @@ internal sealed class StackLoop
     /// </remarks>
     private readonly ConcurrentQueue<Action> _arrivals = new();
 
-    public StackLoop(IByteChannelFactory channels, IPacketSink sink, IStackClock clock)
+    public StackLoop(IByteChannelFactory channels, IPacketSink sink, IStackClock clock, int mtu)
     {
         _channels = channels;
         _sink = sink;
         _clock = clock;
-        _dns = new DnsRelay(sink, clock, OpenChannel);
+        _mtu = mtu;
+        _dns = new DnsRelay(sink, clock, OpenChannel, mtu);
     }
 
     /// <summary>Gets the number of flows currently tracked.</summary>
@@ -55,6 +59,30 @@ internal sealed class StackLoop
 
     /// <summary>Gets the number of packets dropped as uninteresting.</summary>
     public long Dropped { get; private set; }
+
+    /// <summary>Gets the number of IPv6 packets dropped, separately from the v4 noise.</summary>
+    /// <remarks>
+    /// Separate because it answers a different question. The v4 counter absorbs known chatter -
+    /// SSDP, LLMNR, NetBIOS - while this one is the first thing to read when IPv6 through the
+    /// tunnel misbehaves: a working v6 path drops little, and a broken one shows exactly what is
+    /// being refused, with <see cref="DescribeIcmpV6"/> saying what the platform was asking for.
+    /// </remarks>
+    public long DroppedV6 { get; private set; }
+
+    /// <summary>
+    /// Called once per ICMPv6 type the tunnel sees, with the type, code and addresses of the first
+    /// occurrence.
+    /// </summary>
+    /// <remarks>
+    /// ICMPv6 is not carried, but what arrives is evidence: whether Windows expects Neighbour
+    /// Discovery to be answered on this interface is not written down anywhere, so the first
+    /// connect with v6 routed in answers it by observation. Once per type, so a flood costs one
+    /// log line.
+    /// </remarks>
+    public Action<byte, byte, IpAddr, IpAddr>? IcmpV6Seen { get; set; }
+
+    /// <summary>Counts of ICMPv6 packets by type, allocated the first time one arrives.</summary>
+    private long[]? _icmpV6Types;
 
     /// <summary>Gets how the DNS relay has been faring, for the host to report.</summary>
     public (long Answered, long Truncated, long Dropped, int Channels) DnsCounters =>
@@ -125,48 +153,100 @@ internal sealed class StackLoop
     /// </returns>
     public bool Offer(Span<byte> packet)
     {
-        if (!Ipv4Packet.TryParse(packet, out var ip))
+        if (Ipv4Packet.TryParse(packet, out var ip))
         {
-            Dropped++;
+            // Dropped before the flow table is touched. A default route through the tunnel drags in
+            // SSDP, LLMNR, mDNS, NetBIOS and NCSI probes, and hashing a four-tuple for each of them
+            // would be work done purely to throw the result away.
+            if (ip.IsFragment || !IsUnicast(ip.Destination))
+            {
+                Dropped++;
+                return false;
+            }
+
+            return Demultiplex(IpAddr.FromV4(ip.Source), IpAddr.FromV4(ip.Destination), ip.Protocol, ip.Payload);
+        }
+
+        if (Ipv6Packet.TryParse(packet, out var ip6))
+        {
+            return OfferV6(ip6);
+        }
+
+        Dropped++;
+        return false;
+    }
+
+    /// <summary>
+    /// Takes an IPv6 packet: transports go to the shared demultiplexer, everything else is counted
+    /// and dropped.
+    /// </summary>
+    /// <remarks>
+    /// Extension headers are not walked - a next header that is not directly a transport is
+    /// dropped. Host-originated traffic puts TCP and UDP straight after the fixed header, so the
+    /// walk would run zero times on everything this stack serves; a fragment header gets the same
+    /// treatment as a v4 fragment for the same reason.
+    /// </remarks>
+    private bool OfferV6(Ipv6Packet ip)
+    {
+        // Recorded before the unicast filter, deliberately: Neighbour Solicitations go to
+        // solicited-node multicast, so filtering multicast first would blind the one histogram the
+        // first v6 deploy exists to read.
+        if (ip.NextHeader == IpProtocol.IcmpV6)
+        {
+            RecordIcmpV6(ip);
+            DroppedV6++;
             return false;
         }
 
-        // Dropped before the flow table is touched. A default route through the tunnel drags in
-        // SSDP, LLMNR, mDNS, NetBIOS and NCSI probes, and hashing a four-tuple for each of them
-        // would be work done purely to throw the result away.
-        if (ip.IsFragment || !IsUnicast(ip.Destination))
+        if (ip.NextHeader is not (IpProtocol.Tcp or IpProtocol.Udp))
         {
-            Dropped++;
+            DroppedV6++;
             return false;
         }
 
+        var destination = ip.Destination;
+
+        if (!IsUnicastV6(destination))
+        {
+            DroppedV6++;
+            return false;
+        }
+
+        return Demultiplex(ip.Source, destination, ip.NextHeader, ip.Payload);
+    }
+
+    /// <summary>
+    /// Dispatches one unicast transport payload, of either family, onto a flow or the DNS relay.
+    /// </summary>
+    private bool Demultiplex(IpAddr source, IpAddr destination, IpProtocol protocol, Span<byte> payload)
+    {
         // The one exception to "TCP only". Name resolution for the whole machine is pinned to the
         // tunnel the moment it starts, so UDP/53 going nowhere does not degrade gracefully - it
         // breaks every name on the system.
-        if (ip.Protocol == IpProtocol.Udp)
+        if (protocol == IpProtocol.Udp)
         {
-            if (UdpDatagram.TryParse(ip.Payload, out var udp) && udp.DestinationPort == DnsRelay.Port)
+            if (UdpDatagram.TryParse(payload, out var udp) && udp.DestinationPort == DnsRelay.Port)
             {
-                return _dns.Offer(ip.Source, ip.Destination, udp);
+                return _dns.Offer(source, destination, udp);
             }
 
-            Dropped++;
+            Drop(source);
             return false;
         }
 
-        if (ip.Protocol != IpProtocol.Tcp)
+        if (protocol != IpProtocol.Tcp)
         {
-            Dropped++;
+            Drop(source);
             return false;
         }
 
-        if (!TcpSegment.TryParse(ip.Payload, out var tcp))
+        if (!TcpSegment.TryParse(payload, out var tcp))
         {
-            Dropped++;
+            Drop(source);
             return false;
         }
 
-        var key = new TcpFlowKey(ip.Source, tcp.SourcePort, ip.Destination, tcp.DestinationPort);
+        var key = new TcpFlowKey(source, tcp.SourcePort, destination, tcp.DestinationPort);
 
         if (!_flows.TryGetValue(key, out var flow))
         {
@@ -187,7 +267,7 @@ internal sealed class StackLoop
                 return true;
             }
 
-            flow = new TcpFlow(key, _sink, _clock);
+            flow = new TcpFlow(key, _sink, _clock, _mtu);
             _flows[key] = flow;
             FlowStarted?.Invoke(key);
         }
@@ -261,7 +341,7 @@ internal sealed class StackLoop
     /// <summary>
     /// Opens a channel, marshalling the answer back onto the stack's thread.
     /// </summary>
-    private void OpenChannel(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed)
+    private void OpenChannel(IpAddr address, ushort port, Action<IByteChannel> onOpened, Action onFailed)
     {
         // The reason stops here: a flow answers every failure the same way (a refusal to the
         // peer), so only the factory layers below - the negative cache among them - care why.
@@ -288,5 +368,85 @@ internal sealed class StackLoop
 
         // 224.0.0.0/4
         return (address & 0xF0000000) != 0xE0000000;
+    }
+
+    /// <summary>
+    /// Determines whether an IPv6 destination is one worth opening a connection to.
+    /// </summary>
+    /// <remarks>
+    /// Excludes the unspecified address, multicast (<c>ff00::/8</c>, which absorbs the router and
+    /// neighbour solicitation, MLD and LLMNR noise a default-routed tunnel attracts), and
+    /// link-local (<c>fe80::/10</c>) - a stream to a link-local address is meaningless from the SSH
+    /// server's side of the tunnel.
+    /// </remarks>
+    private static bool IsUnicastV6(in IpAddr address)
+    {
+        if (address.High == 0 && address.Low == 0)
+        {
+            return false;
+        }
+
+        if ((address.High >> 56) == 0xFF)
+        {
+            return false;
+        }
+
+        return (address.High >> 54) != 0x3FA;
+    }
+
+    /// <summary>Counts a drop against the family of the packet that carried it.</summary>
+    private void Drop(in IpAddr source)
+    {
+        if (source.IsV4)
+        {
+            Dropped++;
+        }
+        else
+        {
+            DroppedV6++;
+        }
+    }
+
+    private void RecordIcmpV6(in Ipv6Packet ip)
+    {
+        var payload = ip.Payload;
+
+        if (payload.Length < 4)
+        {
+            return;
+        }
+
+        _icmpV6Types ??= new long[256];
+
+        var type = payload[0];
+
+        if (_icmpV6Types[type]++ == 0)
+        {
+            IcmpV6Seen?.Invoke(type, payload[1], ip.Source, ip.Destination);
+        }
+    }
+
+    /// <summary>
+    /// Describes the ICMPv6 seen so far, as <c>type:count</c> pairs, or an empty string when none
+    /// has arrived.
+    /// </summary>
+    public string DescribeIcmpV6()
+    {
+        if (_icmpV6Types is null)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>();
+
+        for (var type = 0; type < _icmpV6Types.Length; type++)
+        {
+            if (_icmpV6Types[type] > 0)
+            {
+                parts.Add($"{type}:{_icmpV6Types[type]}");
+            }
+        }
+
+        return string.Join(" ", parts);
     }
 }

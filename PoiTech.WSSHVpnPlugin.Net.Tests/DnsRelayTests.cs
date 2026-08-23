@@ -17,14 +17,14 @@ public sealed class DnsRelayTests
     private const ushort ClientPort = 50000;
     private const ushort ClientId = 0x1234;
 
-    private static readonly uint Client = Packets.Address("192.168.255.2");
-    private static readonly uint Server = Packets.Address("1.1.1.1");
+    private static readonly IpAddr Client = Packets.Address("192.168.255.2");
+    private static readonly IpAddr Server = Packets.Address("1.1.1.1");
 
     private FakeSink _sink = null!;
     private FakeClock _clock = null!;
     private DnsRelay _relay = null!;
     private FakeChannel? _channel;
-    private List<(uint Address, ushort Port)> _opens = null!;
+    private List<(IpAddr Address, ushort Port)> _opens = null!;
     private bool _refuseOpen;
     private bool _deferOpen;
     private Action? _completeOpen;
@@ -34,7 +34,7 @@ public sealed class DnsRelayTests
     {
         _sink = new FakeSink();
         _clock = new FakeClock();
-        _opens = new List<(uint, ushort)>();
+        _opens = new List<(IpAddr, ushort)>();
         _refuseOpen = false;
         _deferOpen = false;
         _completeOpen = null;
@@ -62,7 +62,7 @@ public sealed class DnsRelayTests
 
             _channel = new FakeChannel();
             onOpened(_channel);
-        });
+        }, mtu: 1400);
     }
 
     [TestMethod]
@@ -301,6 +301,30 @@ public sealed class DnsRelayTests
         Assert.AreEqual(1, _relay.Truncated);
     }
 
+    /// <summary>
+    /// The cap is derived from the tunnel MTU, not a constant: a reply the default MTU would
+    /// truncate goes back whole once the tunnel is large enough to carry it.
+    /// </summary>
+    [TestMethod]
+    public void Reply_cap_follows_the_configured_mtu()
+    {
+        _relay = new DnsRelay(_sink, _clock, (address, port, onOpened, onFailed) =>
+        {
+            _channel = new FakeChannel();
+            onOpened(_channel);
+        }, mtu: 4000);
+
+        var query = BuildQuery(ednsPayloadSize: 4096);
+        OfferQuery(query);
+        _ = _relay.RunOnce();
+
+        DeliverReply(SentRequests()[0].Id, BuildReply(query, answers: 1, padding: 1500));
+        _ = _relay.RunOnce();
+
+        Assert.AreEqual(0, _relay.Truncated);
+        Assert.AreEqual(1, _relay.Answered);
+    }
+
     [TestMethod]
     public void Query_whose_channel_fails_is_dropped_silently()
     {
@@ -515,8 +539,8 @@ public sealed class DnsRelayTests
     {
         Assert.IsTrue(Ipv4Packet.TryParse(packet, out var ip));
         Assert.AreEqual(IpProtocol.Udp, ip.Protocol);
-        Assert.AreEqual(Server, ip.Source, "the reply must appear to come from the server the client asked");
-        Assert.AreEqual(Client, ip.Destination);
+        Assert.AreEqual(Server, IpAddr.FromV4(ip.Source), "the reply must appear to come from the server the client asked");
+        Assert.AreEqual(Client, IpAddr.FromV4(ip.Destination));
 
         Assert.IsTrue(UdpDatagram.TryParse(ip.Payload, out var udp));
         Assert.AreEqual((ushort)53, udp.SourcePort);

@@ -41,7 +41,7 @@ internal sealed class ServerLink
     // Reassembly state. The prefix is accumulated separately because it can be split across reads
     // just as easily as the body can.
     private readonly byte[] _prefix = new byte[sizeof(ushort)];
-    private readonly byte[] _body = new byte[1372];
+    private readonly byte[] _body;
     private int _prefixFilled;
     private int _bodyRemaining;
     private int _bodyFilled;
@@ -52,14 +52,19 @@ internal sealed class ServerLink
     private ushort _nextId;
     private TimeSpan _lastBusy;
 
-    public ServerLink(uint serverAddress)
+    public ServerLink(IpAddr serverAddress, int replyCapacity)
     {
         ServerAddress = serverAddress;
-        ReplyBuffer = new byte[1372];
+        ReplyCapacity = replyCapacity;
+        _body = new byte[replyCapacity];
+        ReplyBuffer = new byte[replyCapacity];
     }
 
     /// <summary>Gets the DNS server this channel talks to.</summary>
-    public uint ServerAddress { get; }
+    public IpAddr ServerAddress { get; }
+
+    /// <summary>Gets the largest reply deliverable as one datagram to this server's family.</summary>
+    public int ReplyCapacity { get; }
 
     /// <summary>Gets or sets the channel, once it is open.</summary>
     public IByteChannel? Channel { get; set; }
@@ -80,7 +85,7 @@ internal sealed class ServerLink
     public int ReplyLength { get; private set; }
 
     /// <summary>Gets the address the waiting reply goes to.</summary>
-    public uint ReplyClientAddress { get; private set; }
+    public IpAddr ReplyClientAddress { get; private set; }
 
     /// <summary>Gets the port the waiting reply goes to.</summary>
     public ushort ReplyClientPort { get; private set; }
@@ -115,7 +120,7 @@ internal sealed class ServerLink
     /// </summary>
     /// <returns><see langword="true"/> if it was accepted.</returns>
     public bool TryAccept(
-        uint clientAddress,
+        IpAddr clientAddress,
         ushort clientPort,
         ReadOnlySpan<byte> message,
         TimeSpan now,
@@ -398,7 +403,7 @@ internal sealed class ServerLink
 internal sealed class PendingQuery
 {
     /// <summary>Gets the client's address.</summary>
-    public uint ClientAddress { get; init; }
+    public IpAddr ClientAddress { get; init; }
 
     /// <summary>Gets the client's port.</summary>
     public ushort ClientPort { get; init; }

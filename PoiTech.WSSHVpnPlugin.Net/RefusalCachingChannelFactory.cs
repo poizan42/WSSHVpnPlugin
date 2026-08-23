@@ -50,7 +50,7 @@ internal sealed class RefusalCachingChannelFactory : IByteChannelFactory
     private readonly IByteChannelFactory _inner;
     private readonly IStackClock _clock;
     private readonly Lock _gate = new();
-    private readonly Dictionary<(uint Address, ushort Port), TimeSpan> _refused = new();
+    private readonly Dictionary<(IpAddr Address, ushort Port), TimeSpan> _refused = new();
 
     private long _refusedFromCache;
 
@@ -64,7 +64,7 @@ internal sealed class RefusalCachingChannelFactory : IByteChannelFactory
     public long RefusedFromCache => Interlocked.Read(ref _refusedFromCache);
 
     /// <inheritdoc/>
-    public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
+    public void BeginOpen(IpAddr address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
     {
         var key = (address, port);
 
@@ -98,7 +98,7 @@ internal sealed class RefusalCachingChannelFactory : IByteChannelFactory
             });
     }
 
-    private void Remember((uint Address, ushort Port) key)
+    private void Remember((IpAddr Address, ushort Port) key)
     {
         lock (_gate)
         {
@@ -118,13 +118,13 @@ internal sealed class RefusalCachingChannelFactory : IByteChannelFactory
     private void Purge()
     {
         var now = _clock.Now;
-        List<(uint, ushort)>? expired = null;
+        List<(IpAddr, ushort)>? expired = null;
 
         foreach (var pair in _refused)
         {
             if (now >= pair.Value)
             {
-                (expired ??= new List<(uint, ushort)>()).Add(pair.Key);
+                (expired ??= new List<(IpAddr, ushort)>()).Add(pair.Key);
             }
         }
 

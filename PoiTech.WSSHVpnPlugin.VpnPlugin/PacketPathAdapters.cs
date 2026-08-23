@@ -409,9 +409,12 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
     /// for the length of a rekey — and the stack's own thread must never wait on either. The worker
     /// is released at the first await rather than held for the server's answer.
     /// </remarks>
-    public void BeginOpen(uint address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
+    public void BeginOpen(IpAddr address, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
     {
-        var host = Ipv4Format(address);
+        // The host string goes to the SSH server as-is: direct-tcpip carries the host and port as
+        // separate fields, so an IPv6 literal is sent bare, with no brackets.
+        var host = address.Format();
+        var endpoint = address.FormatEndpoint(port);
 
         if (Interlocked.Increment(ref _live) > MaximumLiveChannels)
         {
@@ -420,13 +423,13 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
             // Refused rather than queued. The peer is told at once and can retry, which is far
             // better than holding its SYN while a queue of doomed opens drains. Local, not
             // Refused: the cap says nothing about the destination.
-            PluginLog.Error($"Refusing a channel to {host}:{port}: {MaximumLiveChannels} channels already live");
+            PluginLog.Error($"Refusing a channel to {endpoint}: {MaximumLiveChannels} channels already live");
             onFailed(ByteChannelOpenFailure.Local);
             _wake();
             return;
         }
 
-        _ = Task.Run(() => OpenAsync(host, port, onOpened, onFailed));
+        _ = Task.Run(() => OpenAsync(host, port, endpoint, onOpened, onFailed));
     }
 
     /// <summary>
@@ -438,7 +441,7 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
     /// slot is held for that whole time, because until the answer comes the server may be holding
     /// the channel too.
     /// </remarks>
-    private async Task OpenAsync(string host, ushort port, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
+    private async Task OpenAsync(string host, ushort port, string endpoint, Action<IByteChannel> onOpened, Action<ByteChannelOpenFailure> onFailed)
     {
         DirectTcpipStream? stream = null;
 
@@ -456,7 +459,7 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
             var reason = ex is OperationCanceledException
                 ? $"no answer within {_openTimeout.TotalSeconds:0.#} s"
                 : ex.Message;
-            PluginLog.Error($"Could not open a channel to {host}:{port}: {reason}");
+            PluginLog.Error($"Could not open a channel to {endpoint}: {reason}");
 
             // Only the server's own verdict about the destination is reported as a refusal - it is
             // what the negative cache may remember. A timeout, a dead session, or a server that is
@@ -478,7 +481,7 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
                 }
                 catch (Exception reapEx)
                 {
-                    PluginLog.Error($"Abandoning the open to {host}:{port} failed", reapEx);
+                    PluginLog.Error($"Abandoning the open to {endpoint} failed", reapEx);
                 }
             }
 
@@ -510,7 +513,7 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
         }
         catch (Exception ex)
         {
-            PluginLog.Error($"Could not hand the stack its channel to {host}:{port}", ex);
+            PluginLog.Error($"Could not hand the stack its channel to {endpoint}", ex);
             onFailed(ByteChannelOpenFailure.Local);
             _wake();
 
@@ -525,13 +528,6 @@ internal sealed class SshByteChannelFactory : IByteChannelFactory
                 _ = Interlocked.Decrement(ref _live);
             }
         }
-    }
-
-    private static string Ipv4Format(uint address)
-    {
-        Span<byte> bytes = stackalloc byte[4];
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(bytes, address);
-        return new System.Net.IPAddress(bytes).ToString();
     }
 }
 

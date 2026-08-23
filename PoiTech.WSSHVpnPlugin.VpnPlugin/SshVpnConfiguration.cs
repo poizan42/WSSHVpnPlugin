@@ -24,6 +24,7 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 ///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
 ///   &lt;PrivateKeyToken&gt;{GUID from the app's file picker}&lt;/PrivateKeyToken&gt;
 ///   &lt;ClientIPv4&gt;192.168.255.2&lt;/ClientIPv4&gt;
+///   &lt;ClientIPv6&gt;fd00::2&lt;/ClientIPv6&gt;
 ///   &lt;Mtu&gt;1400&lt;/Mtu&gt;
 ///   &lt;DnsServer&gt;1.1.1.1&lt;/DnsServer&gt;
 ///   &lt;InclusionRoute&gt;10.0.0.0/8&lt;/InclusionRoute&gt;
@@ -78,6 +79,16 @@ internal sealed class SshVpnConfiguration
 
     /// <summary>Gets the IPv4 address to assign to the virtual interface.</summary>
     public string ClientIPv4 { get; private init; } = "192.168.255.2";
+
+    /// <summary>Gets the IPv6 address to assign to the virtual interface.</summary>
+    /// <remarks>
+    /// Always assigned - <c>Start*</c> fails with <c>E_OUTOFMEMORY</c> when the assigned IPv6
+    /// address list is empty - and, now that the stack carries IPv6, also the tunnel's v6 source
+    /// address. The ULA default makes Windows prefer IPv4 for dual-stack names (RFC 6724 gives a
+    /// ULA source a mismatched label against a global destination), so v6 traffic is mostly
+    /// v6-only hosts and literals until this is set to a global-scope address.
+    /// </remarks>
+    public string ClientIPv6 { get; private init; } = "fd00::2";
 
     /// <summary>
     /// Gets how many seconds a channel open may wait for the server's answer before the connection
@@ -200,6 +211,7 @@ internal sealed class SshVpnConfiguration
             StartDelaySeconds = ReadUInt32(root, "StartDelaySeconds", 0),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
             ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
+            ClientIPv6 = ReadString(root, "ClientIPv6") ?? "fd00::2",
             OpenTimeoutSeconds = ReadUInt32(root, "OpenTimeoutSeconds", 3),
             Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             DnsServers = ReadStringList(root, "DnsServer"),

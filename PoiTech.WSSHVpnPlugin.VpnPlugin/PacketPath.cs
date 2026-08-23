@@ -85,7 +85,7 @@ internal sealed class PacketPath : IDisposable
     private long _lastReaps;
     private long _lastReapTicks;
 
-    public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport, TimeSpan openTimeout)
+    public PacketPath(SshClient client, InboundPacketQueue queue, IOuterTransport transport, TimeSpan openTimeout, int mtu)
     {
         var clock = new MonotonicClock();
 
@@ -95,17 +95,22 @@ internal sealed class PacketPath : IDisposable
         // Between the stack and the real opens: destinations the server just refused are refused
         // again from memory, so a peer that retries steadily does not cost a round trip per retry.
         _refusals = new RefusalCachingChannelFactory(_factory, clock);
-        _stack = new StackLoop(_refusals, _sink, clock)
+        _stack = new StackLoop(_refusals, _sink, clock, mtu)
         {
             FlowStarted = key => PluginLog.Info(
-                $"flow {Ipv4Packet.Format(key.LocalAddress)}:{key.LocalPort} -> " +
-                $"{Ipv4Packet.Format(key.RemoteAddress)}:{key.RemotePort}"),
+                $"flow {key.LocalAddress.FormatEndpoint(key.LocalPort)} -> " +
+                $"{key.RemoteAddress.FormatEndpoint(key.RemotePort)}"),
 
             // The client resetting a live flow is its application giving up, and the sender's
             // post-mortem is the only evidence of why: a wedge is silent everywhere else.
             FlowReset = (key, description) => PluginLog.Info(
-                $"flow {Ipv4Packet.Format(key.LocalAddress)}:{key.LocalPort} -> " +
-                $"{Ipv4Packet.Format(key.RemoteAddress)}:{key.RemotePort} reset by the client — {description}"),
+                $"flow {key.LocalAddress.FormatEndpoint(key.LocalPort)} -> " +
+                $"{key.RemoteAddress.FormatEndpoint(key.RemotePort)} reset by the client — {description}"),
+
+            // Once per ICMPv6 type: the evidence that answers whether this interface is expected
+            // to speak Neighbour Discovery, without a flood costing a log line each.
+            IcmpV6Seen = (type, code, source, destination) => PluginLog.Info(
+                $"ICMPv6 type {type} code {code} from {source.Format()} to {destination.Format()} (first of its type; counted, not answered)"),
         };
 
         _thread = new Thread(Run)
@@ -294,11 +299,18 @@ internal sealed class PacketPath : IDisposable
                $"transport {deltaReads / seconds:F0} read/s avg {averageRead:F0} B in {microsPerRead:F0} us; " +
                $"{_stack.Retransmissions} retransmission(s), {_refusals.RefusedFromCache} refused from cache; " +
                $"{GC.CollectionCount(0)} gen0 collection(s); " +
-               $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting; " +
+               $"{Dropped} outbound packet(s) dropped, {_stack.Dropped} uninteresting, " +
+               $"{_stack.DroppedV6} v6 dropped{FormatIcmpV6()}; " +
                $"DNS {dns.Answered} answered, {dns.Truncated} truncated, {dns.Dropped} dropped " +
                $"over {dns.Channels} channel(s); " +
                $"deliveries {deliveryRate:F0}/s ({deliveryByteDelta} B; {DeliveryStats.Describe()}); " +
                $"reaps {reapDelta / seconds:F1}/s in avg {microsPerReap:F0} us on workers";
+    }
+
+    private string FormatIcmpV6()
+    {
+        var histogram = _stack.DescribeIcmpV6();
+        return histogram.Length == 0 ? string.Empty : $" (icmp6 {histogram})";
     }
 
     private bool DrainOutbound()

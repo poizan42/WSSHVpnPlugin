@@ -748,11 +748,33 @@ Deliberate, documented, and not to be silently papered over:
 
 - **Out-of-order segments are dropped**, and no SACK is offered — consistent, but it makes any real
   loss expensive.
-- **IPv6 leaks.** An address is assigned (it must be, or `Start*` fails) but nothing is routed, so
-  IPv6 keeps using the physical NIC. Accepted; routing it in with no stack behind it would black-hole
-  it instead — which is why the `<RouteIPv6>` switch was deleted rather than left at its only usable
-  value. Routing IPv6 in becomes a deliberate addition once the stack can carry it.
-- **UDP other than DNS, and all ICMP, are dropped.** No SSH primitive carries either.
+- **IPv6 is carried, and the deploy probes answered its two unknowns on 2026-08-23.** The old
+  "IPv6 leaks" hole is closed: the stack carries IPv6 TCP and DNS, `::/1` + `8000::/1` are routed in
+  unconditionally, and `<ExcludeRoute>::/0</ExcludeRoute>` is the off switch — the subtraction turns
+  it into "no IPv6 routes", restoring the old leak-to-physical behaviour on purpose. Verified live
+  on build 26200: `Start` **accepts** the v6 half-default pair alongside 24 v4 routes (`accepted
+  (mtu 1400, frame 65536, ipv6 1)`), and **no Neighbour Discovery is required** — a point-to-point
+  VPN interface produced only multicast RS (133), unsolicited NA (136) and echo (128), zero
+  Neighbour Solicitations, while v6 TCP flowed end to end (`curl -6` egressing from the SSH server's
+  v6 address at ~266 Mbit/s, at parity with v4 in the same session). The NS→NA responder therefore
+  stays unwritten; if it is ever needed on some other build, **never answer DAD** (an NS whose
+  source is `::` is Windows probing its own address — answering asserts a conflict and kills it).
+  Observability that made this checkable stays in: `StackLoop` counts v6 drops separately and keeps
+  an ICMPv6 type histogram, logged once per type and in the 30-second summary. Also deliberate: with
+  the default ULA `fd00::2` as v6 source, RFC 6724 label mismatch makes Windows prefer v4 for
+  dual-stack names, so v6 volume is mostly v6-only hosts and literals; `<ClientIPv6>` with a
+  global-scope address is the knob for full v6 preference. The remaining pieces were verified live the same
+  day: a v6 `<DnsServer>` answers A and AAAA through the relay, and a v6 `<ExcludeRoute>` (one /32
+  hole) produced exactly the predicted 32 inclusion routes, bypassed the range (instant local
+  failure, zero flow-log hits) while the rest of v6 kept flowing — and `Start` took the resulting
+  **56 routes** (24 v4 + 32 v6) without complaint, retiring the never-handed-more-than-24 caveat.
+- **UDP other than DNS, and all ICMP (both families), are dropped.** No SSH primitive carries
+  either. ICMPv6 is counted per type rather than silently discarded — see above.
+- **The MSS now derives from `<Mtu>`** (mtu − 40 for v4, − 60 for v6) instead of the old constant
+  1360, and per-flow scratch is mtu-sized. Wire behaviour changes for profiles with `<Mtu>` above
+  1400: segments grow to match, which interacts with the receive pool's byte-denominated budget —
+  a 32768 profile should re-measure. `<InclusionRoute>`/`<ExcludeRoute>`/`<DnsServer>` accept both
+  families, told apart by the text (`:` means v6).
 - **Ordinary polling of a host that is offline spends the channel budget.** An application checking
   periodically whether some host is up — a sleeping laptop, a printer, a NAS, a peer that is only
   sometimes on — is a normal thing for a machine to be doing, and it should cost close to nothing.

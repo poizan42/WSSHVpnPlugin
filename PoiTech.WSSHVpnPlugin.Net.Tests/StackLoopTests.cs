@@ -14,8 +14,8 @@ namespace PoiTech.WSSHVpnPlugin.Net.Tests;
 [TestClass]
 public class StackLoopTests
 {
-    private static readonly uint Client = Packets.Address("192.168.255.2");
-    private static readonly uint Server = Packets.Address("1.1.1.1");
+    private static readonly IpAddr Client = Packets.Address("192.168.255.2");
+    private static readonly IpAddr Server = Packets.Address("1.1.1.1");
     private const ushort ClientPort = 40000;
     private const ushort ServerPort = 80;
 
@@ -30,7 +30,7 @@ public class StackLoopTests
         _channels = new FakeChannelFactory();
         _sink = new FakeSink();
         _clock = new FakeClock();
-        _stack = new StackLoop(_channels, _sink, _clock);
+        _stack = new StackLoop(_channels, _sink, _clock, mtu: 1400);
     }
 
     private void Syn(ushort? mss = 1460, ushort port = ClientPort)
@@ -110,6 +110,24 @@ public class StackLoopTests
         Assert.IsTrue(TcpSegment.TryParse(ip.Payload, out var tcp));
         Assert.IsTrue(tcp.TryGetMaximumSegmentSize(out var mss));
         Assert.AreEqual(1360, mss);
+    }
+
+    /// <summary>
+    /// The MSS is derived from the tunnel MTU, not a constant: a profile that raises the MTU should
+    /// get segments to match, and one that lowers it must not overrun the receive pool's buffers.
+    /// </summary>
+    [TestMethod]
+    public void SynAck_MssFollowsTheConfiguredMtu()
+    {
+        _stack = new StackLoop(_channels, _sink, _clock, mtu: 1200);
+
+        Syn();
+
+        var bytes = _sink.Packets[^1];
+        Assert.IsTrue(Ipv4Packet.TryParse(bytes, out var ip));
+        Assert.IsTrue(TcpSegment.TryParse(ip.Payload, out var tcp));
+        Assert.IsTrue(tcp.TryGetMaximumSegmentSize(out var mss));
+        Assert.AreEqual(1160, mss);
     }
 
     [TestMethod]
@@ -554,7 +572,7 @@ public class StackLoopTests
     public void NonTcp_IsDropped()
     {
         var buffer = new byte[40];
-        var total = Ipv4Packet.Write(buffer, IpProtocol.Udp, Client, Server, 20);
+        var total = Ipv4Packet.Write(buffer, IpProtocol.Udp, Client.V4, Server.V4, 20);
 
         Assert.IsFalse(_stack.Offer(buffer.AsSpan(0, total)));
         Assert.AreEqual(1, _stack.Dropped);

@@ -11,9 +11,9 @@ namespace PoiTech.WSSHVpnPlugin.Net.Tests;
 [TestClass]
 public class PacketParsingTests
 {
-    private static uint Address(string dotted)
+    private static IpAddr Address(string dotted)
     {
-        return BinaryPrimitives.ReadUInt32BigEndian(IPAddress.Parse(dotted).GetAddressBytes());
+        return IpAddr.Parse(dotted);
     }
 
     /// <summary>
@@ -52,7 +52,7 @@ public class PacketParsingTests
             payload.Length,
             mss);
 
-        var total = Ipv4Packet.Write(buffer, IpProtocol.Tcp, src, dst, tcpLength);
+        var total = Ipv4Packet.Write(buffer, IpProtocol.Tcp, src.V4, dst.V4, tcpLength);
         return buffer.AsSpan(0, total).ToArray();
     }
 
@@ -63,8 +63,8 @@ public class PacketParsingTests
 
         Assert.IsTrue(Ipv4Packet.TryParse(packet, out var ip));
         Assert.AreEqual(IpProtocol.Tcp, ip.Protocol);
-        Assert.AreEqual(Address("192.168.255.2"), ip.Source);
-        Assert.AreEqual(Address("1.1.1.1"), ip.Destination);
+        Assert.AreEqual(Address("192.168.255.2"), IpAddr.FromV4(ip.Source));
+        Assert.AreEqual(Address("1.1.1.1"), IpAddr.FromV4(ip.Destination));
         Assert.AreEqual(20, ip.HeaderLength);
         Assert.AreEqual(packet.Length, ip.TotalLength);
         Assert.IsFalse(ip.IsFragment);
@@ -152,7 +152,7 @@ public class PacketParsingTests
 
         Assert.IsTrue(Ipv4Packet.TryParse(packet, out var ip));
         Assert.IsTrue(TcpSegment.TryParse(ip.Payload, out var tcp));
-        Assert.IsTrue(tcp.IsChecksumValid(ip.Source, ip.Destination));
+        Assert.IsTrue(tcp.IsChecksumValid(IpAddr.FromV4(ip.Source), IpAddr.FromV4(ip.Destination)));
     }
 
     [TestMethod]
@@ -163,7 +163,7 @@ public class PacketParsingTests
 
         Assert.IsTrue(Ipv4Packet.TryParse(packet, out var ip));
         Assert.IsTrue(TcpSegment.TryParse(ip.Payload, out var tcp));
-        Assert.IsFalse(tcp.IsChecksumValid(ip.Source, ip.Destination));
+        Assert.IsFalse(tcp.IsChecksumValid(IpAddr.FromV4(ip.Source), IpAddr.FromV4(ip.Destination)));
     }
 
     /// <summary>
@@ -181,7 +181,7 @@ public class PacketParsingTests
 
         Assert.IsTrue(Ipv4Packet.TryParse(packet, out ip));
         Assert.IsTrue(TcpSegment.TryParse(ip.Payload, out var tcp));
-        Assert.IsTrue(tcp.IsChecksumValid(ip.Source, ip.Destination));
+        Assert.IsTrue(tcp.IsChecksumValid(IpAddr.FromV4(ip.Source), IpAddr.FromV4(ip.Destination)));
     }
 
     [TestMethod]

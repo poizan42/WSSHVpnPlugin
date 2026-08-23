@@ -12,7 +12,7 @@ namespace PoiTech.WSSHVpnPlugin.Net.Tests;
 [TestClass]
 public class RefusalCachingChannelFactoryTests
 {
-    private const uint Address = 0x01020304;
+    private static readonly IpAddr Address = IpAddr.FromV4(0x01020304);
     private const ushort Port = 443;
 
     private FakeChannelFactory _inner = null!;
@@ -34,9 +34,9 @@ public class RefusalCachingChannelFactoryTests
         _lastFailure = null;
     }
 
-    private void Open(uint address = Address, ushort port = Port)
+    private void Open(IpAddr? address = null, ushort port = Port)
     {
-        _cache.BeginOpen(address, port, _ => _opened++, reason =>
+        _cache.BeginOpen(address ?? Address, port, _ => _opened++, reason =>
         {
             _failed++;
             _lastFailure = reason;

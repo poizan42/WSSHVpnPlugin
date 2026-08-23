@@ -35,15 +35,6 @@ internal sealed class DnsRelay
     public const ushort Port = 53;
 
     /// <summary>
-    /// The largest reply that can be handed back as a single datagram.
-    /// </summary>
-    /// <remarks>
-    /// The tunnel MTU less the IPv4 and UDP headers. Nothing here fragments, so a reply above this
-    /// cannot be delivered whatever the client says it would accept.
-    /// </remarks>
-    private const int MaximumReplySize = 1372;
-
-    /// <summary>
     /// How long an abandoned query's identifier stays reserved.
     /// </summary>
     /// <remarks>
@@ -58,19 +49,24 @@ internal sealed class DnsRelay
     private readonly IPacketSink _sink;
     private readonly IStackClock _clock;
     private readonly OpenChannel _open;
-    private readonly Dictionary<uint, ServerLink> _links = new();
-    private readonly List<uint> _finished = new();
-    private readonly byte[] _scratch = new byte[1500];
+    private readonly Dictionary<IpAddr, ServerLink> _links = new();
+    private readonly List<IpAddr> _finished = new();
+    private readonly byte[] _scratch;
 
-    public DnsRelay(IPacketSink sink, IStackClock clock, OpenChannel open)
+    /// <summary>The tunnel MTU, from which each link derives its reply cap.</summary>
+    private readonly int _mtu;
+
+    public DnsRelay(IPacketSink sink, IStackClock clock, OpenChannel open, int mtu)
     {
         _sink = sink;
         _clock = clock;
         _open = open;
+        _mtu = mtu;
+        _scratch = new byte[mtu];
     }
 
     /// <summary>Begins opening a channel, calling back on the stack's own thread.</summary>
-    public delegate void OpenChannel(uint address, ushort port, Action<IByteChannel> onOpened, Action onFailed);
+    public delegate void OpenChannel(IpAddr address, ushort port, Action<IByteChannel> onOpened, Action onFailed);
 
     /// <summary>Gets the number of queries relayed in full.</summary>
     public long Answered { get; private set; }
@@ -107,7 +103,7 @@ internal sealed class DnsRelay
     /// <param name="destination">The DNS server's address.</param>
     /// <param name="datagram">The datagram carrying the query.</param>
     /// <returns><see langword="true"/> if the query was taken.</returns>
-    public bool Offer(uint source, uint destination, UdpDatagram datagram)
+    public bool Offer(IpAddr source, IpAddr destination, UdpDatagram datagram)
     {
         var payload = datagram.Payload;
 
@@ -119,7 +115,12 @@ internal sealed class DnsRelay
 
         if (!_links.TryGetValue(destination, out var link))
         {
-            link = new ServerLink(destination);
+            // The largest reply that can go back as one datagram: the MTU less this family's IP
+            // header and the UDP header. Nothing here fragments, so a reply above this cannot be
+            // delivered whatever the client says it would accept.
+            var replyCapacity = _mtu - destination.HeaderLength - UdpDatagram.HeaderLength;
+
+            link = new ServerLink(destination, replyCapacity);
             _links[destination] = link;
             BeginOpen(link);
         }
@@ -130,7 +131,7 @@ internal sealed class DnsRelay
             return false;
         }
 
-        query.MaximumReply = Math.Min(DnsMessage.GetMaximumReplySize(query.Message), MaximumReplySize);
+        query.MaximumReply = Math.Min(DnsMessage.GetMaximumReplySize(query.Message), link.ReplyCapacity);
         return true;
     }
 
@@ -369,20 +370,20 @@ internal sealed class DnsRelay
             return false;
         }
 
-        const int UdpOffset = Ipv4Packet.MinimumHeaderLength;
+        var udpOffset = link.ServerAddress.HeaderLength;
         var payload = link.ReplyBuffer.AsSpan(0, link.ReplyLength);
 
-        payload.CopyTo(_scratch.AsSpan(UdpOffset + UdpDatagram.HeaderLength));
+        payload.CopyTo(_scratch.AsSpan(udpOffset + UdpDatagram.HeaderLength));
 
         var udpLength = UdpDatagram.Write(
-            _scratch.AsSpan(UdpOffset),
+            _scratch.AsSpan(udpOffset),
             link.ServerAddress,
             link.ReplyClientAddress,
             Port,
             link.ReplyClientPort,
             payload.Length);
 
-        var total = Ipv4Packet.Write(
+        var total = IpHeader.Write(
             _scratch,
             IpProtocol.Udp,
             link.ServerAddress,
