@@ -117,7 +117,7 @@ internal sealed class SshVpnConnection : IDisposable
         string transportName)
     {
         var connectionInfo = new ConnectionInfo(
-            configuration.Host,
+            configuration.HostName,
             checked((int)configuration.Port),
             userName,
             authentication)
@@ -143,7 +143,7 @@ internal sealed class SshVpnConnection : IDisposable
             client.HostKeyReceived += connection.OnHostKeyReceived;
             client.KeepAliveInterval = KeepAliveInterval;
             client.Connect();
-            PluginLog.Info($"SSH session established with {configuration.Host}:{configuration.Port} over {transportName}");
+            PluginLog.Info($"SSH session established with {configuration.HostName}:{configuration.Port} over {transportName}");
 
             // Logged because the suite decides a real share of the host's CPU and cannot be inferred
             // from anything else in this log. A separate MAC algorithm means a separate hashing pass

@@ -16,13 +16,13 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The host to connect to comes from the profile's server URI list, which the platform surfaces
-/// as <see cref="VpnChannelConfiguration.ServerHostNameList"/>. Everything else is carried in
-/// the profile's custom configuration string, which is opaque to the platform. The expected
-/// shape is:
+/// The connection's name comes from the profile's server URI list, which the platform surfaces as
+/// <see cref="VpnChannelConfiguration.ServerHostNameList"/>. Everything else is carried in the
+/// profile's custom configuration string, which is opaque to the platform. The expected shape is:
 /// </para>
 /// <code>
 /// &lt;SshVpnConfiguration&gt;
+///   &lt;HostName&gt;ssh.example.com&lt;/HostName&gt;
 ///   &lt;Port&gt;22&lt;/Port&gt;
 ///   &lt;UserName&gt;alice&lt;/UserName&gt;
 ///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
@@ -41,6 +41,12 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 /// is resolved from the saved connection (see <see cref="ConnectionsFile"/>) whose entry matches the
 /// profile's server name.
 /// </para>
+/// <para>
+/// <see cref="Host"/> and <see cref="HostName"/> are openssh's two, and mean what they mean there:
+/// the first names the connection and the second is the machine it dials. Keeping them apart is what
+/// lets two connections describe the same server — different port, user or key — since the name is
+/// the only thing the platform hands us to match on and would otherwise have to be the address.
+/// </para>
 /// </remarks>
 internal sealed class SshVpnConfiguration
 {
@@ -51,8 +57,23 @@ internal sealed class SshVpnConfiguration
         Host = host;
     }
 
-    /// <summary>Gets the SSH server host name or address.</summary>
+    /// <summary>
+    /// Gets the connection's name: what the profile's server name is matched against, and the
+    /// entry's identity in <see cref="ConnectionsFile"/>.
+    /// </summary>
+    /// <remarks>
+    /// A label, not necessarily an address — openssh's <c>Host</c>. It need not resolve to anything;
+    /// <see cref="HostName"/> is what gets dialled. It does have to be usable as a URI host, because
+    /// that is the shape a profile carries its server in.
+    /// </remarks>
     public string Host { get; }
+
+    /// <summary>Gets the SSH server host name or address to connect to.</summary>
+    /// <remarks>
+    /// Defaults to <see cref="Host"/> when <c>&lt;HostName&gt;</c> is absent, as in openssh, so a
+    /// connection needing no alias says its address once.
+    /// </remarks>
+    public string HostName { get; private init; } = string.Empty;
 
     /// <summary>Gets the SSH server port.</summary>
     public uint Port { get; private init; } = 22;
@@ -320,6 +341,7 @@ internal sealed class SshVpnConfiguration
     {
         return new SshVpnConfiguration(host)
         {
+            HostName = ReadString(root, "HostName") ?? host,
             Port = ReadUInt32(root, "Port", 22),
             UserName = ReadString(root, "UserName"),
             PrivateKeyToken = ReadString(root, "PrivateKeyToken"),

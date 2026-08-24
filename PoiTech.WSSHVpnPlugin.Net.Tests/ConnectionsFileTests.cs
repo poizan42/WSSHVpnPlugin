@@ -82,6 +82,22 @@ public class ConnectionsFileTests
     }
 
     [TestMethod]
+    public void TheAddressNeitherKeysNorMatches()
+    {
+        // Two connections to one server, told apart by name alone - the case the separation exists
+        // for. Matching must see only <Host>, or the second entry is unreachable.
+        var direct = Entry("a.example.com", "alice");
+        var aliased = Entry("a-alt", "bob");
+        aliased.Add(new XElement("HostName", "a.example.com"));
+        var root = Root(direct, aliased);
+
+        Assert.AreEqual("alice", ConnectionsFile.FindEntry(root, "a.example.com")?.Element("UserName")?.Value);
+        Assert.AreEqual("bob", ConnectionsFile.FindEntry(root, "a-alt")?.Element("UserName")?.Value);
+        Assert.AreEqual("a-alt", ConnectionsFile.HostOf(aliased));
+        CollectionAssert.AreEqual(new[] { "a.example.com", "a-alt" }, ConnectionsFile.Hosts(root));
+    }
+
+    [TestMethod]
     public void DuplicateHostsResolveToTheFirst()
     {
         var root = Root(Entry("a.example.com", "first"), Entry("A.EXAMPLE.COM", "second"));

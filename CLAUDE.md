@@ -348,6 +348,21 @@ app-only `<ProfileName>`/`<PrivateKeyFile>` bookkeeping the plug-in's reader ign
 writes it; `SshVpnConfiguration.FromChannelConfiguration` resolves against it at connect. Both are
 fast-loop covered through `ConnectionsFileTests`.
 
+**`<Host>` names the connection; `<HostName>` is the machine it dials** — openssh's two words,
+meaning what they mean there, with `<HostName>` defaulting to `<Host>` when absent. The separation
+is what lets **two connections describe the same server** (different port, user or key): the name is
+the only thing the platform hands the plug-in to match on, so if it doubled as the address there
+could only ever be one entry per server. A name need not resolve to anything — **verified live on
+2026-08-25: Settings accepts a server field that resolves to nothing** (a profile named after an
+alias connected through its entry) — but it must be usable as a URI host, since the profile carries
+it as `http://<name>`, and the app refuses one that is not.
+Read the code accordingly: `SshVpnConfiguration.Host` is the *name*, and only `HostName` reaches
+`ConnectionInfo` and the transport's `connect`. The connect log prints `Connecting to <name>
+(<address>:<port>)` whenever the two differ, which is what makes a mix-up visible before it becomes
+a wrong dial. One consequence by design: the derived IPv6 ULA is keyed on the **name**, so two
+connections to one server get different prefixes (they may be up at once) and renaming one moves its
+prefix — harmless, since nothing persists and the address never reaches a wire.
+
 Precedence is wholesale, not merged: a profile carrying a real `CustomConfiguration` payload uses
 exactly that and the file is never consulted — so an admin-pushed or legacy profile does precisely
 what it says. Only a profile with *no* payload resolves through the file, and “no payload” includes
@@ -371,7 +386,8 @@ user-scoped profile afterwards. The join key is the profile's server name, read 
   the projection hazard cannot break the wholesale path.
 
 Consequences worth knowing before they bite: the Settings dialog's server field must **equal the
-entry's `<Host>`** (no `host:port` — the entry's `<Port>` governs); initial per-host setup still
+entry's `<Host>`**, i.e. the connection's name rather than necessarily an address (and no
+`host:port` — the entry's `<Port>` governs); initial per-host setup still
 happens in the app once, because the fingerprint pin and the key's FutureAccessList token cannot
 come from Settings and an unpinned host key stays refused; entry edits apply on the *next connect*
 with no profile re-save, while a legacy profile keeps its embedded config until re-saved; and

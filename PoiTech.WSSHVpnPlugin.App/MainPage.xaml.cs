@@ -109,6 +109,7 @@ public sealed partial class MainPage : Page
         return new[]
         {
             (ProfileNameBox, "ProfileName"),
+            (HostNameBox, "HostName"),
             (PortBox, "Port"),
             (UserNameBox, "UserName"),
             (FingerprintBox, "HostKeyFingerprint"),
@@ -205,6 +206,7 @@ public sealed partial class MainPage : Page
         _loadingEntry = true;
 
         HostBox.Text = ConnectionsFile.HostOf(entry) ?? HostBox.Text;
+        HostNameBox.Text = Value(entry, "HostName") ?? string.Empty;
         ProfileNameBox.Text = Value(entry, "ProfileName") ?? ProfileNameBox.Text;
         PortBox.Text = Value(entry, "Port") ?? "22";
         UserNameBox.Text = Value(entry, "UserName") ?? string.Empty;
@@ -273,10 +275,9 @@ public sealed partial class MainPage : Page
     {
         await RunAsync("Save connection", () =>
         {
-            var host = HostBox.Text.Trim();
-            if (host.Length == 0)
+            if (HostBox.Text.Trim().Length == 0)
             {
-                throw new InvalidOperationException("Enter the SSH server host name.");
+                throw new InvalidOperationException("Enter the connection name.");
             }
 
             if (!uint.TryParse(PortBox.Text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out _))
@@ -329,7 +330,7 @@ public sealed partial class MainPage : Page
                 Log($"AddProfileFromObjectAsync: {status}");
             }
 
-            Log($"Profile '{profile.ProfileName}' points at {HostBox.Text.Trim()}");
+            Log($"Profile '{profile.ProfileName}' names connection {HostBox.Text.Trim()}");
         });
     }
 
@@ -445,7 +446,18 @@ public sealed partial class MainPage : Page
         var host = HostBox.Text.Trim();
         if (host.Length == 0)
         {
-            throw new InvalidOperationException("Enter the SSH server host name.");
+            throw new InvalidOperationException("Enter the connection name.");
+        }
+
+        // The profile carries the name as http://<name>, which is how the plug-in gets it back, so a
+        // name that cannot be a URI host can never be matched - worth saying here rather than
+        // letting new Uri complain about a scheme the user never typed.
+        if (!Uri.TryCreate($"http://{host}", UriKind.Absolute, out var serverUri)
+            || !string.Equals(serverUri.Host, host, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"'{host}' cannot be used as a connection name: it has to be usable as a host name "
+                + "in a URI, so no spaces, slashes or colons.");
         }
 
         if (!uint.TryParse(PortBox.Text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out _))
@@ -476,9 +488,9 @@ public sealed partial class MainPage : Page
         // The platform hands these to the plug-in as VpnChannelConfiguration.ServerHostNameList,
         // which it builds by pulling the host out of each URI. http:// mimics what Settings' own
         // "Add VPN" dialog stores (observed via List profiles), since that shape is the one the
-        // lookup has to work for either way. The scheme is otherwise meaningless; the port the
-        // plug-in dials comes from the saved connection's <Port>.
-        profile.ServerUris.Add(new Uri($"http://{host}"));
+        // lookup has to work for either way. The scheme is otherwise meaningless; the address the
+        // plug-in dials comes from the saved connection's <HostName>, and the port from <Port>.
+        profile.ServerUris.Add(serverUri);
 
         return profile;
     }
@@ -493,10 +505,19 @@ public sealed partial class MainPage : Page
     /// </remarks>
     private XElement BuildEntry()
     {
+        var host = HostBox.Text.Trim();
         var root = new XElement(
             ConnectionsFile.EntryElementName,
-            new XElement("Host", HostBox.Text.Trim()),
+            new XElement("Host", host),
             new XElement("Port", PortBox.Text.Trim()));
+
+        // Written only when it says something the name does not, so a connection needing no alias
+        // stays one line shorter - the plug-in defaults HostName to Host, as openssh does.
+        var hostName = HostNameBox.Text.Trim();
+        if (hostName.Length > 0 && !string.Equals(hostName, host, StringComparison.OrdinalIgnoreCase))
+        {
+            root.Add(new XElement("HostName", hostName));
+        }
 
         // Both client addresses are written only when pinned. Empty means the plug-in chooses one at
         // connect out of what the routing table shows is free - which cannot be decided from here,

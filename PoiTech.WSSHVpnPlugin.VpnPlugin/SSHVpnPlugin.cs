@@ -122,7 +122,10 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             ResetState();
 
             var configuration = SshVpnConfiguration.FromChannelConfiguration(channel.Configuration);
-            PluginLog.Info($"Connecting to {configuration.Host}:{configuration.Port}");
+            PluginLog.Info(
+                string.Equals(configuration.Host, configuration.HostName, StringComparison.OrdinalIgnoreCase)
+                    ? $"Connecting to {configuration.HostName}:{configuration.Port}"
+                    : $"Connecting to {configuration.Host} ({configuration.HostName}:{configuration.Port})");
 
             // A key-based profile that already names its user needs nothing from the user, and
             // asking anyway would put a prompt in front of a background task for no reason.

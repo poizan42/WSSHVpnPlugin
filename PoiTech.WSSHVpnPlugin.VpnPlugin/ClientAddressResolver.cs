@@ -36,6 +36,10 @@ internal static class ClientAddressResolver
         var claims = RouteTable.TryRead() ?? Array.Empty<IpPrefix>();
         var avoid = AddressesToAvoid(configuration);
 
+        // Keyed on the connection's name rather than the server's address: two connections to one
+        // server are two tunnels that may be up at once, and a shared prefix would defeat the
+        // derivation. Renaming one moves its prefix, which costs nothing - the address never reaches
+        // a wire and nothing persists.
         var v4 = Resolve(configuration.ClientIPv4, "ClientIPv4", wantV4: true, configuration.Host, claims, avoid);
         var v6 = Resolve(configuration.ClientIPv6, "ClientIPv6", wantV4: false, configuration.Host, claims, avoid);
 
@@ -48,12 +52,13 @@ internal static class ClientAddressResolver
     /// <remarks>
     /// The DNS servers are reached <em>through</em> the tunnel, so taking one of their addresses would
     /// break every lookup on the machine — and this is not hypothetical, since proxy tooling parks
-    /// resolvers inside the benchmarking range the first pool draws from. The server host goes in for
-    /// the same reason when it is a literal. Anything outside every pool costs nothing to list.
+    /// resolvers inside the benchmarking range the first pool draws from. The server goes in for the
+    /// same reason when it is a literal, by both its name and its address, since either spelling may
+    /// be the literal. Anything outside every pool costs nothing to list.
     /// </remarks>
     private static List<IpAddr> AddressesToAvoid(SshVpnConfiguration configuration)
     {
-        var avoid = new List<IpAddr>(configuration.DnsServers.Count + 1);
+        var avoid = new List<IpAddr>(configuration.DnsServers.Count + 2);
 
         foreach (var server in configuration.DnsServers)
         {
@@ -63,9 +68,14 @@ internal static class ClientAddressResolver
             }
         }
 
-        if (TryParse(configuration.Host, out var host))
+        if (TryParse(configuration.HostName, out var dialled))
         {
-            avoid.Add(host);
+            avoid.Add(dialled);
+        }
+
+        if (TryParse(configuration.Host, out var named))
+        {
+            avoid.Add(named);
         }
 
         return avoid;

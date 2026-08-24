@@ -133,12 +133,12 @@ internal sealed class PlatformOwnedTransport : IOuterTransport
                 int.Parse(doorbellFront.Information.LocalPort, System.Globalization.CultureInfo.InvariantCulture));
 
             front.ConnectAsync(
-                    new HostName(configuration.Host),
+                    new HostName(configuration.HostName),
                     configuration.Port.ToString(System.Globalization.CultureInfo.InvariantCulture))
                 .AsTask().GetAwaiter().GetResult();
 
             PluginLog.Info(
-                $"Platform-owned transport connected to {configuration.Host}:{configuration.Port} "
+                $"Platform-owned transport connected to {configuration.HostName}:{configuration.Port} "
                 + $"with a loopback doorbell on port {backPort}; the platform takes ownership at Start.");
 
             return new PlatformOwnedTransport(front, doorbellFront, doorbellBack, channel2, channel5);
