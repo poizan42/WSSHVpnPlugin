@@ -20,6 +20,13 @@
       referenced component's .winmd out of the compile references (otherwise NETSDK1130).
     -->
     <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.2.0" />
+    <!--
+      For ConnectionsFile only: the app writes the saved-connections document the plug-in reads at
+      connect, and sharing the type is what keeps the two processes agreeing on what matches. This
+      is not the forbidden reference - that one is to the *plug-in* (see below), whose re-exported
+      activation factory is what once pulled the VPN host into this process.
+    -->
+    <ProjectReference Include="..\PoiTech.WSSHVpnPlugin.Net\PoiTech.WSSHVpnPlugin.Net.csproj" />
   </ItemGroup>
 
   <!--

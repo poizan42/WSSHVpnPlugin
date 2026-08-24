@@ -1,9 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Xml.Linq;
 using Windows.Networking;
 using Windows.Networking.Vpn;
+using Windows.Storage;
+
+using PoiTech.WSSHVpnPlugin.Net;
 
 namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 
@@ -30,6 +34,13 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 ///   &lt;InclusionRoute&gt;10.0.0.0/8&lt;/InclusionRoute&gt;
 /// &lt;/SshVpnConfiguration&gt;
 /// </code>
+/// <para>
+/// The custom configuration is one of two sources, and it wins wholesale when present, so an
+/// admin-pushed profile does exactly what it says. A profile that carries none — Windows Settings
+/// offers no way to write one, and stores the placeholder <c>&lt;xml&gt;&lt;/xml&gt;</c> instead —
+/// is resolved from the saved connection (see <see cref="ConnectionsFile"/>) whose entry matches the
+/// profile's server name.
+/// </para>
 /// </remarks>
 internal sealed class SshVpnConfiguration
 {
@@ -192,17 +203,54 @@ internal sealed class SshVpnConfiguration
     public IReadOnlyList<string> ExclusionRoutes { get; private init; } = Array.Empty<string>();
 
     /// <summary>
-    /// Reads the configuration carried by the VPN profile.
+    /// Resolves the configuration for the profile being connected.
     /// </summary>
-    /// <exception cref="FormatException">The profile is missing a server, or the custom configuration is malformed.</exception>
+    /// <exception cref="FormatException">
+    /// The custom configuration is malformed, or the profile carries none and no saved connection
+    /// matches its server.
+    /// </exception>
     public static SshVpnConfiguration FromChannelConfiguration(VpnChannelConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var custom = configuration.CustomField;
+        if (ParsePayload(configuration.CustomField) is { } root)
+        {
+            var host = ReadString(root, "Host")
+                ?? TryGetFirstServerHost(configuration)
+                ?? throw new FormatException("The VPN profile does not specify a server host name.");
+
+            PluginLog.Info($"Configuration for {host}: profile CustomConfiguration");
+            return FromXml(root, host);
+        }
+
+        // No payload means a profile provisioned outside the app - Settings can only name a server -
+        // so the server name is the join key into the saved connections.
+        var server = TryGetFirstServerHost(configuration)
+            ?? throw new FormatException(
+                "The profile carries no custom configuration, and the platform would not surface "
+                + "its server name, so there is nothing to look a saved connection up by.");
+
+        var entry = FindSavedEntry(server);
+        PluginLog.Info($"Configuration for {server}: connections.xml entry");
+        return FromXml(entry, ConnectionsFile.HostOf(entry) ?? server);
+    }
+
+    /// <summary>
+    /// Parses the profile's custom configuration, or reports that it carries none.
+    /// </summary>
+    /// <remarks>
+    /// "None" is more than the empty string: Windows Settings stores the placeholder
+    /// <c>&lt;xml&gt;&lt;/xml&gt;</c> in profiles it creates (observed on this profile and on a
+    /// third-party one alike), and that means "no configuration", not "a configuration with the
+    /// wrong root". Anything else non-empty must be ours, and fails loudly when it is not - a
+    /// malformed payload is a broken profile, and quietly substituting the saved connection would
+    /// hand an admin-pushed profile different settings than it specified.
+    /// </remarks>
+    private static XElement? ParsePayload(string? custom)
+    {
         if (string.IsNullOrWhiteSpace(custom))
         {
-            throw new FormatException("The VPN profile carries no custom configuration.");
+            return null;
         }
 
         XElement root;
@@ -216,16 +264,60 @@ internal sealed class SshVpnConfiguration
             throw new FormatException("The custom configuration is not well-formed XML.", ex);
         }
 
+        if (root.Name.LocalName == "xml" && !root.HasElements && !root.HasAttributes
+            && string.IsNullOrWhiteSpace(root.Value))
+        {
+            return null;
+        }
+
         if (root.Name.LocalName != RootElementName)
         {
             throw new FormatException(
                 $"Expected a <{RootElementName}> root element but found <{root.Name.LocalName}>.");
         }
 
-        var host = ReadString(root, "Host")
-            ?? TryGetFirstServerHost(configuration)
-            ?? throw new FormatException("The VPN profile does not specify a server host name.");
+        return root;
+    }
 
+    /// <summary>
+    /// Finds the saved connection for the profile's server, refusing with instructions otherwise.
+    /// </summary>
+    /// <remarks>
+    /// Each failure names its own cause because the message ends up in TerminateConnection, which is
+    /// all the user sees: no connections saved at all, a file that cannot be read, and a server no
+    /// entry matches are three different repairs.
+    /// </remarks>
+    private static XElement FindSavedEntry(string server)
+    {
+        var path = Path.Combine(ApplicationData.Current.LocalFolder.Path, ConnectionsFile.FileName);
+        if (!File.Exists(path))
+        {
+            throw new FormatException(
+                "The profile carries no custom configuration and no connections have been saved. "
+                + $"Open the SSH VPN app and save a connection for '{server}'.");
+        }
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new FormatException($"{ConnectionsFile.FileName} could not be read.", ex);
+        }
+
+        return ConnectionsFile.FindEntry(ConnectionsFile.Parse(text), server)
+            ?? throw new FormatException(
+                $"No saved connection matches '{server}'. Open the SSH VPN app and save a "
+                + "connection for that server.");
+    }
+
+    /// <summary>
+    /// Reads the configuration elements, from either source - the two carry the same vocabulary.
+    /// </summary>
+    private static SshVpnConfiguration FromXml(XElement root, string host)
+    {
         return new SshVpnConfiguration(host)
         {
             Port = ReadUInt32(root, "Port", 22),
@@ -250,9 +342,11 @@ internal sealed class SshVpnConfiguration
     /// Observed: for a plug-in profile whose <c>ServerUris</c> were set, merely reading
     /// <see cref="VpnChannelConfiguration.ServerHostNameList"/> throws
     /// <c>ArgumentException("hostName")</c> from the projection — with both an <c>ssh://</c> and an
-    /// <c>https://</c> URI, so it is not about the scheme. The host is therefore carried in the
-    /// custom configuration, which we control end to end, and this is only a fallback so that a
-    /// profile provisioned by other means (MDM, say) still works.
+    /// <c>https://</c> URI, so it is not about the scheme. For a profile carrying its own payload the
+    /// host therefore travels in <c>&lt;Host&gt;</c>, which we control end to end, and this is only a
+    /// fallback. For a profile without one this is the join key into the saved connections —
+    /// Settings stores the server as <c>http://&lt;host&gt;/</c>, and that shape is what the app now
+    /// mimics in the profiles it writes.
     /// </remarks>
     private static string? TryGetFirstServerHost(VpnChannelConfiguration configuration)
     {

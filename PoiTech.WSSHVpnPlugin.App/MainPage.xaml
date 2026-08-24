@@ -25,12 +25,19 @@
         <StackPanel Spacing="8" MaxWidth="480" HorizontalAlignment="Left">
             <!--
               Settable because a profile created here does not appear in Settings > Network &
-              internet > VPN - only one added through Settings' own "Add VPN" does. To connect the
-              sanctioned way, add an entry there first, then name it here so Save writes our custom
-              configuration into it.
+              internet > VPN - only one added through Settings' own "Add VPN" does. Either kind
+              works: the profile only names a server, and the plug-in looks that server up in the
+              connections saved here.
             -->
             <TextBox x:Name="ProfileNameBox" Header="Profile name" Text="SSH VPN"/>
-            <TextBox x:Name="HostBox" Header="SSH server" PlaceholderText="ssh.example.com"/>
+            <!--
+              Editable: pick a saved connection to load it, or type a new server to create one.
+              The text is the key the plug-in matches the profile's server name against.
+            -->
+            <ComboBox x:Name="HostBox" Header="SSH server" IsEditable="True"
+                      PlaceholderText="ssh.example.com" HorizontalAlignment="Stretch"
+                      SelectionChanged="OnHostSelectionChanged"/>
+            <Button x:Name="RemoveButton" Content="Remove saved connection" Click="OnRemoveConnectionClick" HorizontalAlignment="Left"/>
             <TextBox x:Name="PortBox" Header="Port" Text="22"/>
             <TextBox x:Name="UserNameBox" Header="User name" PlaceholderText="(leave empty to be prompted)"/>
             <TextBox x:Name="FingerprintBox" Header="Host key fingerprint" PlaceholderText="SHA256:..."/>
@@ -47,7 +54,8 @@
         </ScrollViewer>
 
         <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" Margin="0,16,0,16">
-            <Button x:Name="SaveButton" Content="Save profile" Click="OnSaveProfileClick"/>
+            <Button x:Name="SaveButton" Content="Save connection" Click="OnSaveConnectionClick"/>
+            <Button x:Name="SaveProfileButton" Content="Save profile" Click="OnSaveProfileClick"/>
             <Button x:Name="ConnectButton" Content="Connect" Click="OnConnectClick"/>
             <Button x:Name="DisconnectButton" Content="Disconnect" Click="OnDisconnectClick"/>
             <Button x:Name="DeleteButton" Content="Delete profile" Click="OnDeleteProfileClick"/>

@@ -169,9 +169,10 @@ on the `.Net` side of that line wherever it has a choice.
 - **`PoiTech.WSSHVpnPlugin.VpnPlugin`** — the plug-in, and the only place WinRT and SSH meet the
   stack. A CsWinRT component (`CsWinRTComponent`), so **public types must be WinRT-compatible**; keep
   everything except `SSHVpnPlugin` and `VpnBackgroundTask` `internal`.
-- **`PoiTech.WSSHVpnPlugin.App`** — UWP XAML app whose only real job is creating the VPN profile via
-  `VpnManagementAgent`. There is no system UI for provisioning a plug-in profile, so this is the only
-  way one gets created.
+- **`PoiTech.WSSHVpnPlugin.App`** — UWP XAML app that edits the saved connections (see **Where the
+  configuration lives** below) and creates VPN profiles via `VpnManagementAgent`. It references
+  `.Net` for `ConnectionsFile` only — the forbidden reference is to the *plug-in*, whose re-exported
+  activation factory once pulled the VPN host into the XAML process.
 - **`PoiTech.WSSHVpnPlugin.Package`** — wapproj; owns `Package.appxmanifest`.
 - **`SSH.NET`** — submodule, fork of upstream. It exists because
   `Session.CreateChannelDirectTcpip`, `ISession`, and `IChannelDirectTcpip` are all `internal`
@@ -336,6 +337,45 @@ reported, not corrected.
 writes them only when the field is non-empty. Profiles saved before this carry an explicit
 `192.168.255.2`, which is honoured as a pin; clearing the field in the app and saving is what moves
 them onto allocation.
+
+### Where the configuration lives: the connections file
+
+Since 2026-08-24 the profile is a pointer and the settings live in **`connections.xml` in the
+package's local folder** (next to `wsshvpn.log`), keyed by server host — the openssh-config model.
+`ConnectionsFile` in `.Net` owns the document (matching is exact, trimmed, ordinal-case-insensitive;
+entries are `<SshVpnConfiguration>` fragments, the same vocabulary a profile would embed, plus
+app-only `<ProfileName>`/`<PrivateKeyFile>` bookkeeping the plug-in's reader ignores). The app
+writes it; `SshVpnConfiguration.FromChannelConfiguration` resolves against it at connect. Both are
+fast-loop covered through `ConnectionsFileTests`.
+
+Precedence is wholesale, not merged: a profile carrying a real `CustomConfiguration` payload uses
+exactly that and the file is never consulted — so an admin-pushed or legacy profile does precisely
+what it says. Only a profile with *no* payload resolves through the file, and “no payload” includes
+the placeholder **`<xml></xml>`, which is what Settings' own “Add VPN” dialog stores** (observed on
+our profile and a third-party AnyConnect one alike). A malformed payload still fails the connect
+loudly rather than falling back — silently substituting the saved connection would hand an
+admin-pushed profile different settings than it specified.
+
+This is what makes **profiles created in Windows Settings work**, which was the point: Settings can
+only name a server, and the platform gives the owning app no way to write configuration into a
+user-scoped profile afterwards. The join key is the profile's server name, read from
+`VpnChannelConfiguration.ServerHostNameList`. Two facts about that list, both bought with failures:
+
+- Settings stores the server as **`http://<host>/`** in `ServerUris`, and the app now mimics that
+  shape for its own profiles. **Verified live on 2026-08-24: `http://` URIs read cleanly** - both a
+  Settings-created profile and an app-created pointer profile resolved their server and connected
+  end to end. The earlier observation stands alongside it: with `ssh://` or `https://` URIs, merely
+  *reading* `ServerHostNameList` throws `ArgumentException("hostName")` from the projection - so the
+  failure is scheme-shaped, and `http://` is the shape that works.
+- A profile that embeds its own payload still carries `<Host>` and never needs the server list, so
+  the projection hazard cannot break the wholesale path.
+
+Consequences worth knowing before they bite: the Settings dialog's server field must **equal the
+entry's `<Host>`** (no `host:port` — the entry's `<Port>` governs); initial per-host setup still
+happens in the app once, because the fingerprint pin and the key's FutureAccessList token cannot
+come from Settings and an unpinned host key stays refused; entry edits apply on the *next connect*
+with no profile re-save, while a legacy profile keeps its embedded config until re-saved; and
+`Remove-AppxPackage` now also deletes the saved connections, along with the tokens and the log.
 
 ### Runtime flow
 
