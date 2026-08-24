@@ -280,11 +280,19 @@ public sealed partial class MainPage : Page
             // Carried here rather than relied upon from ServerUris: reading the platform's
             // ServerHostNameList throws for this profile. See SshVpnConfiguration.TryGetFirstServerHost.
             new XElement("Host", HostBox.Text.Trim()),
-            new XElement("Port", port.ToString(CultureInfo.InvariantCulture)),
-            new XElement("ClientIPv4", ClientAddressBox.Text.Trim()));
+            new XElement("Port", port.ToString(CultureInfo.InvariantCulture)));
+
+        // Both client addresses are written only when pinned. Empty means the plug-in chooses one at
+        // connect out of what the routing table shows is free - which cannot be decided from here,
+        // because the answer belongs to whichever network the machine is on at the time.
+        var clientIPv4 = ClientAddressBox.Text.Trim();
+        if (clientIPv4.Length > 0)
+        {
+            root.Add(new XElement("ClientIPv4", clientIPv4));
+        }
 
         var clientIPv6 = ClientIPv6Box.Text.Trim();
-        if (clientIPv6.Length > 0 && clientIPv6 != "fd00::2")
+        if (clientIPv6.Length > 0)
         {
             root.Add(new XElement("ClientIPv6", clientIPv6));
         }

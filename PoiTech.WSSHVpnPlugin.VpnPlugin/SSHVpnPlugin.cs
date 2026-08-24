@@ -124,8 +124,6 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             var configuration = SshVpnConfiguration.FromChannelConfiguration(channel.Configuration);
             PluginLog.Info($"Connecting to {configuration.Host}:{configuration.Port}");
 
-            RouteTableProbe.Run();
-
             // A key-based profile that already names its user needs nothing from the user, and
             // asking anyway would put a prompt in front of a background task for no reason.
             var needsCredentials = configuration.PrivateKeyToken is null || configuration.UserName is null;
@@ -143,6 +141,12 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
             {
                 throw new InvalidOperationException("No SSH user name was configured or supplied.");
             }
+
+            // After the credential prompt rather than before it: the routing table is read to avoid
+            // claiming an address something else already reaches, so the less time between reading it
+            // and publishing our own claim at Start, the better - and a prompt can wait on the user
+            // for minutes.
+            var (clientV4, clientV6) = ClientAddressResolver.Resolve(configuration);
 
             // The platform-owned-transport ordering, forced at both ends: sends through the
             // channel deadlock before Start (the acquire waits on pools only Start creates), and
@@ -172,7 +176,7 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
 
             // Everything the platform might immediately call into has to exist before this: it may
             // ask for packets as soon as the channel starts.
-            StartChannel(channel, configuration, transport);
+            StartChannel(channel, configuration, transport, clientV4, clientV6);
 
             // The handshake rides the started channel: Decapsulate feeds the pipe on the
             // platform's threads while Session.Connect blocks here, on the activation thread.
@@ -217,18 +221,22 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
     /// Exactly one attempt: the channel is single-shot, and a second call after a rejected one
     /// returns <c>E_ILLEGAL_METHOD_CALL</c> rather than being retried on its merits.
     /// </remarks>
-    private static void StartChannel(VpnChannel channel, SshVpnConfiguration configuration, IOuterTransport transport)
+    private static void StartChannel(
+        VpnChannel channel,
+        SshVpnConfiguration configuration,
+        IOuterTransport transport,
+        IpAddr clientV4,
+        IpAddr clientV6)
     {
-        var ipv4 = new List<HostName> { new HostName(configuration.ClientIPv4) };
+        var ipv4 = new List<HostName> { new HostName(clientV4.Format()) };
 
-        // Unconditional - Start* fails with E_OUTOFMEMORY, a resource error that has nothing to do
-        // with resources, whenever the assigned IPv6 address list is empty; bisected to this single
-        // variable during the bring-up, and there is no working value of "off". IPv6 is carried
-        // now, so the address is also load-bearing: it is the tunnel's v6 source. The ULA default
-        // makes Windows prefer v4 for dual-stack names (RFC 6724 label mismatch), so default v6
-        // volume is v6-only hosts and literals; a profile wanting full v6 preference sets
-        // <ClientIPv6> to a global-scope address.
-        var ipv6 = new List<HostName> { new HostName(configuration.ClientIPv6) };
+        // The v6 list is never empty: Start* fails with E_OUTOFMEMORY, a resource error that has
+        // nothing to do with resources, whenever it is - bisected to this single variable during the
+        // bring-up, and there is no working value of "off". The address is load-bearing beyond that,
+        // being the tunnel's v6 source. Both addresses come from ClientAddressResolver, which
+        // honours whatever the profile pinned and otherwise chooses around what this machine already
+        // reaches.
+        var ipv6 = new List<HostName> { new HostName(clientV6.Format()) };
 
         // Configurable, and defaulting to the documented maximum. See SshVpnConfiguration.Mtu for
         // why: this argument also sizes every buffer in the platform's receive pool, raising it is
@@ -256,7 +264,9 @@ public sealed class SSHVpnPlugin : IVpnPlugIn
                 false,                                                         // reserved
                 transport.Transport);
 
-            PluginLog.Info($"StartWithMainTransport accepted (mtu {mtu}, frame {frameSize}, ipv6 {ipv6.Count})");
+            PluginLog.Info(
+                $"StartWithMainTransport accepted (mtu {mtu}, frame {frameSize}, "
+                + $"v4 {clientV4.Format()}, v6 {clientV6.Format()})");
         }
         catch (Exception ex)
         {

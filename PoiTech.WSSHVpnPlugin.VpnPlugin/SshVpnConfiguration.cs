@@ -23,7 +23,7 @@ namespace PoiTech.WSSHVpnPlugin.VpnPlugin;
 ///   &lt;UserName&gt;alice&lt;/UserName&gt;
 ///   &lt;HostKeyFingerprint&gt;SHA256:xxxxxxxx&lt;/HostKeyFingerprint&gt;
 ///   &lt;PrivateKeyToken&gt;{GUID from the app's file picker}&lt;/PrivateKeyToken&gt;
-///   &lt;ClientIPv4&gt;192.168.255.2&lt;/ClientIPv4&gt;
+///   &lt;ClientIPv4&gt;198.18.0.1&lt;/ClientIPv4&gt;
 ///   &lt;ClientIPv6&gt;fd00::2&lt;/ClientIPv6&gt;
 ///   &lt;Mtu&gt;1400&lt;/Mtu&gt;
 ///   &lt;DnsServer&gt;1.1.1.1&lt;/DnsServer&gt;
@@ -77,18 +77,41 @@ internal sealed class SshVpnConfiguration
     /// </summary>
     public string? HostKeyFingerprint { get; private init; }
 
-    /// <summary>Gets the IPv4 address to assign to the virtual interface.</summary>
-    public string ClientIPv4 { get; private init; } = "192.168.255.2";
-
-    /// <summary>Gets the IPv6 address to assign to the virtual interface.</summary>
+    /// <summary>
+    /// Gets the IPv4 address to assign to the virtual interface, or <see langword="null"/> to choose
+    /// one.
+    /// </summary>
     /// <remarks>
-    /// Always assigned, for two reasons: <c>Start*</c> fails with <c>E_OUTOFMEMORY</c> when the
-    /// assigned IPv6 address list is empty, and this is the tunnel's IPv6 source address. The ULA
-    /// default makes Windows prefer IPv4 for dual-stack names (RFC 6724 gives a ULA source a
-    /// mismatched label against a global destination), so v6 traffic is mostly v6-only hosts and
-    /// literals until this is set to a global-scope address.
+    /// Unset is the ordinary case. An assigned address becomes a host route on the tunnel interface,
+    /// and a host route beats every other prefix length, so one that collides with something this
+    /// machine already reaches makes that thing unreachable while the tunnel is up — which is why
+    /// the choice is made at connect from what the routing table shows, rather than fixed in a
+    /// profile that cannot know which network the machine will be on. Set it only to pin a
+    /// particular address; a configured value is honoured whether or not it collides, and the
+    /// collision is reported rather than corrected. See <c>ClientAddressAllocator</c>.
     /// </remarks>
-    public string ClientIPv6 { get; private init; } = "fd00::2";
+    public string? ClientIPv4 { get; private init; }
+
+    /// <summary>
+    /// Gets the IPv6 address to assign to the virtual interface, or <see langword="null"/> to derive
+    /// one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// An address is always assigned, whether or not one is configured: <c>Start*</c> fails with
+    /// <c>E_OUTOFMEMORY</c> when the assigned IPv6 address list is empty, and this is also the
+    /// tunnel's IPv6 source address.
+    /// </para>
+    /// <para>
+    /// Unset derives a unique local prefix from the server host, which needs no coordination with
+    /// anything: unlike IPv4 there is no shortage to allocate around, only the requirement not to
+    /// reuse the well-known <c>fd00::/8</c> value that everything else picking lazily also uses.
+    /// A ULA source makes Windows prefer IPv4 for dual-stack names (RFC 6724 gives it a mismatched
+    /// label against a global destination), so v6 traffic is mostly v6-only hosts and literals; set
+    /// this to a global-scope address to change that.
+    /// </para>
+    /// </remarks>
+    public string? ClientIPv6 { get; private init; }
 
     /// <summary>
     /// Gets how many seconds a channel open may wait for the server's answer before the connection
@@ -210,8 +233,8 @@ internal sealed class SshVpnConfiguration
             PrivateKeyToken = ReadString(root, "PrivateKeyToken"),
             StartDelaySeconds = ReadUInt32(root, "StartDelaySeconds", 0),
             HostKeyFingerprint = ReadString(root, "HostKeyFingerprint"),
-            ClientIPv4 = ReadString(root, "ClientIPv4") ?? "192.168.255.2",
-            ClientIPv6 = ReadString(root, "ClientIPv6") ?? "fd00::2",
+            ClientIPv4 = ReadString(root, "ClientIPv4"),
+            ClientIPv6 = ReadString(root, "ClientIPv6"),
             OpenTimeoutSeconds = ReadUInt32(root, "OpenTimeoutSeconds", 3),
             Mtu = ReadUInt32(root, "Mtu", DefaultMtu),
             DnsServers = ReadStringList(root, "DnsServer"),

@@ -276,10 +276,8 @@ What this is for: an assigned client address becomes a host route on the tunnel 
 that collides makes whatever it collides with quietly unreachable for the life of the tunnel. The
 routing table is where such a claim is *published*, which makes reading it before assigning the
 coordination protocol rather than a heuristic — and a later arrival that does not read it is no more
-our problem than it is any other virtual interface's. Two calibration notes from the same run:
-`0.0.0.0/0` was the only default route of the 72, so "more specific than a default" is not a useful
-filter; and the ranges to discard before testing containment are the ones nothing would allocate from
-anyway (`127/8`, multicast, `fe80::/10`).
+our problem than it is any other virtual interface's. This is what `ClientAddressResolver` and
+`ClientAddressAllocator` do with it — see **Client addresses** below.
 
 No such probe is needed for IPv6, and the asymmetry is the point: a randomly generated 40-bit ULA
 global ID (RFC 4193 §3.2.2, which requires exactly that — `fd00::2` uses a global ID of zero and is
@@ -288,6 +286,56 @@ same 40 bits. For v6 the compliance that matters is ours; for v4 it is everyone 
 range is safe by construction — `100.64.0.0/10` is Tailscale's, `198.18.0.0/15` turns up in proxy
 tooling, `192.0.2.0/24` gets copy-pasted out of documentation. Hence observation for v4, entropy for
 v6.
+
+### Client addresses
+
+Both are chosen at connect and both are overridable, and the two families work differently on
+purpose. `ClientAddressAllocator` lives in the `.Net` project because it is pure prefix arithmetic —
+the caller passes the claims it read and the answer is a function of them — so the whole thing is
+exercised against a brute-force oracle in the fast loop instead of a deploy.
+
+**IPv4 is chosen by observation.** `IpPrefix.Subtract` removes what is claimed from a pool and the
+first survivor's network address is the answer, which makes it exact: sampling a few candidate
+offsets instead would fall through a pool that is almost entirely free whenever a claim covers its
+low end, which is precisely the shape proxy tooling installs. Pools in order: `198.18.0.0/15` (RFC
+2544), then `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` (RFC 5737). None is a legitimate
+internet destination, which is the most that can be said for any IPv4 range; `100.64.0.0/10` is
+deliberately absent because Tailscale assigns from it.
+
+**A claim counts only if the pool contains it**, and that one rule is load-bearing. A route broader
+than the whole pool is a coarse routing decision that happens to cover it, not a statement about any
+address in it — and the case that proves it is our own: this plug-in publishes `0.0.0.0/1` +
+`128.0.0.0/1` for its own tunnel, so honouring routes broader than a pool would make the allocator
+fall back to a fixed address whenever *any* full-tunnel VPN is up, including a second profile of this
+one. On v6 it is worse: stepping could never escape `8000::/1`, so a naive rule does not terminate.
+`IpPrefix.Contains` already means "at least as specific, and nested", so the rule is one call and
+needs no threshold. Its accepted cost is a false negative on a genuinely broad claim (a corporate
+`198.0.0.0/8`, say), which is the trade for the pools being ranges nobody routes wholesale.
+
+**IPv6 is derived, not searched.** SHA-256 of the lowercased `<Host>`, truncated to 40 bits, gives
+the ULA global ID; the address is `::2` in the resulting `/64`, and the subnet field is stepped if
+something claims the whole prefix. There is no shortage to allocate around — only the requirement not
+to reuse the well-known all-zero global ID — and the address never reaches a wire, so two machines
+sharing a profile share a prefix and never meet. It must be SHA-256 rather than `GetHashCode`, which
+is randomised per process and would silently change the "stable" prefix on every connect.
+
+**Reserved and avoided.** Each pool's first address is skipped, plus its last for v4 and one more for
+v6 so the first address handed out is `::2`; whether the platform would accept a `.0` is untested and
+costs a deploy on a single-shot channel to find out. The configured `<DnsServer>` addresses and a
+literal `<Host>` are skipped too — a resolver is reached *through* the tunnel, so taking its address
+breaks every lookup, and proxy tooling parks resolvers inside the first pool.
+
+**What to grep for.** One line per family at connect naming the address, whether it was allocated or
+configured, and the most specific route that already reaches it. That line is the point of the
+feature as much as the allocation is: a colliding address does not break the tunnel, it makes one
+destination quietly unreachable, so the expensive part was never the collision but working out that
+the tunnel's own address caused it. A configured address is honoured whether or not it collides —
+reported, not corrected.
+
+**Migration.** `<ClientIPv4>` and `<ClientIPv6>` are absent from a profile unless pinned, and the app
+writes them only when the field is non-empty. Profiles saved before this carry an explicit
+`192.168.255.2`, which is honoured as a pin; clearing the field in the app and saving is what moves
+them onto allocation.
 
 ### Runtime flow
 
@@ -798,9 +846,9 @@ Deliberate, documented, and not to be silently papered over:
   source is `::` is Windows probing its own address — answering asserts a conflict and kills it).
   Observability that made this checkable stays in: `StackLoop` counts v6 drops separately and keeps
   an ICMPv6 type histogram, logged once per type and in the 30-second summary. Also deliberate: with
-  the default ULA `fd00::2` as v6 source, RFC 6724 label mismatch makes Windows prefer v4 for
-  dual-stack names, so v6 volume is mostly v6-only hosts and literals; `<ClientIPv6>` with a
-  global-scope address is the knob for full v6 preference. The remaining pieces were verified live the same
+  a ULA as v6 source — which the derived default is — RFC 6724 label mismatch makes Windows prefer
+  v4 for dual-stack names, so v6 volume is mostly v6-only hosts and literals; `<ClientIPv6>` with a
+  global-scope address is the knob for full v6 preference. See **Client addresses**. The remaining pieces were verified live the same
   day: a v6 `<DnsServer>` answers A and AAAA through the relay, and a v6 `<ExcludeRoute>` (one /32
   hole) produced exactly the predicted 32 inclusion routes, bypassed the range (instant local
   failure, zero flow-log hits) while the rest of v6 kept flowing — and `Start` took the resulting
